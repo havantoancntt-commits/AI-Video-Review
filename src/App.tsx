@@ -4994,7 +4994,10 @@ export default function App() {
       <div className="lg:hidden px-4 py-3 bg-[#050505]/95 backdrop-blur-md border-b border-amber-500/10 sticky top-16 z-40 shadow-[0_4px_25px_rgba(0,0,0,0.6)] relative z-10">
         <div className="flex rounded-xl bg-zinc-950 p-1 border border-white/5 gap-1.5 max-w-sm mx-auto">
           <button
-            onClick={() => setActiveMobileTab('inputs')}
+            onClick={() => {
+              setActiveMobileTab('inputs');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
             className="flex-1 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center transition-all cursor-pointer relative"
           >
             {activeMobileTab === 'inputs' && (
@@ -5021,6 +5024,7 @@ export default function App() {
                 return;
               }
               setActiveMobileTab('results');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
             }}
             className="flex-1 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center transition-all cursor-pointer relative"
           >
@@ -5048,6 +5052,7 @@ export default function App() {
                 return;
               }
               setActiveMobileTab('studio');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
             }}
             className="flex-1 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center transition-all cursor-pointer relative"
           >
