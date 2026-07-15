@@ -80,8 +80,11 @@ async function generateWithRetry(
                         errMsg.toLowerCase().includes("request failed") ||
                         errMsg.toLowerCase().includes("aborted") ||
                         errMsg.toLowerCase().includes("timeout") ||
+                        errMsg.includes("500") ||
+                        errMsg.toLowerCase().includes("internal") ||
                         err.status === 503 ||
-                        err.status === 429;
+                        err.status === 429 ||
+                        err.status === 500;
       if (isTemporary && i < retries) {
         if (useModelFallback && modelName === "gemini-3.5-flash") {
           console.info(`[TIKTOK-OPTIMIZER] Điều chỉnh kênh chuyển dịch phân tích thông minh mượt mà...`);
@@ -380,7 +383,7 @@ Yêu cầu cụ thể từ người dùng: "${customPrompt || "Hãy review chân
       }
       reviewData = JSON.parse(resultText);
     } catch (apiError: any) {
-      console.warn("API Gemini gặp sự cố (Đang kích hoạt chế độ lồng tiếng thiết kế cục bộ):", apiError.message);
+      console.log("[VIDEO-ANALYZE-FALLBACK] Gemini API is currently offline or busy. Activating smart local review generator.");
       // Generate highly targeted custom fallback review content so the experience is uninterrupted
       reviewData = getFallbackReviewReport(productName, productDesc);
       // Tag it so the frontend optionally knows, but fits schema perfectly
@@ -514,7 +517,7 @@ Trả về kết quả bằng tiếng Việt theo định dạng JSON chứa cá
       }
       suggestData = JSON.parse(resultText);
     } catch (apiError: any) {
-      console.log("Kích hoạt gợi ý sản phẩm mặc định (Chế độ dự phòng thông minh):", apiError.message);
+      console.log("[PRODUCT-SUGGEST-FALLBACK] Gemini API is currently busy. Activating premium offline product suggestion.");
       // Fallback with highly standard premium product info
       suggestData = getFallbackSuggestProduct(req.body.productName);
     }
@@ -528,95 +531,34 @@ Trả về kết quả bằng tiếng Việt theo định dạng JSON chứa cá
 });
 
 // Phân phác ngữ âm hoàn toàn tự nhiên tạo giọng đọc miền Nam rặt ngọt ngào lôi cuốn cho TTS chuyên nghiệp
+// Phân phác ngữ âm hoàn toàn tự nhiên tạo giọng đọc miền Nam rặt ngọt ngào lôi cuốn cho TTS chuyên nghiệp
+function cleanTextForSpeech(text: string): string {
+  if (!text) return "";
+  return text
+    .replace(/\[[^\]]*\]/g, ' ') // loại bỏ toàn bộ [SFX: ...], [Gợi ý B-Roll: ...], [SIÊU HOOK ...]
+    .replace(/\([^)]*\)/g, ' ')  // loại bỏ ghi chú trong dấu ngoặc đơn
+    .replace(/(KOL:|Người dẫn:|Vlogger:|MC:|Dẫn chương trình:|Lời thoại:|Kịch bản:)/gi, ' ') // loại bỏ nhãn người nói
+    .replace(/[*#_~`•\-+]/g, ' ') // loại bỏ markdown và ký tự đặc biệt
+    .replace(/\s+/g, ' ') // thu gọn khoảng trắng thừa
+    .trim();
+}
+
 function sanitizeTextForVietnameseTTS(text: string): string {
   if (!text) return "";
   let clean = text;
 
-  // Dịch chuyển mượt mà các tiếng nước ngoài/Marketing kỹ thuật số sang âm gõ tiếng Việt tự nhiên giúp AI phát âm cực chuẩn
-  const englishToPhonetic: Record<string, string> = {
-    "KOLs": "Kei-ao-eo",
-    "KOL": "Kei-ao-eo",
-    "KOCs": "Kei-o-xi",
-    "KOC": "Kei-o-xi",
-    "TikTok Shop": "Tích Tốc Sóp",
-    "TikTokShop": "Tích Tốc Sóp",
-    "TikTok": "Tích Tốc",
-    "Tiktok": "Tích Tốc",
-    "video": "vi-đê-o",
-    "Video": "vi-đê-o",
-    "clip": "clíp",
-    "Clip": "clíp",
-    "shop": "sóp",
-    "Shop": "sóp",
-    "sales": "seo",
-    "sale": "seo",
-    "Sale": "seo",
-    "hot": "hót",
-    "Hot": "hót",
-    "style": "tai",
-    "Style": "tai",
-    "pro": "bờ-rồ",
-    "Pro": "bờ-rồ",
-    "Kore": "Kô-Gê",
-    "Aoede": "Ao-đê",
-    "Puck": "Pắc",
-    "Fenrir": "Phen-Gút",
-    "ASMR": "A-ét-em-gờ",
-    "combo": "com-bo",
-    "Combo": "com-bo",
-    "decor": "đê-co",
-    "Decor": "đê-co",
-    "review": "ri-diu",
-    "Review": "ri-diu",
-    "unboxing": "ăn bóc sing",
-    "Unboxing": "ăn bóc sing",
-    "AIDA": "Ai-Đa",
-    "PAS": "Pê-A-Ét",
-    "FAB": "Ép-A-Bê",
-    "NLP": "En-Lờ-Pê",
-    "FOMO": "Phô-mô",
-    "viral": "vai-rồ",
-    "Viral": "vai-rồ",
-    "smart": "sờ-mát",
-    "Smart": "sờ-mát",
-    "trend": "tren",
-    "Trend": "tren"
-  };
+  // Loại bỏ các ký tự đặc biệt của markdown (*, #, _, ~) để tránh gây nhiễu nhịp đọc của AI
+  clean = clean.replace(/[*#_~`•\-+]/g, ' ');
 
-  for (const [key, val] of Object.entries(englishToPhonetic)) {
-    const regex = new RegExp(`\\b${key}\\b`, 'gi');
-    clean = clean.replace(regex, val);
-  }
+  // Quy đổi các ký hiệu tiền tệ và phần trăm thông dụng sang chữ quốc ngữ để AI đọc trơn tru và tự nhiên nhất
+  clean = clean.replace(/(\d+)\s*%/g, '$1 phần trăm');
+  clean = clean.replace(/(\d+)\s*k\b/gi, '$1 ngàn');
+  clean = clean.replace(/(\d+)\s*(đ|VND|đồng)/gi, '$1 đồng');
 
-  // 2. Ép phát âm nhẹ nhàng, tinh hoa chuẩn từ miền Nam Việt Nam (giữ gìn sự đài các, đẳng cấp và thanh thoát)
-  const southernPhoneticRules: [RegExp, string][] = [
-    [/\bnhé\b/g, "nha"],
-    [/\bNhé\b/g, "Nha"],
-    [/\bnhỉ\b/g, "nha"],
-    [/\bNhỉ\b/g, "Nha"],
-    [/\bđấy\b/g, "đó"],
-    [/\bĐấy\b/g, "Đó"],
-    [/\bnày\b/g, "nè"],
-    [/\bNày\b/g, "Nè"],
-    [/\bthế này\b/g, "như vầy"],
-    [/\bthế á\b/g, "dậy á"],
-    [/\bthật\b/g, "thiệt"],
-    [/\bThật\b/g, "Thiệt"],
-    [/\bquả(?=\s+(bóng|đất|cầu|phạt|tạ|tim|cân|chuông|nước|khế|cam|chanh|xoài|bưởi|dừa))\b/g, "quả"],
-    [/\bquả\b/g, "trái"],
-    [/\bQuả\b/g, "Trái"],
-    [/\bví dụ\b/g, "thí dụ"],
-    [/\bVí dụ\b/g, "Thí dụ"]
-  ];
+  // Loại bỏ các khoảng trắng thừa
+  clean = clean.replace(/\s+/g, ' ');
 
-  for (const [regex, replacement] of southernPhoneticRules) {
-    clean = clean.replace(regex, replacement);
-  }
-
-  // Loại bỏ các ký tự đặc biệt không cần thiết hoặc gây nhiễu cho AI đọc
-  clean = clean.replace(/[*#_~]/g, '');
-
-  return clean;
+  return clean.trim();
 }
 
 // Endpoint: Generate High-quality TTS Voiceover for marketing review script
@@ -637,10 +579,13 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
       isEnglish = true;
     }
 
-    // Invalidate old cache and prefix with v13_south to force new perfect phonetic setup update
-    const cacheKey = `v13_south:${selectedVoice}:${text.trim()}`;
+    // Clean all technical brackets and annotations so the voice is 100% pure and professional narration
+    const cleanSpeechText = cleanTextForSpeech(text);
+
+    // Invalidate old cache and prefix with v15_natural_tts to force new clean phonetic setup update
+    const cacheKey = `v15_natural_tts:${selectedVoice}:${cleanSpeechText.trim()}`;
     if (ttsMemoryCache.has(cacheKey)) {
-      console.info(`[TTS-CACHE-HIT] Phản hồi tức thì giọng đọc cực hay cho ${selectedVoice}`);
+      console.info(`[TTS-CACHE-HIT] Phản hồi tức thì giọng đọc cực sạch cho ${selectedVoice}`);
       return res.json({ audioBase64: ttsMemoryCache.get(cacheKey) });
     }
 
@@ -679,45 +624,31 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
     }
 
     const isFemale = voiceForGemini === "Kore" || voiceForGemini === "Aoede";
-
+    
     // Perform ultimate phonetic preprocessing before TTS synthesis for maximum beauty (skip for English text)
-    const phoneticOptimizedText = isEnglish ? text : sanitizeTextForVietnameseTTS(text);
+    const phoneticOptimizedText = isEnglish ? cleanSpeechText : sanitizeTextForVietnameseTTS(cleanSpeechText);
 
-    // Formulate a clean pronunciation script with clear stage cues so Google TTS reads only the beautiful words
-    let finalTTSScript = "";
-    if (isEnglish) {
-      finalTTSScript = `REQUIREMENT FOR PREMIUM ENGLISH PRONUNCIATION - PROFESSIONAL REVIEWER STYLE, HIGH-CLASS VOICE OVER:
-You are an outstanding voice artist and highly acclaimed brand voiceover specialist. You excel in product reviews, tech showcases, modern lifestyle stories, and captivating consumers with your persuasive tone.
-Your main mission is to pronounce the text in premium English with excellent flow, authentic accent, natural breathing, and deep emotional appeal.
+    // Formulate a robust system instruction for the Gemini Voice generation model
+    const systemInstruction = isEnglish
+      ? `You are an elite, highly professional ${isFemale ? "female" : "male"} brand voiceover artist and professional reviewer.
+Your main mission is to pronounce the user text in premium English with excellent flow, authentic accent, natural breathing, and deep emotional appeal.
 
 MANDATORY RULES:
 1. NATURAL EXPRESSION & EMOTION: Exude authenticity, credibility, and premium tone. Do not sound robotic. Put soul, genuine warmth, and appropriate excitement into nouns and verbs highlighting benefits.
 2. NATURAL CADENCE & BREATHING: Maintain a steady, natural tempo. Incorporate subtle breathing spaces between phrases to feel like a real human. Pause 0.4-0.6s at commas, 0.8s at periods to allow natural breath distribution.
-3. CLEAR PRONUNCIATION: Clear, articulate words. Skip reading strange symbols or emojis.
-4. TARGET VOICE STYLE: ${accentInstruction}
+3. CLEAR PRONUNCIATION: Clear, articulate words. Skip reading strange symbols, hashtags, or emojis.
+4. TARGET VOICE PROFILE: ${accentInstruction}
 
-CRITICAL: Only record the text content inside the double quotes of 'TEXT TO BE SPOKEN'. Do not add any greeting, intro, outro, title, or read the guidelines. Start exactly from the first word and end on the last word.
+CRITICAL: Only read/record the EXACT words provided in the user contents. Do not add any greeting, intro, outro, explanations, commentary, or say "TEXT TO BE SPOKEN". Start exactly from the first word and end on the last word.`
+      : `Bạn là một ${isFemale ? "Nữ" : "Nam"} nghệ sĩ lồng tiếng và MC danh tiếng hàng đầu tại Việt Nam, sở hữu chất giọng miền Nam (Sài Gòn) cực kỳ truyền cảm, ấm áp, lôi cuốn và đĩnh đạc nhất.
 
-TEXT TO BE SPOKEN:
-"${phoneticOptimizedText}"`;
-    } else {
-      finalTTSScript = `YÊU CẦU PHÁT ÂM TIẾNG VIỆT CHUẨN MIỀN NAM (SÀI GÒN) - GIỌNG ĐỌC PHÁT THANH VIÊN CHUYÊN NGHIỆP, TRUYỀN CẢM, ĐẦY ĐỦ CẢM XÚC VÀ TỰ NHIÊN NHẤT:
-Bạn là một Nghệ sĩ lồng tiếng xuất chúng và MC danh tiếng hàng đầu tại Việt Nam. Chuyên gia về các video review sản phẩm công nghệ, phong cách sống hiện đại, gia dụng tiện ích và chia sẻ trải nghiệm đầy lôi cuốn thuyết phục.
-Nhiệm vụ tối cao của bạn là phát âm GIỌNG MIỀN NAM VIỆT NAM (SÀI GÒN) cực kỳ truyền cảm, tự nhiên, ấm áp, nhịp điệu trôi chảy không bị vấp hay giật cục.
-
-BẮT BUỘC TUÂN THỦ CÁC QUY TẮC NGHỆ THUẬT PHÁT ÂM VÀ KIỂM SOÁT HƠI THỞ SAU:
-1. BIỂU CẢM TRUYỀN CẢM TỰ NHIÊN: Tỏa ra năng lượng chân thành, uy tín, cuốn hút người nghe. Hãy thổi hồn và cảm xúc chân thật, ấm áp vào từng nguyên âm. Không được đọc đều đều như máy, phải nhấn giọng vào các tính từ, động từ mang tính lợi ích sản phẩm để tạo sự thuyết phục.
-2. TIẾT TẤU & HƠI THỞ (Natural Cadence): Đọc thong thả, vừa phải, tròn trịa, không nói quá nhanh dồn dập. Có tiếng hít thở nhẹ nhàng, kịch tính vừa đủ giữa các cụm từ để tạo cảm giác giọng nói của một con người thật đang chia sẻ chân thành. Dừng khoảng 0.4 đến 0.6 giây sau các dấu phẩy, 0.8 giây sau dấu chấm để phân bổ hơi thở tự nhiên.
-3. NHẤN NHÁ & THANH ĐIỆU NAM BỘ: Luyến láy tự nhiên, mềm mượt nịnh tai, thể hiện thổ âm Nam Bộ ấm áp, tinh tế và đáng tin cậy.
-4. KHÔNG ĐỌC BIỂU TƯỢNG VÀ KÝ HIỆU: Chỉ đọc từ ngữ thuần túy, bỏ qua hoàn toàn các kí tự lạ nếu có.
-
-MẪU GIỌNG YÊU CẦU: ${accentInstruction}
-
-YÊU CẦU CỰC KỲ QUAN TRỌNG: Bạn chỉ được ghi âm duy nhất phần nội dung nằm giữa hai dấu ngoặc kép của mục 'VĂN BẢN REVIEW CẦN ĐỌC'. Tuyệt đối không được tự ý nói thêm bớt từ ngữ nào, không chào hỏi, không đọc tiêu đề, không đọc các quy tắc ghi âm, chỉ bắt đầu phát âm từ chữ đầu tiên đến chữ cuối cùng của kịch bản review.
-
-VĂN BẢN REVIEW CẦN ĐỌC:
-"${phoneticOptimizedText}"`;
-    }
+QUY TẮC BẮT BUỘC KHI GHI ÂM GIỌNG ĐỌC:
+1. BIỂU CẢM TRUYỀN CẢM TỰ NHIÊN: Tỏa ra năng lượng chân thành, uy tín, cuốn hút người nghe. Thổi hồn và cảm xúc chân thật, đầy đặn sinh khí vào từng chữ. Tuyệt đối không được đọc đều đều hay vô cảm như robot. Nhấn giọng vào các tính từ, động từ làm nổi bật lợi ích sản phẩm.
+2. TIẾT TẤU & HƠI THỞ: Đọc thong thả, tròn trịa, tốc độ vừa phải. Có tiếng hít thở nhẹ nhàng tự nhiên giữa các cụm từ để tạo cảm giác giọng nói của một con người thật đang chia sẻ tâm đắc. Dừng khoảng 0.4 đến 0.6 giây sau dấu phẩy, 0.8 giây sau dấu chấm để phân bổ hơi thở tự nhiên.
+3. NHẤN NHÁ & THANH ĐIỆU NAM BỘ: Luyến láy tự nhiên, mượt mà nịnh tai, thể hiện thổ âm Nam Bộ ấm áp, tinh tế và đáng tin cậy nhất.
+4. KHÔNG ĐỌC KÝ TỰ ĐẶC BIỆT: Bỏ qua hoàn toàn các biểu tượng cảm xúc (emojis), dấu hoa thị (*), hashtag (#) nếu có trong văn bản kịch bản. Chỉ đọc từ ngữ thuần túy.
+5. CHỈ ĐỌC VĂN BẢN ĐƯỢC CUNG CẤP: Không chào hỏi, không thêm bớt bất kỳ lời dẫn hay lời kết nào, không giải thích hay hỏi ngược lại người dùng. Bắt đầu ngay từ từ đầu tiên của kịch bản và kết thúc ở từ cuối cùng.
+6. TARGET VOICE PROFILE: ${accentInstruction}`;
 
     let base64Audio = null;
     try {
@@ -725,7 +656,7 @@ VĂN BẢN REVIEW CẦN ĐỌC:
         (model) => 
           ai.models.generateContent({
             model: model,
-            contents: [{ parts: [{ text: finalTTSScript }] }],
+            contents: [{ parts: [{ text: phoneticOptimizedText }] }],
             config: {
               responseModalities: ["AUDIO"],
               speechConfig: {
@@ -746,7 +677,7 @@ VĂN BẢN REVIEW CẦN ĐỌC:
         ttsMemoryCache.set(cacheKey, base64Audio);
       }
     } catch (apiError: any) {
-      console.warn("API Gemini TTS gặp bận rộn tạm thời hoặc quá tải:", apiError.message);
+      console.error("[TTS-ERROR-DETAILED] Lỗi chi tiết khi gọi Gemini TTS API:", apiError);
     }
 
     if (!base64Audio) {
@@ -830,21 +761,27 @@ YÊU CẦU THIẾT KẾ & TẤN CÔNG ĐỘ DÀI:
 
 Hãy thực thi nhiệm vụ một cách chuyên nghiệp nhất!`;
 
-    const response = await generateWithRetry(
-      (model) => 
-        ai.models.generateContent({
-          model: model,
-          contents: [{ parts: [{ text: optimizationPrompt }] }],
-        }),
-      3,
-      1000,
-      "gemini-2.5-flash",
-      false
-    );
+    let resultText = "";
+    try {
+      const response = await generateWithRetry(
+        (model) => 
+          ai.models.generateContent({
+            model: model,
+            contents: [{ parts: [{ text: optimizationPrompt }] }],
+          }),
+        3,
+        1000,
+        "gemini-2.5-flash",
+        false
+      );
 
-    const resultText = response.text;
-    if (!resultText) {
-      throw new Error("Không thể tối ưu hóa kịch bản từ mô hình AI.");
+      resultText = response.text || "";
+      if (!resultText) {
+        throw new Error("Không thể tối ưu hóa kịch bản từ mô hình AI.");
+      }
+    } catch (apiError: any) {
+      console.log("[OPTIMIZE-FALLBACK] Gemini API is currently busy. Returning original script without modification.");
+      resultText = script || "";
     }
 
     res.json({ optimizedScript: resultText.trim() });
@@ -939,7 +876,7 @@ Hãy kiến tạo các thông tin chất lượng cao, sành sỏi, tinh tế ch
       }
       trendData = JSON.parse(resultText);
     } catch (apiError: any) {
-      console.warn("API Gemini scan-trending-products gặp sự cố (Tải sản phẩm xu hướng lưu trữ):", apiError.message);
+      console.log("[TRENDS-FALLBACK] Gemini Trends API is busy. Serving high-converting offline trending products list.");
       trendData = {
         trendingProducts: [
           {
@@ -1074,7 +1011,7 @@ Trả về kết quả chuẩn định dạng JSON chứa mảng "hooks" như sa
       }
       hooksData = JSON.parse(resultText);
     } catch (apiError: any) {
-      console.warn("API Gemini suggest-hooks gặp sự cố, sử dụng chế độ dự phòng:", apiError.message);
+      console.log("[HOOKS-FALLBACK] Gemini Hooks API is busy. Constructing dynamic high-converting fallback hooks.");
       hooksData = {
         hooks: isEn ? [
           `WARNING: WHAT THEY NEVER TOLD YOU ABOUT ${uppercaseName}!`,
@@ -1108,14 +1045,17 @@ app.post("/api/translate-subtitles", async (req, res): Promise<any> => {
     const ai = getGoogleAI();
 
     const promptText = `
-You are a translation expert specialized in localization, commercial copywriting, and subtitle translation.
+You are a world-class localization expert and creative marketing copywriter specialized in professional subtitle translation for short-form video commercials (TikTok, Reels, YouTube Shorts, CapCut).
 Your task is to translate a sequence of short subtitle segments from ${sourceLang === 'vi' ? 'Vietnamese' : 'English'} to ${targetLang === 'vi' ? 'Vietnamese' : 'English'}.
 
-CRITICAL REQUIREMENTS:
-1. Preserve the style and tone: The translations must be engaging, professional, natural, and suited for short-form commercial videos (like TikTok, Reels, CapCut).
-2. Maintain contextual flow: Read the sequence of segments as a continuous script. Ensure the translations make sense together as a story or speech.
-3. Length and pacing: Subtitles must be readable in short bursts. Keep translations concise and of similar syllable count/length to the original so they fit the timing. Do not over-explain or add unnecessary fluff.
-4. Output formatting: Return exactly one translated string for each input segment, in the exact same order. Do not skip any segments. Do not include any HTML tags or meta-annotations.
+CRITICAL REQUIREMENTS FOR ULTIMATE PROFESSIONALISM AND CLASS:
+1. ELEVATED STYLE & COMMERCIAL copywriting: Do not translate literally word-for-word. Use high-impact commercial vocabulary, strong active verbs, and natural native phrasing.
+   - For Vietnamese to English: Translate trendy words beautifully (e.g., "chất như nước cất" -> "top-tier quality" / "absolutely premium", "bão view" -> "going fully viral", "ngon bổ rẻ" -> "unbeatable value", "đập hộp" -> "unboxing live").
+   - Ensure the tone is elite, smooth, persuasive, and perfectly localized for standard luxury or trending consumer brands.
+2. CONCISE PACING & BREVITY: Subtitles are shown in rapid successions. Keep every segment extremely tight and punchy (ideally under 5-7 words per segment). Never over-explain or write long-winded academic sentences.
+3. FLUID CONTEXTUAL FLOW: Read the list of segments as one single continuous narrative script. Ensure that transition words, sentence connections, and tense are consistent and seamless when read in succession.
+4. ABSOLUTE CLEANLINESS: Strip away all technical annotations, brackets, markdown, or cues (e.g., [Music], (Laughter), KOL:, MC:). Only translate the pure spoken words.
+5. CASING Consistency: Return clean, standard Sentence Case (e.g., "Unlock your true potential today") to ensure the subtitle layout looks beautifully polished, minimalist, and high-class.
 
 Input segments to translate:
 ${segments.map((seg: any, idx: number) => `[${idx}]: "${seg.text}"`).join("\n")}
@@ -1150,7 +1090,7 @@ ${segments.map((seg: any, idx: number) => `[${idx}]: "${seg.text}"`).join("\n")}
       }
       translationsData = JSON.parse(resultText);
     } catch (apiError: any) {
-      console.warn("API Gemini translate-subtitles gặp sự cố, sử dụng chế độ dự phòng:", apiError.message);
+      console.log("[TRANSLATE-FALLBACK] Gemini Translation API is busy. Falling back to direct layout preservation.");
       // Fallback simple translation or just copy if fail
       translationsData = {
         translations: segments.map((seg: any) => {

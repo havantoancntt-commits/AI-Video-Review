@@ -50,6 +50,7 @@ import {
   Sun,
   Moon,
   Smartphone,
+  Cpu,
   Move,
   Globe
 } from 'lucide-react';
@@ -108,17 +109,33 @@ interface SubtitleSegment {
   sentenceIndex?: number;
 }
 
-function getSegmentsFromScript(scriptText: string, totalDuration: number = 0): SubtitleSegment[] {
-  if (!scriptText) return [];
-  
-  // Clean all brackets, parentheses, and speaker indicators for clean viewable speech
-  const cleanText = scriptText
+export function cleanScriptForSpeech(scriptText: string): string {
+  if (!scriptText) return "";
+  return scriptText
     .replace(/\[[^\]]*\]/g, ' ') 
     .replace(/\([^)]*\)/g, ' ')  
     .replace(/[*#_~`]/g, ' ') // remove italics/bold markdown
     .replace(/(KOL:|Người dẫn:|Vlogger:|MC:|Dẫn chương trình:|Lời thoại:|Kịch bản:)/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+export function cleanSubtitleTranslation(text: string): string {
+  if (!text) return "";
+  return text
+    .replace(/^["'“”‘’]|["'“”‘’]$/g, '') // strip surrounding quotes
+    .replace(/^[-\s:\.]+|[-\s:\.]+$/g, '') // strip leading/trailing dashes, colons, dots, spaces
+    .replace(/\[[^\]]*\]/g, '') // remove any brackets
+    .replace(/\([^)]*\)/g, '')  // remove any parentheses
+    .replace(/^(Translation|English|Vietnamese|Subtitles|Subtitle|Dịch|Bản dịch)\s*:\s*/gi, '') // remove speaker/meta labels
+    .trim();
+}
+
+function getSegmentsFromScript(scriptText: string, totalDuration: number = 0): SubtitleSegment[] {
+  if (!scriptText) return [];
+  
+  // Clean all brackets, parentheses, and speaker indicators for clean viewable speech
+  const cleanText = cleanScriptForSpeech(scriptText);
 
   if (cleanText.length === 0) return [];
 
@@ -511,6 +528,7 @@ export default function App() {
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const [selectedVoice, setSelectedVoice] = useState<string>('Kore');
   const [voiceGenderFilter, setVoiceGenderFilter] = useState<'female' | 'male'>('female');
+  const [ttsMode, setTtsMode] = useState<'cloud' | 'native'>('cloud');
 
   // Synchronize gender filter tab automatically with selectedVoice configuration
   useEffect(() => {
@@ -819,6 +837,73 @@ export default function App() {
     ];
   };
 
+  // Real-time dynamic Viral Retention Score calculator for million-view videos
+  const getViralRetentionScore = (): { score: number; level: string; color: string; advice: string } => {
+    if (!activeReview) return { score: 0, level: 'Chưa có', color: 'text-slate-500', advice: 'Hãy chọn hoặc phân tích sản phẩm để xem điểm.' };
+    const script = editedScript || activeReview.marketingScript || '';
+    let score = 50;
+    let advice = 'Kịch bản cơ bản tốt. Cần bổ sung thêm gia vị viral.';
+
+    // Check for Hooks
+    if (script.includes('[SIÊU HOOK TRIỆU VIEW]')) {
+      score += 15;
+    } else {
+      advice = 'Hãy chèn "Siêu Hook" vào đầu kịch bản để thu hút giữ chân 3s đầu cực đại.';
+    }
+
+    // Check for B-Roll directions
+    if (script.includes('[Gợi ý B-Roll:')) {
+      score += 15;
+    } else {
+      if (score < 80) advice = 'Hãy chèn "Gợi ý máy quay B-Roll" giúp thị giác biến chuyển đa dạng.';
+    }
+
+    // Check for SFX audio effects
+    if (script.includes('[SFX:')) {
+      score += 15;
+    } else {
+      if (score < 80 && advice.startsWith('Kịch bản')) advice = 'Chèn hiệu ứng SFX leng keng kích thích xúc cảm chốt đơn sâu sắc.';
+    }
+
+    // Word rate check
+    const words = script.split(/\s+/).filter(Boolean).length;
+    const dur = uploadedVideoDuration || audioDuration || 45;
+    const rate = words / dur;
+    if (rate >= 2.0 && rate <= 2.5) {
+      score += 5;
+    } else if (rate > 2.5) {
+      score -= 5;
+      advice = `Tốc độ đọc đang hơi nhanh (~${rate.toFixed(1)} từ/giây). Cân nhắc rút ngắn bớt văn bản để khán giả kịp nghe ngấm.`;
+    } else if (rate < 2.0 && words > 0) {
+      score -= 5;
+      advice = `Tốc độ đọc hơi chậm (~${rate.toFixed(1)} từ/giây). Hãy bổ sung thêm lời thoại lấp đầy thời lượng.`;
+    }
+
+    // Check for Call To Action
+    const hasCta = /(giỏ hàng|mua ngay|đặt mua|link bên dưới|nhấp vào|săn)/i.test(script);
+    if (hasCta) {
+      score += 5;
+    }
+
+    score = Math.min(100, Math.max(0, score));
+
+    let level = 'Sơ cấp (Cần Tối Ưu)';
+    let color = 'text-rose-400';
+    if (score >= 90) {
+      level = 'Hoàn Mỹ Triệu Views 👑';
+      color = 'text-amber-400';
+      advice = 'Kịch bản đạt tỉ lệ giữ chân tối đa! Sẵn sàng lồng tiếng và sản xuất.';
+    } else if (score >= 75) {
+      level = 'Khá Cao (Hứa Hẹn Viral) ⚡';
+      color = 'text-emerald-400';
+    } else if (score >= 60) {
+      level = 'Trung bình (Đủ Dùng)';
+      color = 'text-yellow-400';
+    }
+
+    return { score, level, color, advice };
+  };
+
   // Auto speech speed optimizer effect
   useEffect(() => {
     if (isAutoSpeedEnabled) {
@@ -845,11 +930,16 @@ export default function App() {
     let modified = editedScript || activeReview.marketingScript;
 
     if (type === 'hook') {
+      const rawName = activeReview?.productName || "siêu phẩm này";
+      // Clean name for hook, remove bracket annotations, keep it neat
+      const cleanName = rawName.replace(/\(.*?\)/g, '').trim();
       const hooks = [
-        "Sự thật cực kỳ đắt giá khi trải nghiệm trực tiếp sản phẩm này...",
-        "Có một lưu ý quan trọng về thiết kế giúp bạn giải quyết vướng mắc...",
-        "Nhiều người đánh giá rất cao, nhưng đây mới là trải nghiệm thực tế...",
-        "Đây là một sai lầm cực lớn nếu bạn chủ quan bỏ qua lưu ý này..."
+        `Trời đất ơi, đừng vội mua ${cleanName} nếu cả nhà chưa xem hết clip này nha...`,
+        `Sự thật cực kỳ đắt giá về em ${cleanName} mà người bán không bao giờ nói cho bạn biết...`,
+        `Bình tĩnh! Có một cảnh báo cực kỳ quan trọng về thiết kế của ${cleanName} nè...`,
+        `Nhiều người tốn tiền oan uổng cho ${cleanName}, đây mới là trải nghiệm thực tế của mình...`,
+        `Bữa nay mình bóc phốt chân thực xem ${cleanName} có đáng đồng tiền bát gạo như lời đồn không nha...`,
+        `Nếu đang định sắm ${cleanName} thì dừng lại ba giây coi kỹ cái này giúp mình nheng...`
       ];
       const randomHook = hooks[Math.floor(Math.random() * hooks.length)];
       // Remove any existing Hook marker to avoid piling up
@@ -862,19 +952,23 @@ export default function App() {
         return;
       }
       modified = modified
-        .replace(/(nhất|ưu điểm|đột phá|chất liệu|thiết kế|tiết kiệm)/gi, `$1 [Gợi ý B-Roll: Quay cận cảnh macro chuyển động 60fps góc nghiêng sang trọng]`)
-        .replace(/giỏ hàng/gi, `chiếc giỏ hàng màu vàng nhỏ [Gợi ý B-Roll: Trỏ tay tinh tế hướng giỏ hàng góc trái]`);
+        .replace(/(nhất|đột phá|ưu điểm|độc đáo)/gi, `$1 [Gợi ý B-Roll: Lia máy nhanh kiểu Whip Pan tập trung vào chi tiết đắt giá]`)
+        .replace(/(chất liệu|thiết kế|ngoại hình|bề mặt)/gi, `$1 [Gợi ý B-Roll: Quay cận cảnh macro chuyển động siêu mượt 60fps góc nghiêng phản chiếu ánh sáng sang trọng]`)
+        .replace(/(tiết kiệm|hiệu năng|tốc độ|mượt mà)/gi, `$1 [Gợi ý B-Roll: Hiệu ứng Speed Ramp tăng tốc độ rồi dừng đột ngột để phô diễn công năng cực mượt]`)
+        .replace(/(trải nghiệm|cảm giác|cảm nhận|sử dụng)/gi, `$1 [Gợi ý B-Roll: Cận cảnh tay lướt chạm sướng mắt, lột tả cảm giác chân thực tuyệt vời]`)
+        .replace(/giỏ hàng/gi, `chiếc giỏ hàng màu vàng nhỏ [Gợi ý B-Roll: Trỏ tay tinh tế hướng giỏ hàng góc trái nhấp nháy chuyển động thu hút]`);
       
-      modified = `[Gợi ý B-Roll: Quay mở cảnh tracking lia máy từ xa đến gần] ${modified}`;
+      modified = `[Gợi ý B-Roll: Quay mở cảnh lia máy nhẹ nhàng từ trên xuống dưới hé lộ toàn cảnh sản phẩm] ${modified}`;
     } else if (type === 'sfx') {
       if (modified.includes('[SFX:')) {
         setApiError('Đã chèn hiệu ứng âm thanh SFX vào kịch bản.');
         return;
       }
       modified = modified
-        .replace(/(ngạc nhiên|bất ngờ|hóa ra|ôi|wow)/gi, `[SFX: Cinematic Swoosh] $1`)
-        .replace(/(đơn hàng|mua ngay|giỏ hàng|quyền lợi|ưu đãi|đặc quyền)/gi, `[SFX: Cash Register leng keng ngân vang] $1`)
-        .replace(/(mượt mà|tinh xảo|ấm áp|hoàn hảo)/gi, `[SFX: Sparkle lấp lánh nhẹ nhàng] $1`);
+        .replace(/(ngạc nhiên|bất ngờ|hóa ra|ôi|wow|sững sờ|đặc biệt)/gi, `[SFX: Cinematic Swoosh chuyển cảnh kịch tính] $1`)
+        .replace(/(đơn hàng|mua ngay|giỏ hàng|quyền lợi|ưu đãi|đặc quyền|săn ngay)/gi, `[SFX: Cash Register leng keng kích thích chốt đơn] $1`)
+        .replace(/(mượt mà|tinh xảo|ấm áp|hoàn hảo|tuyệt vời|đã lắm)/gi, `[SFX: Sparkle lấp lánh nịnh tai] $1`)
+        .replace(/(cảnh báo|lưu ý|sai lầm|sự thật)/gi, `[SFX: Camera Shutter dồn dập lôi cuốn] $1`);
     }
 
     setEditedScript(modified);
@@ -2852,8 +2946,49 @@ export default function App() {
     setApiError(null);
     setIsPlaying(false);
 
+    // Ultimate Native Device TTS Mode: 100% natural and robust local voice synthesis
+    if (ttsMode === 'native') {
+      setIsClientTTSActive(true);
+      setClientTTSScript(textToSynthesize);
+      // Generate a programmatic silent WAV whose duration matches estimated speak speed (approx 14 chars/sec)
+      const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
+      const estimatedDuration = Math.max(12, Math.ceil(cleanSpeech.length / 14));
+      const wavUrl = generateSilentWav(estimatedDuration, 24000);
+      
+      const cacheKey = `v15_natural_tts:${selectedVoice}:${cleanSpeech.trim()}`;
+      ttsClientCache.current[cacheKey] = {
+        url: wavUrl,
+        useClientTTS: true
+      };
+
+      setAudioUrl(wavUrl);
+      setIsGeneratingTTS(false);
+
+      // Auto play once loaded
+      setTimeout(() => {
+        if (audioRef.current) {
+          setupPreviewAudioGraph();
+          audioRef.current.playbackRate = playbackSpeed;
+          audioRef.current.play()
+            .then(() => {
+              setIsPlaying(true);
+              speakClientTTS(textToSynthesize, 0);
+              if (isSyncPlay && videoRef.current) {
+                videoRef.current.currentTime = 0;
+                videoRef.current.playbackRate = 1.0;
+                videoRef.current.volume = videoOriginalMute ? 0 : (duckOriginalAudio ? 0.15 : 0.8);
+                videoRef.current.play().catch(e => console.log('Video autoplay interrupted', e));
+              }
+            })
+            .catch(err => console.log('Auto-play blocked by browser. Ready for manual play.', err));
+        }
+      }, 50);
+      return;
+    }
+
     // Dynamic Client-side Caching: instantly serve matching voice script configurations
-    const cacheKey = `v13_south:${selectedVoice}:${textToSynthesize.trim()}`;
+    const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
+    const cacheKey = `v15_natural_tts:${selectedVoice}:${cleanSpeech.trim()}`;
     const cached = ttsClientCache.current[cacheKey];
     if (cached) {
       console.info("[CLIENT-CACHE-HIT] Khởi chạy tức thì từ bộ nhớ đệm kịch bản:", cacheKey);
@@ -2923,7 +3058,7 @@ export default function App() {
         setIsClientTTSActive(true);
         setClientTTSScript(textToSynthesize);
         // Generate a programmatic silent WAV whose duration matches estimated speak speed (approx 14 chars/sec)
-        const estimatedDuration = Math.max(12, Math.ceil(textToSynthesize.length / 14));
+        const estimatedDuration = Math.max(12, Math.ceil(cleanSpeech.length / 14));
         const wavUrl = generateSilentWav(estimatedDuration, 24000);
         
         // Cache client tts fallback
@@ -3016,7 +3151,7 @@ export default function App() {
         setIsClientTTSActive(true);
         setClientTTSScript(textToSynthesize);
 
-        const estimatedDuration = Math.max(12, Math.ceil(textToSynthesize.length / 14));
+        const estimatedDuration = Math.max(12, Math.ceil(cleanSpeech.length / 14));
         const wavUrl = generateSilentWav(estimatedDuration, 24000);
 
         ttsClientCache.current[cacheKey] = {
@@ -3063,7 +3198,8 @@ export default function App() {
     window.speechSynthesis.cancel();
     
     // Slice script text to allow resuming speech from current playback percent
-    const words = text.split(' ');
+    const cleanSpeech = cleanScriptForSpeech(text);
+    const words = cleanSpeech.split(' ');
     const startIndex = Math.floor(words.length * offsetPercentage);
     const textSubset = words.slice(startIndex).join(' ');
     
@@ -3119,14 +3255,50 @@ export default function App() {
       // 2. Precise Gender Classification
       let isVoiceFemale = true; // default to female
       
-      if (nameLower.includes('female') || nameLower.includes('nữ') || nameLower.includes('nư') || nameLower.includes('hoaimy') || nameLower.includes('hoài my') || nameLower.includes('linh') || nameLower.includes('lan') || nameLower.includes('chi') || nameLower.includes('mai') || nameLower.includes('zira') || nameLower.includes('samantha') || nameLower.includes('susan') || nameLower.includes('hazel')) {
+      const isExplicitFemale = nameLower.includes('female') || 
+                               nameLower.includes('nữ') || 
+                               nameLower.includes('nư') || 
+                               nameLower.includes('hoaimy') || 
+                               nameLower.includes('hoài my') || 
+                               nameLower.includes('linh') || 
+                               nameLower.includes('lan') || 
+                               nameLower.includes('chi') || 
+                               nameLower.includes('mai') || 
+                               nameLower.includes('zira') || 
+                               nameLower.includes('samantha') || 
+                               nameLower.includes('susan') || 
+                               nameLower.includes('hazel') ||
+                               nameLower.includes('an-neural') || 
+                               nameLower.includes('anneural') || 
+                               nameLower.includes('microsoft an') ||
+                               nameLower.includes('google vi-vn'); // google vi-vn is female by default
+      
+      const isExplicitMale = nameLower.includes('male') || 
+                             nameLower.includes('namminh') || 
+                             nameLower.includes('nam minh') || 
+                             nameLower.includes('tuấn') || 
+                             nameLower.includes('tuan') || 
+                             nameLower.includes('phong') || 
+                             nameLower.includes('minh') || 
+                             nameLower.includes('dũng') || 
+                             nameLower.includes('dung') || 
+                             nameLower.includes('hùng') || 
+                             nameLower.includes('hung') || 
+                             nameLower.includes('david') || 
+                             nameLower.includes('mark') || 
+                             nameLower.includes('george') ||
+                             nameLower.includes('guy') ||
+                             nameLower.includes('stefan') ||
+                             nameLower.includes('microsoft hoang') || // Hoàng is male
+                             nameLower.includes('hoàng') ||
+                             nameLower.includes('nam_minh');
+
+      if (isExplicitFemale) {
         isVoiceFemale = true;
-      } else if (nameLower.includes('male') || nameLower.includes('namminh') || nameLower.includes('nam minh') || nameLower.includes('tuấn') || nameLower.includes('tuan') || nameLower.includes('phong') || nameLower.includes('minh') || nameLower.includes('dũng') || nameLower.includes('dung') || nameLower.includes('hùng') || nameLower.includes('hung') || nameLower.includes('david') || nameLower.includes('mark') || nameLower.includes('george')) {
+      } else if (isExplicitMale) {
         isVoiceFemale = false;
-      } else if (nameLower.includes('anneural') || nameLower.includes('an-neural') || nameLower.includes('microsoft an')) {
-        isVoiceFemale = true;
       } else {
-        // stand-alone gender check
+        // stand-alone gender check - remove noise first
         const cleanName = nameLower
           .replace('vietnam', '')
           .replace('viet nam', '')
@@ -3134,7 +3306,9 @@ export default function App() {
           .replace('nam bộ', '')
           .replace('nambộ', '')
           .replace('nam bo', '')
-          .replace('nambo', '');
+          .replace('nambo', '')
+          .replace('vi-vn', '')
+          .replace('vivn', '');
         
         if (cleanName.includes('nam')) {
           isVoiceFemale = false;
@@ -3299,7 +3473,8 @@ export default function App() {
       // Ensure backup voice is upgraded to high definition Google AI Studio voiceover on export
       let currentAudioUrl = audioUrl;
       const textToSynthesize = (editedScript || activeReview?.marketingScript || "").trim();
-      const cacheKey = `v13_south:${selectedVoice}:${textToSynthesize}`;
+      const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
+      const cacheKey = `v15_natural_tts:${selectedVoice}:${cleanSpeech.trim()}`;
       const cached = ttsClientCache.current[cacheKey];
       
       const needsRealTTS = isClientTTSActive || 
@@ -3533,7 +3708,7 @@ export default function App() {
             ...seg,
             start: Number((seg.start * scaleRatio).toFixed(3)),
             end: Number((seg.end * scaleRatio).toFixed(3)),
-            translation: seg.translation || (bilingualEnabled ? (subtitleTranslations[seg.text] || "") : "")
+            translation: cleanSubtitleTranslation(seg.translation || (bilingualEnabled ? (subtitleTranslations[seg.text] || "") : ""))
           }));
         }
       } else {
@@ -3549,7 +3724,7 @@ export default function App() {
         // Tự động đính kèm bản dịch song ngữ từ bộ nhớ đệm nếu bilingualEnabled
         videoSubSegments = autoSegments.map(seg => ({
           ...seg,
-          translation: bilingualEnabled ? (subtitleTranslations[seg.text] || "") : ""
+          translation: cleanSubtitleTranslation(bilingualEnabled ? (subtitleTranslations[seg.text] || "") : "")
         }));
       }
 
@@ -4810,7 +4985,7 @@ export default function App() {
       if (data && Array.isArray(data.translations)) {
         const newTranslations = { ...subtitleTranslations };
         segmentsToTranslate.forEach((seg, idx) => {
-          newTranslations[seg.text] = data.translations[idx] || "";
+          newTranslations[seg.text] = cleanSubtitleTranslation(data.translations[idx] || "");
         });
         setSubtitleTranslations(newTranslations);
 
@@ -4818,7 +4993,7 @@ export default function App() {
         if (customSubtitleSegments) {
           const updated = customSubtitleSegments.map(seg => ({
             ...seg,
-            translation: newTranslations[seg.text] || subtitleTranslations[seg.text] || ""
+            translation: cleanSubtitleTranslation(newTranslations[seg.text] || subtitleTranslations[seg.text] || "")
           }));
           setCustomSubtitleSegments(updated);
         }
@@ -4855,7 +5030,7 @@ export default function App() {
     );
     return autoSegments.map(seg => ({
       ...seg,
-      translation: subtitleTranslations[seg.text] || ""
+      translation: cleanSubtitleTranslation(subtitleTranslations[seg.text] || "")
     }));
   }, [activeScriptText, audioDuration, customSubtitleSegments, subtitleTranslations]);
 
@@ -7170,16 +7345,32 @@ export default function App() {
               Lựa chọn tông giọng đọc tối ưu cho từng loại kịch bản để tăng kịch tính và thuyết phục mua sắm.
             </p>
 
+            {/* Technology Engine Info Card */}
+            <div className="space-y-1.5 bg-gradient-to-r from-amber-500/[0.03] to-orange-500/[0.03] border border-amber-500/20 rounded-xl p-3 shadow-[0_0_15px_rgba(245,158,11,0.03)]">
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] font-black uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+                  <Cpu className="w-3.5 h-3.5 animate-pulse" />
+                  <span>⚡ Động cơ Lồng tiếng Google AI Studio (Gemini)</span>
+                </label>
+                <span className="text-[8px] bg-amber-500/20 text-amber-300 font-bold px-1.5 py-0.5 rounded border border-amber-500/30">
+                  PREMIUM PRO
+                </span>
+              </div>
+              <p className="text-[9.5px] text-amber-300/90 leading-relaxed font-sans font-medium">
+                🤖 Đang kích hoạt <strong>Trí tuệ Nhân tạo Gemini</strong> để lồng tiếng chuẩn giọng đọc miền Nam (Sài Gòn). Giọng đọc đạt cảm xúc điện ảnh kịch tính, lôi cuốn, trầm bổng nịnh tai và tự nhiên nhất.
+              </p>
+            </div>
+
             {/* Smart Gender Selector Segmented Tabs */}
             <div className="grid grid-cols-2 p-1 bg-white/[0.02] border border-white/5 rounded-xl gap-1">
               <button
                 type="button"
                 onClick={() => {
                   setVoiceGenderFilter('female');
-                  // Intelligent auto-selection: avoid mixup where activeVoice is male
+                  // Intelligent auto-selection: avoid mixup where activeVoice is male or wrong language
                   const activeVoice = TTS_VOICES.find(v => v.id === selectedVoice);
-                  if (!activeVoice || activeVoice.gender !== 'female') {
-                    const firstFemale = TTS_VOICES.find(v => v.gender === 'female');
+                  if (!activeVoice || activeVoice.gender !== 'female' || (activeVoice.language || 'vi') !== reviewLanguage) {
+                    const firstFemale = TTS_VOICES.find(v => v.gender === 'female' && (v.language || 'vi') === reviewLanguage);
                     if (firstFemale) {
                       setSelectedVoice(firstFemale.id);
                     }
@@ -7199,10 +7390,10 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   setVoiceGenderFilter('male');
-                  // Intelligent auto-selection: avoid mixup where activeVoice is female
+                  // Intelligent auto-selection: avoid mixup where activeVoice is female or wrong language
                   const activeVoice = TTS_VOICES.find(v => v.id === selectedVoice);
-                  if (!activeVoice || activeVoice.gender !== 'male') {
-                    const firstMale = TTS_VOICES.find(v => v.gender === 'male');
+                  if (!activeVoice || activeVoice.gender !== 'male' || (activeVoice.language || 'vi') !== reviewLanguage) {
+                    const firstMale = TTS_VOICES.find(v => v.gender === 'male' && (v.language || 'vi') === reviewLanguage);
                     if (firstMale) {
                       setSelectedVoice(firstMale.id);
                     }
@@ -7221,7 +7412,7 @@ export default function App() {
 
             {/* Filtered Voice List */}
             <div className="space-y-2">
-              {TTS_VOICES.filter((voice) => voice.gender === voiceGenderFilter).map((voice) => (
+              {TTS_VOICES.filter((voice) => voice.gender === voiceGenderFilter && (voice.language || 'vi') === reviewLanguage).map((voice) => (
                 <button
                   key={voice.id}
                   onClick={() => setSelectedVoice(voice.id)}
@@ -9428,9 +9619,9 @@ export default function App() {
                         <div className="flex items-center gap-1.5">
                           <span className="text-amber-500/80 font-bold uppercase tracking-wider">Teleprompter Pro</span>
                           <span className="w-1 h-1 bg-slate-700 rounded-full"></span>
-                          <span>{editedScript.length} ký tự</span>
+                          <span>{cleanScriptForSpeech(editedScript).length} ký tự</span>
                           <span className="w-1 h-1 bg-slate-700 rounded-full"></span>
-                          <span>{Math.round(editedScript.split(/\s+/).filter(Boolean).length)} từ</span>
+                          <span>{Math.round(cleanScriptForSpeech(editedScript).split(/\s+/).filter(Boolean).length)} từ</span>
                         </div>
                         <div className="flex items-center gap-2">
                           <button
@@ -9448,7 +9639,7 @@ export default function App() {
                           </button>
                           
                           <span className="text-amber-400 font-bold bg-amber-500/15 px-1.5 py-0.5 rounded border border-amber-500/20">
-                            ~{Math.max(1, Math.round(editedScript.split(/\s+/).filter(Boolean).length / 2.6))}s phát
+                            ~{Math.max(1, Math.round(cleanScriptForSpeech(editedScript).split(/\s+/).filter(Boolean).length / 2.6))}s phát
                           </span>
                         </div>
                       </div>
@@ -9495,6 +9686,119 @@ export default function App() {
                     <p className="text-[10px] text-amber-200 leading-relaxed font-sans">
                       Hãy nhấp <strong>"Lồng giọng ngay"</strong> ở góc trên bên trái trình phát nhạc sau khi điều chỉnh xong kịch bản để đồng bộ giọng đọc AI cực phẩm!
                     </p>
+                  </div>
+                </div>
+
+                {/* HỘP CÔNG CỤ TỐI ƯU TRIỆU VIEWS PRO (VIRAL RETENTION ENGINE) */}
+                <div className="bg-gradient-to-b from-[#0e0e0e] to-[#050505] border border-amber-500/15 rounded-3xl p-4 sm:p-6 space-y-5 relative overflow-hidden flex flex-col shadow-2xl">
+                  <div className="absolute top-0 right-0 p-4">
+                    <span className="text-[8px] text-amber-500/40 font-mono tracking-widest">RETENTION_ENGINE_v2.5</span>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <h3 className="text-xs uppercase tracking-[0.2em] text-amber-500 font-bold flex items-center gap-1.5">
+                      <TrendingUp className="w-4 h-4 text-amber-400" />
+                      Bộ tối ưu tốc độ giữ chân &amp; Triệu views
+                    </h3>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      Phân tích nội dung kịch bản theo thời gian thực và áp dụng các chiến thuật giữ chân người xem đỉnh cao:
+                    </p>
+                  </div>
+
+                  {/* VIRAL SCORE ANALYZER */}
+                  {(() => {
+                    const ret = getViralRetentionScore();
+                    return (
+                      <div className="p-4 rounded-2xl bg-white/[0.02] border border-white/5 space-y-3">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-bold text-slate-300">Chỉ số Sức Hút Video (Viral Score)</span>
+                          <span className={`font-mono font-black ${ret.color}`}>{ret.score} / 100</span>
+                        </div>
+                        <div className="h-2 w-full bg-slate-800 rounded-full overflow-hidden relative shadow-inner">
+                          <div 
+                            className="h-full bg-gradient-to-r from-amber-500 via-rose-500 to-amber-400 rounded-full transition-all duration-500"
+                            style={{ width: `${ret.score}%` }}
+                          />
+                        </div>
+                        <div className="flex items-start gap-2 text-[10px] leading-relaxed">
+                          <span className="text-amber-400 shrink-0 font-bold uppercase tracking-wider bg-amber-500/10 px-1.5 py-0.2 rounded border border-amber-500/20">{ret.level}</span>
+                          <p className="text-slate-400 italic">&ldquo;{ret.advice}&rdquo;</p>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* DIRECT HOOK INJECTOR */}
+                  <div className="space-y-2">
+                    <span className="text-[8px] text-slate-500 uppercase tracking-widest font-mono block">MÔ HÌNH CHÈN SIÊU HOOK THU HÚT 3S ĐẦU TIÊN TỚI KHÁN GIẢ</span>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {[
+                        { 
+                          label: '🚨 Cảnh Báo Sốc', 
+                          text: `CẢNH BÁO: ĐỪNG VỘI DÙNG ${activeReview?.productName ? activeReview.productName.replace(/\(.*?\)/g, '').trim().toUpperCase() : 'SẢN PHẨM'} NẾU CHƯA COI HẾT CLIP NÀY!`,
+                          style: 'tiktok-red'
+                        },
+                        { 
+                          label: '💡 Sự Thật Lạ', 
+                          text: `SỰ THẬT CỰC ĐẮT GIÁ VỀ TRẢI NGHIỆM THỰC TẾ CỦA ${activeReview?.productName ? activeReview.productName.replace(/\(.*?\)/g, '').trim().toUpperCase() : 'SẢN PHẨM'}...`,
+                          style: 'tiktok-yellow'
+                        },
+                        { 
+                          label: '⚡ FOMO Cực Độ', 
+                          text: `ĐỪNG LÃNG PHÍ TIỀN CHO ${activeReview?.productName ? activeReview.productName.replace(/\(.*?\)/g, '').trim().toUpperCase() : 'SẢN PHẨM'}, ĐÂY MỚI LÀ SỰ THẬT!`,
+                          style: 'beast-glow'
+                        },
+                        { 
+                          label: '⭐ So Sánh Chất', 
+                          text: `TRẢI NGHIỆM 1 THÁNG VỚI ${activeReview?.productName ? activeReview.productName.replace(/\(.*?\)/g, '').trim().toUpperCase() : 'SẢN PHẨM'} SẼ LÀM BẠN SỐC!`,
+                          style: 'cyberpunk-neon'
+                        },
+                      ].map((item, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => {
+                            setHookBannerText(item.text);
+                            setHookBannerStyle(item.style as any);
+                            setShowHookBanner(true);
+                            if (videoRef.current) {
+                              videoRef.current.currentTime = 0;
+                            }
+                          }}
+                          className="py-2 px-2.5 rounded-xl bg-[#080808] border border-white/5 hover:border-amber-500/20 text-[9px] font-bold text-slate-300 hover:text-amber-400 transition-all duration-200 cursor-pointer flex flex-col items-center justify-center gap-1 hover:scale-[1.02] shadow-sm text-center"
+                        >
+                          <span className="text-[10px]">{item.label.split(' ')[0]}</span>
+                          <span>{item.label.split(' ').slice(1).join(' ')}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* SOUNDTRACK RECOMMENDATION */}
+                  <div className="p-3 bg-gradient-to-r from-amber-500/10 to-transparent border-l-2 border-amber-500/40 rounded-r-xl space-y-1.5">
+                    <span className="text-[8px] font-mono font-bold text-amber-400 uppercase tracking-widest block">GỢI Ý MIX NHẠC NỀN &amp; SẮC THÁI PHÒNG THU TỰ NHIÊN</span>
+                    {(() => {
+                      let bgMusic = 'Deep House Lofi Beat (65 BPM)';
+                      let mixVolume = 'Âm lượng nền 12%';
+                      let expressions = 'Sâu lắng, sành điệu, có những khoảng ngừng tự nhiên';
+                      
+                      if (tonePreset.includes('Sôi động')) {
+                        bgMusic = 'Upbeat Tech House / Funk (124 BPM)';
+                        mixVolume = 'Âm lượng nền 8%';
+                        expressions = 'Đọc liền mạch dứt khoát, hào sảng kích thích';
+                      } else if (tonePreset.includes('Uy tín') || tonePreset.includes('Chuyên gia')) {
+                        bgMusic = 'Cinematic Minimal Piano (75 BPM)';
+                        mixVolume = 'Âm lượng nền 15%';
+                        expressions = 'Điềm đạm, trầm ấm, dõng dạc tạo uy tín tuyệt đối';
+                      }
+                      
+                      return (
+                        <div className="space-y-1 text-[10px] text-slate-300 leading-relaxed font-sans text-left">
+                          <p>🎵 <strong>Nhạc nền khuyên dùng:</strong> <span className="text-amber-300">{bgMusic}</span> &bull; <span>{mixVolume}</span></p>
+                          <p>🎙️ <strong>Cách đọc nịnh tai nhất:</strong> <span className="text-slate-400 italic">{expressions}</span></p>
+                        </div>
+                      );
+                    })()}
                   </div>
                 </div>
               </div>
