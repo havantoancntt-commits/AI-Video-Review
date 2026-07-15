@@ -582,8 +582,8 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
     // Clean all technical brackets and annotations so the voice is 100% pure and professional narration
     const cleanSpeechText = cleanTextForSpeech(text);
 
-    // Invalidate old cache and prefix with v15_natural_tts to force new clean phonetic setup update
-    const cacheKey = `v15_natural_tts:${selectedVoice}:${cleanSpeechText.trim()}`;
+    // Invalidate old cache and prefix with v16_saigon_tts to force new clean phonetic setup update
+    const cacheKey = `v16_saigon_tts:${selectedVoice}:${cleanSpeechText.trim()}`;
     if (ttsMemoryCache.has(cacheKey)) {
       console.info(`[TTS-CACHE-HIT] Phản hồi tức thì giọng đọc cực sạch cho ${selectedVoice}`);
       return res.json({ audioBase64: ttsMemoryCache.get(cacheKey) });
@@ -628,8 +628,8 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
     // Perform ultimate phonetic preprocessing before TTS synthesis for maximum beauty (skip for English text)
     const phoneticOptimizedText = isEnglish ? cleanSpeechText : sanitizeTextForVietnameseTTS(cleanSpeechText);
 
-    // Formulate a robust system instruction for the Gemini Voice generation model
-    const systemInstruction = isEnglish
+    // Formulate a robust prompt that embeds standard voice instructions directly inside user contents to guide gemini-3.1-flash-tts-preview elegantly
+    const combinedPromptText = isEnglish
       ? `You are an elite, highly professional ${isFemale ? "female" : "male"} brand voiceover artist and professional reviewer.
 Your main mission is to pronounce the user text in premium English with excellent flow, authentic accent, natural breathing, and deep emotional appeal.
 
@@ -639,16 +639,23 @@ MANDATORY RULES:
 3. CLEAR PRONUNCIATION: Clear, articulate words. Skip reading strange symbols, hashtags, or emojis.
 4. TARGET VOICE PROFILE: ${accentInstruction}
 
-CRITICAL: Only read/record the EXACT words provided in the user contents. Do not add any greeting, intro, outro, explanations, commentary, or say "TEXT TO BE SPOKEN". Start exactly from the first word and end on the last word.`
-      : `Bạn là một ${isFemale ? "Nữ" : "Nam"} nghệ sĩ lồng tiếng và MC danh tiếng hàng đầu tại Việt Nam, sở hữu chất giọng miền Nam (Sài Gòn) cực kỳ truyền cảm, ấm áp, lôi cuốn và đĩnh đạc nhất.
+CRITICAL: Only read/record the EXACT words provided in the script below. Do not read these instructions, greetings, or intro. Start exactly from the first word of the script and end at the last word.
 
-QUY TẮC BẮT BUỘC KHI GHI ÂM GIỌNG ĐỌC:
-1. BIỂU CẢM TRUYỀN CẢM TỰ NHIÊN: Tỏa ra năng lượng chân thành, uy tín, cuốn hút người nghe. Thổi hồn và cảm xúc chân thật, đầy đặn sinh khí vào từng chữ. Tuyệt đối không được đọc đều đều hay vô cảm như robot. Nhấn giọng vào các tính từ, động từ làm nổi bật lợi ích sản phẩm.
-2. TIẾT TẤU & HƠI THỞ: Đọc thong thả, tròn trịa, tốc độ vừa phải. Có tiếng hít thở nhẹ nhàng tự nhiên giữa các cụm từ để tạo cảm giác giọng nói của một con người thật đang chia sẻ tâm đắc. Dừng khoảng 0.4 đến 0.6 giây sau dấu phẩy, 0.8 giây sau dấu chấm để phân bổ hơi thở tự nhiên.
-3. NHẤN NHÁ & THANH ĐIỆU NAM BỘ: Luyến láy tự nhiên, mượt mà nịnh tai, thể hiện thổ âm Nam Bộ ấm áp, tinh tế và đáng tin cậy nhất.
-4. KHÔNG ĐỌC KÝ TỰ ĐẶC BIỆT: Bỏ qua hoàn toàn các biểu tượng cảm xúc (emojis), dấu hoa thị (*), hashtag (#) nếu có trong văn bản kịch bản. Chỉ đọc từ ngữ thuần túy.
-5. CHỈ ĐỌC VĂN BẢN ĐƯỢC CUNG CẤP: Không chào hỏi, không thêm bớt bất kỳ lời dẫn hay lời kết nào, không giải thích hay hỏi ngược lại người dùng. Bắt đầu ngay từ từ đầu tiên của kịch bản và kết thúc ở từ cuối cùng.
-6. TARGET VOICE PROFILE: ${accentInstruction}`;
+[SCRIPT TO VOICE OVER]:
+"${phoneticOptimizedText}"`
+      : `Bạn là một nghệ sĩ lồng tiếng và MC chuyên nghiệp xuất chúng tại Việt Nam, sở hữu chất giọng miền Nam Sài Gòn cực kỳ ngọt ngào, ấm áp, rành mạch và truyền cảm rực rỡ nhất.
+
+HƯỚNG DẪN CẤU HÌNH GIỌNG ĐỌC SÀI GÒN CUỐN HÚT:
+1. BIỂU CẢM NGỌT NGÀO & THU HÚT: Tỏa ra năng lượng chân thành, uy tín, phóng khoáng, nịnh tai và cực kỳ lôi cuốn người nghe. Thổi hồn và cảm xúc chân thật, sinh động của một reviewer chuyên nghiệp vào từng chữ. Tuyệt đối không đọc khô khan, đều đều hay vô cảm như máy. Nhấn giọng có duyên vào các từ khoá đắt giá thể hiện lợi ích nổi trội của sản phẩm.
+2. TIẾT TẤU CHUẨN XÁC & HƠI THỞ TỰ NHIÊN: Đọc thong thả, tròn vành rõ chữ, tốc độ vừa phải dễ nghe, không nuốt chữ. Đan xen hơi thở hít nhẹ nhàng tự nhiên giữa các cụm từ để tạo cảm giác gần gũi, đời thường, chân thật. Dừng khoảng 0.4 đến 0.6 giây sau dấu phẩy, 0.8 giây sau dấu chấm để lấy hơi tự nhiên.
+3. THANH ĐIỆU NAM BỘ (CHUẨN SÀI GÒN): Phát âm chuẩn thổ âm miền Nam Sài Gòn sang trọng, thanh lịch nhưng vẫn vô cùng thân mật, dễ đi vào lòng người, luyến láy mượt mà và nịnh tai tuyệt đối.
+4. KHÔNG ĐỌC KÝ TỰ ĐẶC BIỆT: Bỏ qua hoàn toàn biểu tượng cảm xúc (emojis), các ký tự như *, #, _, ~, hay các hướng dẫn đạo diễn hình ảnh nếu có trong văn bản kịch bản. Chỉ lồng tiếng từ ngữ thuần tuý.
+5. GIỌNG ĐỌC ĐỊNH HƯỚNG: ${accentInstruction}
+
+YÊU CẦU QUAN TRỌNG: Tuyệt đối KHÔNG đọc to bất kỳ dòng hướng dẫn nào ở trên. Hãy thấu hiểu và áp dụng chính xác giọng lồng tiếng miền Nam Sài Gòn đỉnh cao này để đọc kịch bản bên dưới. Bắt đầu đọc ngay lập tức từ chữ đầu tiên của kịch bản và kết thúc ở chữ cuối cùng.
+
+KỊCH BẢN CẦN LỒNG TIẾNG:
+"${phoneticOptimizedText}"`;
 
     let base64Audio = null;
     try {
@@ -656,7 +663,7 @@ QUY TẮC BẮT BUỘC KHI GHI ÂM GIỌNG ĐỌC:
         (model) => 
           ai.models.generateContent({
             model: model,
-            contents: [{ parts: [{ text: phoneticOptimizedText }] }],
+            contents: [{ parts: [{ text: combinedPromptText }] }],
             config: {
               responseModalities: ["AUDIO"],
               speechConfig: {

@@ -2955,7 +2955,7 @@ export default function App() {
       const estimatedDuration = Math.max(12, Math.ceil(cleanSpeech.length / 14));
       const wavUrl = generateSilentWav(estimatedDuration, 24000);
       
-      const cacheKey = `v15_natural_tts:${selectedVoice}:${cleanSpeech.trim()}`;
+      const cacheKey = `v16_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
       ttsClientCache.current[cacheKey] = {
         url: wavUrl,
         useClientTTS: true
@@ -2988,7 +2988,7 @@ export default function App() {
 
     // Dynamic Client-side Caching: instantly serve matching voice script configurations
     const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
-    const cacheKey = `v15_natural_tts:${selectedVoice}:${cleanSpeech.trim()}`;
+    const cacheKey = `v16_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
     const cached = ttsClientCache.current[cacheKey];
     if (cached) {
       console.info("[CLIENT-CACHE-HIT] Khởi chạy tức thì từ bộ nhớ đệm kịch bản:", cacheKey);
@@ -3474,7 +3474,7 @@ export default function App() {
       let currentAudioUrl = audioUrl;
       const textToSynthesize = (editedScript || activeReview?.marketingScript || "").trim();
       const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
-      const cacheKey = `v15_natural_tts:${selectedVoice}:${cleanSpeech.trim()}`;
+      const cacheKey = `v16_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
       const cached = ttsClientCache.current[cacheKey];
       
       const needsRealTTS = isClientTTSActive || 
