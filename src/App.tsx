@@ -7089,7 +7089,7 @@ export default function App() {
                 </span>
               </div>
               <p className="text-[9.5px] text-amber-300/90 leading-relaxed font-sans font-medium">
-                🤖 Đang kích hoạt <strong>Trí tuệ Nhân tạo Gemini</strong> để lồng tiếng chuẩn giọng đọc miền Nam (Sài Gòn). Giọng đọc đạt cảm xúc điện ảnh kịch tính, lôi cuốn, trầm bổng nịnh tai và tự nhiên nhất.
+                🤖 Đang kích hoạt <strong>Trí tuệ Nhân tạo Gemini</strong> để lồng tiếng chuẩn giọng đọc miền Nam (Sài Gòn - Nam Bộ). <strong className="text-emerald-400">Đã loại bỏ vĩnh viễn giọng miền Bắc</strong> với bộ lọc tự động chuyển ngữ Nam Bộ 100%, đem lại cảm xúc điện ảnh kịch tính, lôi cuốn và trầm bổng nịnh tai nhất.
               </p>
             </div>
 

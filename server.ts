@@ -282,7 +282,10 @@ ${isEn ? `### 👑 LUXURIOUS AND ENGAGING WRITING STYLE (Luxury Tone):
 
 2. **Cấu trúc kịch bản truyền thanh (Voiceover marketing script)**:
    - ${durationInstruction}
-   - ${isEn ? `**ELEGANT ENGLISH VOICE STYLE**: Ensure the voiceover script flows beautifully and sounds exceptionally professional, engaging, and premium for international audiences. Use natural conversational phrases, warm pacing, and strong benefits-driven narration.` : `**TÔNG GIỌNG ẤM ÁP, TỰ NHIÊN & SANG TRỌNG GIỌNG MIỀN NAM**: Bắt buộc tạo kịch bản với lời dẫn trôi chảy phong cách tự nhiên, ấm áp, nhịp điệu cuốn hút và giàu biểu cảm của người con miền Nam. Hãy ưu tiên dùng các cụm từ tinh tế, gần gũi nhưng cực kỳ thanh lịch đặc trưng của Nam Bộ như: 'Cả nhà ơi...', 'Mấy bạn ơi...', 'thiệt là...', 'đã lắm nha', 'đẹp lắm nè', 'đúng không nè', 'vừa mắt ghê', 'nhìn vô...', 'coi thử nha'. Hãy tạo cảm xúc lắng đọng, tin cậy tuyệt đối và luyến láy tự nhiên, tránh dùng những tiếng lóng suồng sã hoặc có cảm giác trẻ con (KHÔNG dùng 'mấy bồ ơi', 'đẹp xỉu', 'đã thèm ghê'). Nhịp điệu kịch bản phải uốn chuyển, có các khoảng nghỉ nhịp hợp lý để người lồng tiếng có thể hít thở tự nhiên và truyền tải trọn vẹn sự tinh tế của sản phẩm.`}
+   - ${isEn ? `**ELEGANT ENGLISH VOICE STYLE**: Ensure the voiceover script flows beautifully and sounds exceptionally professional, engaging, and premium for international audiences. Use natural conversational phrases, warm pacing, and strong benefits-driven narration.` : `**TÔNG GIỌNG ẤM ÁP, TỰ NHIÊN & SANG TRỌNG CHUẨN GIỌNG MIỀN NAM (SÀI GÒN / NAM BỘ)**:
+     * TUYỆT ĐỐI KHÔNG sử dụng văn phong, từ ngữ hay ngữ điệu đặc trưng Miền Bắc (Hà Nội). Toàn bộ kịch bản phải chuẩn rặt từ ngữ, cách phát âm và ngữ điệu Miền Nam (Sài Gòn / Nam Bộ) 100%.
+     * Các từ ngữ bắt buộc dùng theo Nam Bộ: dùng "ngàn" (không dùng "nghìn"), "chút xíu/một chút" (không dùng "một tẹo/một tí"), "thiệt sự/thiệt là" (không dùng "thật sự/thật là"), "coi" (không dùng "xem"), "nha/nhé/nè/nghen/nheng" (không dùng "nhỉ"), "xài" (không dùng "dùng/sử dụng").
+     * Bắt buộc tạo kịch bản với lời dẫn trôi chảy phong cách tự nhiên, ấm áp, nhịp điệu cuốn hút và giàu biểu cảm của người con miền Nam. Hãy ưu tiên dùng các cụm từ tinh tế, gần gũi nhưng cực kỳ thanh lịch đặc trưng của Nam Bộ như: 'Cả nhà ơi...', 'Mấy bạn ơi...', 'thiệt là...', 'đã lắm nha', 'đẹp lắm nè', 'đúng không nè', 'vừa mắt ghê', 'nhìn vô...', 'coi thử nha'. Hãy tạo cảm xúc lắng đọng, tin cậy tuyệt đối và luyến láy tự nhiên, tránh dùng những tiếng lóng suồng sã hoặc có cảm giác trẻ con (KHÔNG dùng 'mấy bồ ơi', 'đẹp xỉu', 'đã thèm ghê'). Nhịp điệu kịch bản phải uốn chuyển, có các khoảng nghỉ nhịp hợp lý để người lồng tiếng có thể hít thở tự nhiên và truyền tải trọn vẹn sự tinh tế của sản phẩm.`}
    - Cấu trúc dòng chảy lời thoại:
      * **3-5 giây đầu HOOK THU HÚT ĐỈNH CAO**: Nhập cuộc bằng một câu hỏi thông minh, khơi gợi nhu cầu, tự nhiên dạt dào thiện cảm (Ví dụ: "Có bao giờ bạn cảm thấy mệt mỏi vì...", "Mấy bạn ơi, bữa nay mình chia sẻ cho cả nhà một bảo bối cực kỳ thú vị nha...", "Nếu bạn đang tìm kiếm một giải pháp thực sự đẳng cấp cho...").
      * **Thân kịch bản (Story & Benefit)**: Đan xen sâu sắc các công năng vượt bậc, trải nghiệm xúc cảm, sự yên tâm bền bỉ và giá trị thực tế của sản phẩm một cách chân thành nhất.
@@ -555,6 +558,38 @@ function sanitizeTextForVietnameseTTS(text: string): string {
   clean = clean.replace(/(\d+)\s*k\b/gi, '$1 ngàn');
   clean = clean.replace(/(\d+)\s*(đ|VND|đồng)/gi, '$1 đồng');
 
+  // Quy đổi triệt để toàn bộ từ ngữ miền Bắc sang từ ngữ miền Nam (Sài Gòn) chuẩn để AI lồng tiếng 100% Nam Bộ ngọt ngào
+  const northToSouthMap: [RegExp, string][] = [
+    [/\bnghìn\b/gi, 'ngàn'],
+    [/\bxem thử\b/gi, 'coi thử'],
+    [/\bxem clip\b/gi, 'coi clip'],
+    [/\bxem video\b/gi, 'coi clip'],
+    [/\bxem ngay\b/gi, 'coi ngay'],
+    [/\bxem hết\b/gi, 'coi hết'],
+    [/\bthật là\b/gi, 'thiệt là'],
+    [/\bthật sự\b/gi, 'thiệt sự'],
+    [/\bmột tí\b/gi, 'chút xíu'],
+    [/\bmột tẹo\b/gi, 'chút xíu'],
+    [/\bnhỉ\b/gi, 'nha'],
+    [/\bchuẩn chỉ\b/gi, 'chuẩn chỉnh'],
+    [/\bchẳng\b/gi, 'hông'],
+    [/\bchả\b/gi, 'hông'],
+    [/\bđâu nhé\b/gi, 'đâu nha'],
+    [/\bđược nhé\b/gi, 'được nha'],
+    [/\bnày nhé\b/gi, 'này nha'],
+    [/\bạ\b/gi, 'nha'],
+    [/\brất là\b/gi, 'cực kỳ'],
+    [/\bbảo\b/gi, 'nói'],
+    [/\bxử lý\b/gi, 'giải quyết'],
+    [/\bsẽ thấy\b/gi, 'sẽ coi thấy'],
+    [/\bvào đâu\b/gi, 'vô đâu'],
+    [/\bnhìn vào\b/gi, 'nhìn vô']
+  ];
+
+  for (const [pattern, replacement] of northToSouthMap) {
+    clean = clean.replace(pattern, replacement);
+  }
+
   // Loại bỏ các khoảng trắng thừa
   clean = clean.replace(/\s+/g, ' ');
 
@@ -620,10 +655,15 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
     for (let i = 0; i <= maxRetries; i++) {
       try {
         console.info(`[TTS-GEMINI-STUDIO] Khởi tạo lồng tiếng Google AI Studio (Giọng: ${voiceForGemini}, Lần thử: ${i + 1}/${maxRetries + 1})...`);
+        const saigonSystemInstruction = isEnglish
+          ? "You are an elite English voice narrator. Speak with clear pronunciation, natural pacing, and warm, expressive tone."
+          : "Bạn là phát thanh viên lồng tiếng CHUẨN GIỌNG MIỀN NAM SÀI GÒN (NAM BỘ) CHUYÊN NGHIỆP. TUYỆT ĐỐI KHÔNG sử dụng chất giọng Miền Bắc (Hà Nội). BẮT BUỘC phát âm ngữ điệu Miền Nam (Sài Gòn) ngọt ngào, ấm áp, truyền cảm, tròn vành rõ chữ, nhịp điệu tự nhiên như trò chuyện trực tiếp và cực kỳ nịnh tai.";
+
         const response = await ai.models.generateContent({
           model: "gemini-3.1-flash-tts-preview",
           contents: [{ parts: [{ text: phoneticOptimizedText }] }],
           config: {
+            systemInstruction: saigonSystemInstruction,
             responseModalities: ["AUDIO"],
             speechConfig: {
               voiceConfig: {
