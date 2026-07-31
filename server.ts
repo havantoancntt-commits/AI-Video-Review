@@ -940,12 +940,16 @@ Return your response in standard JSON format containing a "hooks" array of strin
 Hãy đóng vai một chuyên gia Giám đốc Sáng tạo kịch bản quảng cáo và thu hút tỷ lệ giữ chân (Retention) xuất sắc trên TikTok, Reels và Shorts.
 Nhiệm vụ của bạn là viết ra đúng 3 câu Hook (tiêu đề mở đầu video ngắn) cực kỳ giật gân, khơi dậy trí tò mò tuyệt đối cho sản phẩm: "${productName}".
 
-YÊU CẦU ĐẶC BIỆT QUAN TRỌNG ĐỂ TỐI ƯU THUẬT TOÁN TIKTOK (ORGANIC REACH):
+YÊU CẦU ĐẶC BIỆT QUAN TRỌNG ĐỂ TỐI ƯU THUẬT TOÁN TIKTOK FYP 2026 (ORGANIC REACH):
 1. TUYỆT ĐỐI KHÔNG kêu gọi bán hàng, không giục mua sắm, không nhắc tới mã giảm giá, giỏ hàng hay bất kì yếu tố thương mại nào (Ví dụ tránh tuyệt đối: "MUA NGAY", "CLICK GIỎ HÀNG", "CHỈ HÔM NAY", "GIÁ RẺ").
 2. Chỉ tập trung vào TRẢI NGHIỆM TIÊU DÙNG THỰC TẾ, CẢNH BÁO khuyết điểm/lưu ý, hoặc khơi gợi TRÍ TÒ MÒ tột độ đầy khách quan để người xem không thể lướt qua trong 3 giây đầu tiên.
-3. Viết bằng tiếng Việt, in hoa hoàn toàn.
-4. Ngắn gọn, súc tích (khoảng 10-15 từ), phù hợp làm chữ chạy trên màn hình (Hook Banner).
-5. TTS-Ready: Không chứa icon/emoji, hashtag hay kí tự đặc biệt kỳ lạ ngoài chấm, phẩy, hỏi chấm.
+3. Áp dụng 3 công thức vàng giữ chân người xem (Retention Formulas):
+   - Hook 1 (Cảnh báo trải nghiệm / Tiết kiệm chi phí): ĐỪNG VỘI MUA ... NẾU CHƯA BIẾT SỰ THẬT NÀY.
+   - Hook 2 (Khám phá bí mật / Trải nghiệm bất ngờ): KIẾP NẠN MUA HÀNG ONLINE VÀ CÁI KẾT SỐC VỚI ...
+   - Hook 3 (Kiểm chứng thực tế / Góc nhìn khách quan): KIỂM CHỨNG CHẤT LƯỢNG THỰC TẾ ... SAU THỜI GIAN DÀI SỬ DỤNG.
+4. Viết bằng tiếng Việt, in hoa hoàn toàn.
+5. Ngắn gọn, súc tích (khoảng 10-15 từ), phù hợp làm chữ chạy trên màn hình (Hook Banner).
+6. TTS-Ready: Không chứa icon/emoji, hashtag hay kí tự đặc biệt kỳ lạ ngoài chấm, phẩy, hỏi chấm.
 
 Trả về kết quả chuẩn định dạng JSON chứa mảng "hooks" như sau:
 {
