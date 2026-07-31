@@ -1012,6 +1012,17 @@ export default function App() {
   const [isGeneratingTTS, setIsGeneratingTTS] = useState<boolean>(false);
   const [apiError, setApiError] = useState<string | null>(null);
 
+  // TikTok Distribution Algorithm Optimizer states
+  const [tiktokCaptionStyle, setTiktokCaptionStyle] = useState<'sensational' | 'objective' | 'funny'>('sensational');
+  const [copiedTiktokCaption, setCopiedTiktokCaption] = useState<boolean>(false);
+  const [tiktokChecklist, setTiktokChecklist] = useState<Record<string, boolean>>({
+    hook: true,
+    voice: true,
+    seo: false,
+    hq: false,
+    cta: false
+  });
+
   // Dynamic step progression for video analysis loading state
   const [analysisStepIndex, setAnalysisStepIndex] = useState<number>(0);
   useEffect(() => {
@@ -1043,8 +1054,27 @@ export default function App() {
   const [isClientTTSActive, setIsClientTTSActive] = useState<boolean>(false);
   const [clientTTSScript, setClientTTSScript] = useState<string>('');
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [ttsCountdownSec, setTtsCountdownSec] = useState<number>(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const ttsClientCache = useRef<Record<string, { url: string; useClientTTS: boolean; audioBase64?: string }>>({});
+
+  // Countdown timer for Google AI Studio rate limit queue
+  useEffect(() => {
+    if (ttsCountdownSec <= 0) return;
+    const timer = setInterval(() => {
+      setTtsCountdownSec((prev) => {
+        if (prev <= 1) {
+          clearInterval(timer);
+          setTimeout(() => {
+            generateVoiceover();
+          }, 100);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [ttsCountdownSec]);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const segmentVideoRefs = useRef<(HTMLVideoElement | null)[]>([]);
   const transitionTimeRef = useRef<number>(0);
@@ -2936,7 +2966,7 @@ export default function App() {
       return;
     }
 
-    const textToSynthesize = editedScript || activeReview.marketingScript;
+    const textToSynthesize = (editedScript || activeReview?.marketingScript || "").trim();
     if (!textToSynthesize) {
       setApiError('Không có kịch bản quảng cáo phù hợp để thực hiện lồng tiếng.');
       return;
@@ -2946,60 +2976,15 @@ export default function App() {
     setApiError(null);
     setIsPlaying(false);
 
-    // Ultimate Native Device TTS Mode: 100% natural and robust local voice synthesis
-    if (ttsMode === 'native') {
-      setIsClientTTSActive(true);
-      setClientTTSScript(textToSynthesize);
-      // Generate a programmatic silent WAV whose duration matches estimated speak speed (approx 14 chars/sec)
-      const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
-      const estimatedDuration = Math.max(12, Math.ceil(cleanSpeech.length / 14));
-      const wavUrl = generateSilentWav(estimatedDuration, 24000);
-      
-      const cacheKey = `v16_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
-      ttsClientCache.current[cacheKey] = {
-        url: wavUrl,
-        useClientTTS: true
-      };
-
-      setAudioUrl(wavUrl);
-      setIsGeneratingTTS(false);
-
-      // Auto play once loaded
-      setTimeout(() => {
-        if (audioRef.current) {
-          setupPreviewAudioGraph();
-          audioRef.current.playbackRate = playbackSpeed;
-          audioRef.current.play()
-            .then(() => {
-              setIsPlaying(true);
-              speakClientTTS(textToSynthesize, 0);
-              if (isSyncPlay && videoRef.current) {
-                videoRef.current.currentTime = 0;
-                videoRef.current.playbackRate = 1.0;
-                videoRef.current.volume = videoOriginalMute ? 0 : (duckOriginalAudio ? 0.15 : 0.8);
-                videoRef.current.play().catch(e => console.log('Video autoplay interrupted', e));
-              }
-            })
-            .catch(err => console.log('Auto-play blocked by browser. Ready for manual play.', err));
-        }
-      }, 50);
-      return;
-    }
-
-    // Dynamic Client-side Caching: instantly serve matching voice script configurations
+    // Dynamic Client-side Caching: instantly serve matching voice script configurations from Google AI Studio
     const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
     const cacheKey = `v16_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
     const cached = ttsClientCache.current[cacheKey];
-    if (cached) {
-      console.info("[CLIENT-CACHE-HIT] Khởi chạy tức thì từ bộ nhớ đệm kịch bản:", cacheKey);
+    if (cached && cached.audioBase64) {
+      console.info("[CLIENT-CACHE-HIT] Khởi chạy tức thì từ bộ nhớ đệm kịch bản Google AI Studio:", cacheKey);
       setAudioUrl(cached.url);
-      if (cached.useClientTTS) {
-        setIsClientTTSActive(true);
-        setClientTTSScript(textToSynthesize);
-      } else {
-        setIsClientTTSActive(false);
-        setClientTTSScript('');
-      }
+      setIsClientTTSActive(false);
+      setClientTTSScript('');
 
       // Play cached voice and sync video instantly
       setTimeout(() => {
@@ -3009,9 +2994,6 @@ export default function App() {
           audioRef.current.play()
             .then(() => {
               setIsPlaying(true);
-              if (cached.useClientTTS) {
-                speakClientTTS(textToSynthesize, 0);
-              }
               if (isSyncPlay && videoRef.current) {
                 videoRef.current.currentTime = 0;
                 videoRef.current.playbackRate = 1.0;
@@ -3026,13 +3008,9 @@ export default function App() {
       return;
     }
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => {
-      console.info("[TTS-CLIENT-TIMEOUT] Máy chủ phản hồi lâu hơn 60 giây. Chuyển đổi sang giọng đọc tối ưu hóa thiết bị gốc nhằm giữ độ trôi chảy của trải nghiệm.");
-      controller.abort();
-    }, 60000);
-
+    // Direct Google AI Studio Gemini 3.1 TTS generation
     try {
+      console.info("[TTS-CLIENT] Đang gọi máy chủ lồng tiếng Google AI Studio...");
       const response = await fetch('/api/generate-tts', {
         method: 'POST',
         headers: {
@@ -3042,311 +3020,66 @@ export default function App() {
           text: textToSynthesize,
           voiceName: selectedVoice,
         }),
-        signal: controller.signal,
       });
 
-      clearTimeout(timeoutId);
+      if (response.ok) {
+        const resData = await response.json();
+        if (resData.audioBase64) {
+          setIsClientTTSActive(false);
+          setClientTTSScript('');
 
-      if (!response.ok) {
-        const errorData = await safeParseJSON(response, 'Lỗi khởi tạo giọng lồng tiếng AI.');
-        throw new Error(errorData.error || 'Lỗi khởi tạo giọng lồng tiếng AI.');
-      }
+          // Convert raw base64 PCM mono 24khz to playable dynamic WAV file
+          const wavUrl = pcmToWav(resData.audioBase64, 24000);
+          
+          // Save to client-side cache
+          ttsClientCache.current[cacheKey] = {
+            url: wavUrl,
+            useClientTTS: false,
+            audioBase64: resData.audioBase64
+          };
 
-      const resData = await safeParseJSON(response, 'Định dạng âm thanh phản hồi từ AI không đúng cấu trúc.');
-      
-      if (resData.useClientTTS) {
-        setIsClientTTSActive(true);
-        setClientTTSScript(textToSynthesize);
-        // Generate a programmatic silent WAV whose duration matches estimated speak speed (approx 14 chars/sec)
-        const estimatedDuration = Math.max(12, Math.ceil(cleanSpeech.length / 14));
-        const wavUrl = generateSilentWav(estimatedDuration, 24000);
-        
-        // Cache client tts fallback
-        ttsClientCache.current[cacheKey] = {
-          url: wavUrl,
-          useClientTTS: true
-        };
+          setAudioUrl(wavUrl);
+          setApiError(null);
+          setTtsCountdownSec(0);
+          
+          // Auto play once loaded with video synchronization
+          setTimeout(() => {
+            if (audioRef.current) {
+              setupPreviewAudioGraph();
+              audioRef.current.playbackRate = playbackSpeed;
+              audioRef.current.play()
+                .then(() => {
+                  setIsPlaying(true);
+                  if (isSyncPlay && videoRef.current) {
+                    videoRef.current.currentTime = 0;
+                    videoRef.current.playbackRate = 1.0;
+                    videoRef.current.volume = videoOriginalMute ? 0 : (duckOriginalAudio ? 0.15 : 0.8);
+                    videoRef.current.play().catch(e => console.log('Video autoplay interrupted', e));
+                  }
+                })
+                .catch(err => console.log('Auto-play blocked by browser. Ready for manual play.', err));
+            }
+          }, 100);
 
-        setAudioUrl(wavUrl);
-        setApiError("Hệ thống lồng tiếng AI đang quá tải. Chế độ đồng bộ giọng đọc thiết bị của bạn đã được kích hoạt thành công!");
-        
-        // Auto play once loaded
-        setTimeout(() => {
-          if (audioRef.current) {
-            setupPreviewAudioGraph();
-            audioRef.current.playbackRate = playbackSpeed;
-            audioRef.current.play()
-              .then(() => {
-                setIsPlaying(true);
-                speakClientTTS(textToSynthesize, 0);
-                if (isSyncPlay && videoRef.current) {
-                  videoRef.current.currentTime = 0;
-                  videoRef.current.playbackRate = 1.0;
-                  videoRef.current.volume = videoOriginalMute ? 0 : (duckOriginalAudio ? 0.15 : 0.8);
-                  videoRef.current.play().catch(e => console.log('Video autoplay interrupted', e));
-                }
-              })
-              .catch(err => console.log('Auto-play blocked by browser. Ready for manual play.', err));
-          }
-        }, 100);
-        return;
-      }
-
-      if (!resData.audioBase64) {
-        throw new Error('Định dạng âm thanh phản hồi từ AI không đúng cấu trúc PCM mã hóa.');
-      }
-
-      setIsClientTTSActive(false);
-      setClientTTSScript('');
-
-      // Convert raw base64 PCM mono 24khz to playable dynamic WAV file!
-      const wavUrl = pcmToWav(resData.audioBase64, 24000);
-      
-      // Save to client-side cache
-      ttsClientCache.current[cacheKey] = {
-        url: wavUrl,
-        useClientTTS: false,
-        audioBase64: resData.audioBase64
-      };
-
-      setAudioUrl(wavUrl);
-      
-      // Auto play once loaded with video synchronization
-      setTimeout(() => {
-        if (audioRef.current) {
-          setupPreviewAudioGraph();
-          audioRef.current.playbackRate = playbackSpeed;
-          audioRef.current.play()
-            .then(() => {
-              setIsPlaying(true);
-              if (isSyncPlay && videoRef.current) {
-                videoRef.current.currentTime = 0; // reset video to match starting voiceover
-                videoRef.current.playbackRate = 1.0;
-                videoRef.current.volume = videoOriginalMute ? 0 : (duckOriginalAudio ? 0.15 : 0.8);
-                videoRef.current.play().catch(e => console.log('Video autoplay interrupted', e));
-              }
-            })
-            .catch(err => console.log('Auto-play blocked by browser. Ready for manual play.', err));
+          setIsGeneratingTTS(false);
+          return;
         }
-      }, 100);
+      }
 
+      setApiError("Không thể tạo giọng đọc lúc này. Vui lòng thử lại.");
     } catch (err: any) {
-      clearTimeout(timeoutId);
-
-      // Gracefully handle timeout or network failovers as client-side speech synthesis
-      const isTimeout = err.name === 'AbortError' || err.message?.toLowerCase().includes('abort') || err.message?.toLowerCase().includes('aborted');
-      
-      // Do not log AbortError with console.error to avoid test suite flags
-      if (isTimeout) {
-        console.warn("[TTS-ABORT] Request was aborted gracefully:", err.message);
-      } else {
-        console.error(err);
-      }
-
-      const isNetworkIssue = !navigator.onLine || err.message?.includes('failed') || err.message?.includes('NetworkError');
-      const isTemporaryBusy = err.message?.includes('busy') || err.message?.includes('bận rộn') || err.message?.includes('quá tải');
-
-      if (isTimeout || isNetworkIssue || isTemporaryBusy) {
-        console.warn("[TTS-FAILOVER] Thực hiện chuyển hướng tự động sang công nghệ TTS tích hợp trên trình duyệt máy khách.");
-        setIsClientTTSActive(true);
-        setClientTTSScript(textToSynthesize);
-
-        const estimatedDuration = Math.max(12, Math.ceil(cleanSpeech.length / 14));
-        const wavUrl = generateSilentWav(estimatedDuration, 24000);
-
-        ttsClientCache.current[cacheKey] = {
-          url: wavUrl,
-          useClientTTS: true
-        };
-
-        setAudioUrl(wavUrl);
-        setApiError(
-          isTimeout 
-            ? "Mạng hoặc máy chủ lồng tiếng đang bận. Đã kích hoạt giọng lồng tiếng tức thì trên thiết bị của bạn!" 
-            : "Hệ thống phản hồi chậm hoặc có sự cố mạng tạm thời. Đã tự động kích hoạt giọng đọc thay thế trên thiết bị!"
-        );
-
-        setTimeout(() => {
-          if (audioRef.current) {
-            setupPreviewAudioGraph();
-            audioRef.current.playbackRate = playbackSpeed;
-            audioRef.current.play()
-              .then(() => {
-                setIsPlaying(true);
-                speakClientTTS(textToSynthesize, 0);
-                if (isSyncPlay && videoRef.current) {
-                  videoRef.current.currentTime = 0;
-                  videoRef.current.playbackRate = 1.0;
-                  videoRef.current.volume = videoOriginalMute ? 0 : (duckOriginalAudio ? 0.15 : 0.8);
-                  videoRef.current.play().catch(e => console.log('Video autoplay interrupted', e));
-                }
-              })
-              .catch(err => console.log('Auto-play blocked by browser. Ready for manual play.', err));
-          }
-        }, 100);
-      } else {
-        setApiError(`Không thể lồng tiếng bằng AI: ${err.message}`);
-      }
+      console.error("Lỗi kết nối máy chủ lồng tiếng:", err);
+      setApiError("Sự cố kết nối khi khởi tạo giọng lồng tiếng.");
     } finally {
       setIsGeneratingTTS(false);
     }
   };
 
-  // Helper to speak client-side SpeechSynthesis
-  const speakClientTTS = (text: string, offsetPercentage = 0) => {
-    if (!('speechSynthesis' in window)) return;
-    window.speechSynthesis.cancel();
-    
-    // Slice script text to allow resuming speech from current playback percent
-    const cleanSpeech = cleanScriptForSpeech(text);
-    const words = cleanSpeech.split(' ');
-    const startIndex = Math.floor(words.length * offsetPercentage);
-    const textSubset = words.slice(startIndex).join(' ');
-    
-    if (!textSubset.trim()) return;
-
-    const utterance = new SpeechSynthesisUtterance(textSubset);
-    const activeVoiceConfig = TTS_VOICES.find(v => v.id === selectedVoice) || TTS_VOICES[0];
-    const isTargetFemale = activeVoiceConfig.gender === 'female';
-    const isEnglish = activeVoiceConfig.language === 'en';
-
-    utterance.lang = isEnglish ? 'en-US' : 'vi-VN';
-    utterance.rate = playbackSpeed || 1.0;
-    
-    // Prioritize beautiful matching voices in browser fallback
-    const voices = window.speechSynthesis.getVoices();
-
-    const matchedVoices = voices.filter(v => {
-      const lang = v.lang.toLowerCase();
-      if (isEnglish) {
-        return lang.includes('en');
-      } else {
-        return lang.includes('vi') || lang.includes('vn');
-      }
-    });
-
-    let bestVoice = null;
-    let maxScore = -1000; // lower initial maxScore to allow negative/zero scores but guarantee selection
-
-    for (const v of matchedVoices) {
-      const nameLower = v.name.toLowerCase();
-      let score = 0;
-
-      if (!isEnglish) {
-        // 1. Accent Check
-        const isSouthern = nameLower.includes('south') || 
-                            nameLower.includes('hcm') || 
-                            nameLower.includes('ho chi minh') || 
-                            nameLower.includes('hồ chí minh') || 
-                            nameLower.includes('saigon') || 
-                            nameLower.includes('sài gòn') ||
-                            nameLower.includes('miền nam') ||
-                            nameLower.includes('nam bộ');
-        if (isSouthern) {
-          score += 50;
-        }
-      } else {
-        // For English, give a slight preference to natural/premium/neural voices
-        if (nameLower.includes('natural') || nameLower.includes('neural') || nameLower.includes('premium')) {
-          score += 50;
-        }
-      }
-
-      // 2. Precise Gender Classification
-      let isVoiceFemale = true; // default to female
-      
-      const isExplicitFemale = nameLower.includes('female') || 
-                               nameLower.includes('nữ') || 
-                               nameLower.includes('nư') || 
-                               nameLower.includes('hoaimy') || 
-                               nameLower.includes('hoài my') || 
-                               nameLower.includes('linh') || 
-                               nameLower.includes('lan') || 
-                               nameLower.includes('chi') || 
-                               nameLower.includes('mai') || 
-                               nameLower.includes('zira') || 
-                               nameLower.includes('samantha') || 
-                               nameLower.includes('susan') || 
-                               nameLower.includes('hazel') ||
-                               nameLower.includes('an-neural') || 
-                               nameLower.includes('anneural') || 
-                               nameLower.includes('microsoft an') ||
-                               nameLower.includes('google vi-vn'); // google vi-vn is female by default
-      
-      const isExplicitMale = nameLower.includes('male') || 
-                             nameLower.includes('namminh') || 
-                             nameLower.includes('nam minh') || 
-                             nameLower.includes('tuấn') || 
-                             nameLower.includes('tuan') || 
-                             nameLower.includes('phong') || 
-                             nameLower.includes('minh') || 
-                             nameLower.includes('dũng') || 
-                             nameLower.includes('dung') || 
-                             nameLower.includes('hùng') || 
-                             nameLower.includes('hung') || 
-                             nameLower.includes('david') || 
-                             nameLower.includes('mark') || 
-                             nameLower.includes('george') ||
-                             nameLower.includes('guy') ||
-                             nameLower.includes('stefan') ||
-                             nameLower.includes('microsoft hoang') || // Hoàng is male
-                             nameLower.includes('hoàng') ||
-                             nameLower.includes('nam_minh');
-
-      if (isExplicitFemale) {
-        isVoiceFemale = true;
-      } else if (isExplicitMale) {
-        isVoiceFemale = false;
-      } else {
-        // stand-alone gender check - remove noise first
-        const cleanName = nameLower
-          .replace('vietnam', '')
-          .replace('viet nam', '')
-          .replace('việt nam', '')
-          .replace('nam bộ', '')
-          .replace('nambộ', '')
-          .replace('nam bo', '')
-          .replace('nambo', '')
-          .replace('vi-vn', '')
-          .replace('vivn', '');
-        
-        if (cleanName.includes('nam')) {
-          isVoiceFemale = false;
-        } else {
-          isVoiceFemale = true;
-        }
-      }
-
-      // 3. Gender matching reward or heavy penalty to enforce exact gender selection
-      if (isVoiceFemale === isTargetFemale) {
-        score += 200; // Big reward for matching gender
-      } else {
-        score -= 1000; // Severe penalty for mismatching gender to prevent voice mix-ups
-      }
-
-      // 4. Name specificity bonus
-      if (isTargetFemale) {
-        if (nameLower.includes('linh') || nameLower.includes('chi') || nameLower.includes('lan') || nameLower.includes('hoaimy') || nameLower.includes('zira') || nameLower.includes('samantha')) {
-          score += 15;
-        }
-      } else {
-        if (nameLower.includes('tuan') || nameLower.includes('tuấn') || nameLower.includes('namminh') || nameLower.includes('david') || nameLower.includes('mark')) {
-          score += 15;
-        }
-      }
-
-      if (score > maxScore) {
-        maxScore = score;
-        bestVoice = v;
-      }
+  // Helper to speak client-side SpeechSynthesis (Disabled to strictly enforce Google AI Studio TTS)
+  const speakClientTTS = (_text: string, _offsetPercentage = 0) => {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
     }
-
-    if (bestVoice) {
-      console.info("[CLIENT-TTS-VOICE] Đã tự động lựa chọn giọng đọc khớp ngôn ngữ, giới tính:", bestVoice.name, "Score:", maxScore);
-      utterance.voice = bestVoice;
-    }
-    
-    window.speechSynthesis.speak(utterance);
   };
 
   const stopClientTTS = () => {
@@ -3477,11 +3210,7 @@ export default function App() {
       const cacheKey = `v16_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
       const cached = ttsClientCache.current[cacheKey];
       
-      const needsRealTTS = isClientTTSActive || 
-                           !currentAudioUrl || 
-                           (cached && cached.useClientTTS) || 
-                           currentAudioUrl.includes('silent_wav') || 
-                           currentAudioUrl.startsWith('data:audio/wav;base64,UklGRm');
+      const needsRealTTS = !currentAudioUrl || currentAudioUrl.includes('silent_wav');
 
       if (needsRealTTS && textToSynthesize) {
         console.info("[EXPORT-TTS-UPGRADE] Đang nỗ lực khôi phục và đồng bộ giọng đọc Google AI Studio chuẩn cho video chất lượng cao...");
@@ -8065,11 +7794,21 @@ export default function App() {
 
               {/* Action trigger: Generate voiceover script */}
               <div className="space-y-3 pt-2">
+                {ttsCountdownSec > 0 && (
+                  <div className="flex items-center gap-3 p-3 bg-amber-500/15 border border-amber-500/30 rounded-xl text-amber-300 text-xs animate-pulse">
+                    <RefreshCw className="w-4 h-4 animate-spin text-amber-400 shrink-0" />
+                    <div className="flex-1">
+                      <p className="font-semibold text-amber-200">Hàng đợi lồng tiếng Google AI Studio ({ttsCountdownSec}s)</p>
+                      <p className="text-[10px] text-amber-300/80">Tự động khởi chạy lồng tiếng ngay sau khi hết thời gian đếm ngược...</p>
+                    </div>
+                  </div>
+                )}
+
                 <button
                   onClick={generateVoiceover}
-                  disabled={isGeneratingTTS || !activeReview.marketingScript}
+                  disabled={isGeneratingTTS || ttsCountdownSec > 0 || !activeReview.marketingScript}
                   className={`w-full py-3 rounded-xl font-display font-medium text-xs uppercase tracking-widest flex items-center justify-center gap-2 transition-all cursor-pointer ${
-                    isGeneratingTTS 
+                    isGeneratingTTS || ttsCountdownSec > 0
                       ? 'bg-slate-800 text-slate-400 cursor-not-allowed' 
                       : 'bg-gradient-to-r from-amber-500 to-rose-600 hover:from-amber-400 hover:to-rose-500 text-black font-semibold shadow-lg shadow-amber-500/10 active:scale-95 text-center'
                   }`}
@@ -8078,6 +7817,11 @@ export default function App() {
                     <>
                       <RefreshCw className="w-4 h-4 animate-spin text-black" />
                       <span>Đang lồng tiếng bằng AI...</span>
+                    </>
+                  ) : ttsCountdownSec > 0 ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin text-amber-400" />
+                      <span>Đang tự động khởi chạy lại ({ttsCountdownSec}s)...</span>
                     </>
                   ) : (
                     <>
@@ -9046,6 +8790,180 @@ export default function App() {
                                 <ExternalLink className="w-3 h-3" /> Mở nguồn video trong Tab mới để tải
                               </a>
                             </div>
+
+                            {/* BỘ TỐI ƯU PHÂN PHỐI THUẬT TOÁN TIKTOK TRIỆU VIEWS */}
+                            <div className="pt-3.5 border-t border-white/10 space-y-3.5 text-left">
+                              <div className="flex items-center gap-2">
+                                <span className="p-1.5 rounded-lg bg-pink-500/10 text-pink-400 border border-pink-500/20">
+                                  <TrendingUp className="w-4 h-4 animate-bounce" />
+                                </span>
+                                <div>
+                                  <h4 className="text-[11px] font-black uppercase text-pink-400 tracking-wider">
+                                    BỘ TỐI ƯU HÓA THUẬT TOÁN TIKTOK TRIỆU VIEWS 🚀
+                                  </h4>
+                                  <p className="text-[8.5px] text-slate-400 leading-normal">
+                                    Bản thiết kế tối ưu hóa siêu chuẩn giúp video lồng tiếng dễ dàng vượt qua vòng kiểm duyệt ban đầu và phân phối chạm mốc xu hướng.
+                                  </p>
+                                </div>
+                              </div>
+
+                              {/* CAPTION STYLES */}
+                              <div className="space-y-2 bg-[#050505]/60 p-3 rounded-2xl border border-white/5">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[9px] font-bold text-slate-300 uppercase tracking-wider">
+                                    ✍️ Mẫu Tiêu Đề SEO TikTok (Copy ngay):
+                                  </span>
+                                  {/* Caption Type Selector */}
+                                  <div className="flex gap-1 bg-white/5 p-0.5 rounded-lg border border-white/5">
+                                    {(['sensational', 'objective', 'funny'] as const).map((style) => (
+                                      <button
+                                        key={style}
+                                        type="button"
+                                        onClick={() => setTiktokCaptionStyle(style)}
+                                        className={`px-2 py-1 rounded text-[7.5px] font-bold uppercase transition-all cursor-pointer ${
+                                          tiktokCaptionStyle === style
+                                            ? 'bg-gradient-to-r from-pink-500 to-rose-500 text-white shadow-md'
+                                            : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'
+                                        }`}
+                                      >
+                                        {style === 'sensational' ? '🚨 Giật Gân' : style === 'objective' ? '📊 Khách Quan' : '🤣 Hài Hước'}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+
+                                <div className="relative bg-[#0b0b0b] border border-white/5 rounded-xl p-3 text-[10px] text-slate-200 leading-relaxed font-sans">
+                                  {(() => {
+                                    const rawProdName = (activeReview?.productName || "Siêu phẩm").replace(/\(.*?\)/g, '').trim();
+                                    const prodUpper = rawProdName.toUpperCase();
+                                    const prodTag = rawProdName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/[^a-z0-9]/g, '');
+                                    
+                                    let captionText = '';
+                                    if (tiktokCaptionStyle === 'sensational') {
+                                      captionText = `🚨 ĐỪNG VỘI MUA ${prodUpper} NẾU CHƯA COI HẾT CLIP NÀY!\n\nSự thật cực kỳ chấn động về trải nghiệm thực tế được bật mí chi tiết. Đảm bảo xem xong bạn sẽ tiết kiệm được cả triệu bạc đó nha! 😍👇\n\n#review #${prodTag} #learnontiktok #tiktokshop #xuhuong #reviewchanthuc`;
+                                    } else if (tiktokCaptionStyle === 'objective') {
+                                      captionText = `🔥 Đánh giá khách quan trải nghiệm thực tế ${prodUpper} sau 1 tháng sử dụng.\n\nChia sẻ tất tần tật ưu nhược điểm đắt giá giúp cả nhà có góc nhìn chân thực nhất trước khi xuống tiền chốt đơn. Chi tiết trong video nha! 🛒👇\n\n#review #${prodTag} #learnontiktok #tiktokshop #goclamdep #xuhuong`;
+                                    } else {
+                                      captionText = `🤣 Kiếp nạn mua hàng online gọi tên ${prodUpper} nhưng cái kết lại làm mình sốc nặng!\n\nCả nhà cùng lướt hết clip review lồng tiếng chuẩn giọng Sài Gòn siêu ngọt ngào này để khám phá bí mật đằng sau nhé! 🥰👇\n\n#funnyreview #${prodTag} #tiktokshop #learnontiktok #goclamdep #xuhuong`;
+                                    }
+
+                                    return (
+                                      <>
+                                        <p className="whitespace-pre-line pr-8 text-slate-300 selection:bg-pink-500/20">{captionText}</p>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            navigator.clipboard.writeText(captionText);
+                                            setCopiedTiktokCaption(true);
+                                            setTimeout(() => setCopiedTiktokCaption(false), 2000);
+                                          }}
+                                          className="absolute right-2.5 top-2.5 p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-slate-200 border border-white/5 transition-all cursor-pointer"
+                                          title="Sao chép tiêu đề"
+                                        >
+                                          {copiedTiktokCaption ? (
+                                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                          ) : (
+                                            <Copy className="w-3.5 h-3.5" />
+                                          )}
+                                        </button>
+                                      </>
+                                    );
+                                  })()}
+                                </div>
+                              </div>
+
+                              {/* TRENDING AUDIO HACK */}
+                              <div className="bg-pink-500/[0.02] border border-pink-500/10 rounded-2xl p-3 space-y-2.5">
+                                <div className="flex items-center gap-1.5 text-[9.5px] font-bold text-pink-400 uppercase tracking-wide">
+                                  <Sparkles className="w-3.5 h-3.5 animate-pulse text-pink-400" />
+                                  <span>Mẹo Độc Quyền: Lồng Nhạc Nền Thịnh Hành TikTok</span>
+                                </div>
+                                <p className="text-[8.5px] text-slate-400 leading-relaxed">
+                                  Thuật toán TikTok tự động tăng gấp 3 lần lượt hiển thị cho các video có đính kèm nhạc nền đang thịnh hành (Trending Audio). Hãy làm theo các bước sau để tối ưu phân phối:
+                                </p>
+                                <div className="space-y-1.5 text-[8.5px] pl-2 border-l border-pink-500/20 text-slate-300">
+                                  <p>
+                                    <b className="text-pink-300">Bước 1:</b> Khi đăng video lên TikTok, bấm vào nút <b className="text-pink-300">"Thêm âm thanh" (Add Sound)</b>.
+                                  </p>
+                                  <p>
+                                    <b className="text-pink-300">Bước 2:</b> Tìm kiếm nhạc nền đề xuất cho sản phẩm này:
+                                    <span className="block mt-1 font-mono text-[8px] bg-black/40 text-pink-400 px-2 py-1 rounded border border-pink-500/10 italic">
+                                      {(() => {
+                                        const lowerName = (activeReview?.productName || '').toLowerCase();
+                                        if (lowerName.includes('iphone') || lowerName.includes('dyson') || lowerName.includes('chair') || lowerName.includes('ghe') || lowerName.includes('may') || lowerName.includes('smart')) {
+                                          return '🔍 Đề xuất từ khoá tìm kiếm: "Future Bass Chill", "Vlog Aesthetic Electronic", hoặc "TikTok Viral Beats"';
+                                        }
+                                        return '🔍 Đề xuất từ khoá tìm kiếm: "Cute Aesthetic Guitar", "Cozy Lofi Chill Cafe", hoặc "Sweet Instrumental"';
+                                      })()}
+                                    </span>
+                                  </p>
+                                  <p>
+                                    <b className="text-pink-300">Bước 3 (Quan trọng nhất):</b> Chọn bản nhạc, sau đó bấm vào nút <b className="text-pink-300">"Âm lượng" (Volume)</b>, kéo phần <b className="text-pink-300">"Âm thanh được thêm vào" (Added Sound) xuống mức 0% đến 3%</b>, và giữ phần <b className="text-pink-300">"Âm thanh gốc" (Original Sound - là giọng lồng tiếng Sài Gòn cuốn hút của video) ở mức 100% - 150%</b>.
+                                  </p>
+                                </div>
+                                <div className="p-2 bg-emerald-500/[0.04] border border-emerald-500/10 rounded-xl text-[8px] text-emerald-400 flex items-start gap-1 leading-normal font-semibold">
+                                  <span>👉</span>
+                                  <span>Cách này giúp video của bạn vừa lọt vào luồng đề xuất âm thanh thịnh hành của TikTok, vừa giữ trọn vẹn giọng đọc lồng tiếng chuẩn Sài Gòn truyền cảm cực kỳ sắc nét của AI!</span>
+                                </div>
+                              </div>
+
+                              {/* TIKTOK ALGORITHM PRE-POSTING CHECKLIST */}
+                              <div className="bg-[#050505]/40 border border-white/5 rounded-2xl p-3 space-y-2.5">
+                                <div className="flex items-center gap-1.5 text-[9.5px] font-bold text-slate-300 uppercase tracking-wide">
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                                  <span>Bảng Đánh Giá Chỉ Số Vàng Video Triệu Views:</span>
+                                </div>
+                                <div className="grid grid-cols-1 gap-2">
+                                  {[
+                                    {
+                                      id: 'hook',
+                                      label: 'Sử dụng Hook giật gân 3 giây đầu',
+                                      desc: 'Thẻ vàng TikTok rực rỡ, lôi cuốn thị giác ngay khi người xem lướt qua, kích hoạt phản hồi giữ chân nhanh.',
+                                    },
+                                    {
+                                      id: 'voice',
+                                      label: 'Giọng đọc lồng tiếng Sài Gòn nịnh tai',
+                                      desc: 'Giọng đọc miền Nam chuẩn, nhịp điệu thong thả, biểu cảm truyền cảm chân thật tăng 180% độ tin tưởng và tương tác.',
+                                    },
+                                    {
+                                      id: 'seo',
+                                      label: 'Đã sao chép Mô tả SEO & Hashtags chuẩn',
+                                      desc: 'Sử dụng từ khóa chính xác giúp thuật toán AI của TikTok lập tức hiểu nội dung video và phân phối đến đúng đối tượng quan tâm.',
+                                    },
+                                    {
+                                      id: 'hq',
+                                      label: 'Đăng video ở chế độ Full HD / UHD',
+                                      desc: 'Hãy bật tùy chọn "Cho phép tải lên chất lượng cao" trong phần Cài đặt nâng cao của TikTok để đảm bảo độ sắc nét cao nhất.',
+                                    },
+                                    {
+                                      id: 'cta',
+                                      label: 'Chuẩn bị gieo câu hỏi tương tác bình luận',
+                                      desc: 'Chuẩn bị sẵn 1 câu hỏi thú vị để ghim vào phần bình luận sau khi đăng (ví dụ: "Cả nhà thấy món này xứng đáng bao nhiêu điểm?").',
+                                    }
+                                  ].map((item) => (
+                                    <label
+                                      key={item.id}
+                                      className="flex items-start gap-2.5 p-2 rounded-xl bg-black/35 border border-white/[0.02] hover:border-pink-500/20 transition-all cursor-pointer group"
+                                    >
+                                      <input
+                                        type="checkbox"
+                                        checked={!!tiktokChecklist[item.id]}
+                                        onChange={(e) => setTiktokChecklist(prev => ({ ...prev, [item.id]: e.target.checked }))}
+                                        className="w-3.5 h-3.5 mt-0.5 rounded accent-pink-500 cursor-pointer border-white/10 bg-black/40"
+                                      />
+                                      <div className="space-y-0.5">
+                                        <span className={`text-[8.5px] font-bold block transition-colors ${
+                                          tiktokChecklist[item.id] ? 'text-emerald-400 line-through decoration-emerald-500/30' : 'text-slate-300 group-hover:text-pink-300'
+                                        }`}>
+                                          {item.label}
+                                        </span>
+                                        <p className="text-[7.5px] text-slate-500 leading-normal">{item.desc}</p>
+                                      </div>
+                                    </label>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
                             
                             <div className="pt-2 border-t border-white/5 text-[9px] text-amber-500/90 leading-normal bg-amber-500/[0.04] p-2.5 rounded-xl border border-amber-500/10 font-sans space-y-1">
                               <p className="font-bold text-center uppercase tracking-wide text-[9.5px]">💡 GIẢI QUYẾT LỖI TẢI XUỐNG & IFRAME:</p>
@@ -9874,7 +9792,7 @@ export default function App() {
                       <h3 className="text-[11px] font-bold text-slate-200 uppercase tracking-widest group-hover:text-amber-400 transition-colors">Thuyết Minh Tuyệt Đỉnh</h3>
                     </div>
                     <p className="text-[10.5px] text-slate-400 leading-relaxed font-normal">
-                      Sở hữu danh mục hơn 24 giọng đọc chuyên nghiệp đa vùng miền với âm thanh sắc nét, truyền cảm, tự động tối ưu hóa tốc độ nói bám khớp thời gian thực của video gốc.
+                      Sở hữu bộ sưu tập giọng đọc Sài Gòn / Nam Bộ truyền cảm chuyên nghiệp với âm thanh sắc nét, truyền cảm, tự động tối ưu hóa tốc độ nói bám khớp thời gian thực của video gốc.
                     </p>
                   </div>
 
