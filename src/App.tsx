@@ -1091,7 +1091,7 @@ export default function App() {
   const [videoOriginalMute, setVideoOriginalMute] = useState<boolean>(false);
 
   // Video Splicing Transitions Library
-  const [videoTransition, setVideoTransition] = useState<'none' | 'cross_dissolve' | 'white_flash' | 'fade_to_black' | 'slide_left' | 'slide_right' | 'zoom_blur' | 'glitch'>('cross_dissolve');
+  const [videoTransition, setVideoTransition] = useState<'none' | 'cross_dissolve' | 'white_flash' | 'fade_to_black' | 'slide_left' | 'slide_right' | 'zoom_blur' | 'glitch'>('none');
   const [activeTransitionId, setActiveTransitionId] = useState<string | null>(null);
   const [transitionProgress, setTransitionProgress] = useState<number>(0);
   const [transitionDuration, setTransitionDuration] = useState<number>(0.4);
@@ -1535,12 +1535,12 @@ export default function App() {
     const currentSubIndex = currentSub && currentSub.sentenceIndex !== undefined ? currentSub.sentenceIndex : null;
 
     if (currentSubIndex !== lastSubtitleIdRef.current) {
-      if (lastSubtitleIdRef.current !== null && isPlaying && videoTransition !== 'none') {
+      if (lastSubtitleIdRef.current !== null && isPlaying && videoTransition !== 'none' && uploadedFiles.length > 1) {
         triggerPreviewTransition();
       }
       lastSubtitleIdRef.current = currentSubIndex;
     }
-  }, [currentAudioTime, showSubtitles, isPlaying, videoTransition, editedScript, activeReview, audioDuration, subtitleOffset]);
+  }, [currentAudioTime, showSubtitles, isPlaying, videoTransition, editedScript, activeReview, audioDuration, subtitleOffset, uploadedFiles.length]);
 
   // Clean transition timers on unmount
   useEffect(() => {
@@ -3028,8 +3028,13 @@ export default function App() {
       if (response.ok) {
         const resData = await response.json();
         if (resData.audioBase64) {
-          setIsClientTTSActive(false);
-          setClientTTSScript('');
+          if (resData.isFallback) {
+            setIsClientTTSActive(false);
+            setClientTTSScript('');
+          } else {
+            setIsClientTTSActive(false);
+            setClientTTSScript('');
+          }
 
           // Convert raw base64 PCM mono 24khz to playable dynamic WAV file
           const wavUrl = pcmToWav(resData.audioBase64, 24000);
@@ -3078,10 +3083,38 @@ export default function App() {
     }
   };
 
-  // Helper to speak client-side SpeechSynthesis (Disabled to strictly enforce Google AI Studio TTS)
-  const speakClientTTS = (_text: string, _offsetPercentage = 0) => {
-    if ('speechSynthesis' in window) {
+  // Helper to speak client-side SpeechSynthesis as a fallback (Strictly blocked for Vietnamese to eliminate Northern OS voices)
+  const speakClientTTS = (text: string, offsetPercentage = 0) => {
+    if (!('speechSynthesis' in window) || !text) return;
+    try {
       window.speechSynthesis.cancel();
+      // TUYỆT ĐỐI KHÔNG DÙNG SpeechSynthesis TRÊN TRÌNH DUYỆT CHO TIẾNG VIỆT
+      // Vì mặc định giọng vi-VN của hệ điều hành OS (Windows, Android, Mac) luôn là Giọng Miền Bắc.
+      const isEn = selectedVoice.endsWith('_EN');
+      if (!isEn) return;
+
+      const cleanText = cleanScriptForSpeech(text);
+      if (!cleanText) return;
+
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.rate = playbackSpeed || 1.0;
+      utterance.pitch = 1.0;
+
+      const voices = window.speechSynthesis.getVoices();
+      const matchedVoice = voices.find(v => v.lang.toLowerCase().includes('en')) || voices[0];
+      if (matchedVoice) {
+        utterance.voice = matchedVoice;
+      }
+      utterance.lang = 'en-US';
+
+      if (offsetPercentage > 0 && offsetPercentage < 0.85) {
+        const startChar = Math.floor(cleanText.length * offsetPercentage);
+        utterance.text = cleanText.substring(startChar);
+      }
+
+      window.speechSynthesis.speak(utterance);
+    } catch (err) {
+      console.warn("Client speech synthesis fallback notice:", err);
     }
   };
 
@@ -3398,23 +3431,28 @@ export default function App() {
         canvasWidth = Math.round(canvasWidth * ratio);
         canvasHeight = Math.round(canvasHeight * ratio);
       }
+
+      // Guarantee strictly even dimensions (modulo 2 === 0) for hardware encoder compliance (prevents chroma misalignment & blurring)
+      canvasWidth = Math.floor(canvasWidth / 2) * 2;
+      canvasHeight = Math.floor(canvasHeight / 2) * 2;
       
       canvas.width = canvasWidth;
       canvas.height = canvasHeight;
       
-      // Request display-p3 wide color gamut if available to preserve vibrant colors and prevent washed out tones
+      // Use standard sRGB color space with alpha: false to guarantee 100% opaque, vivid color reproduction without chroma loss or monochrome/grayscale bugs
       let ctx: CanvasRenderingContext2D | null = null;
       try {
         ctx = canvas.getContext('2d', {
-          colorSpace: 'display-p3' as any,
+          alpha: false,
+          colorSpace: 'srgb',
           willReadFrequently: false,
           desynchronized: false // Disable desynchronized: true for video synthesis as it causes double-buffering tears & flicker
         }) as CanvasRenderingContext2D | null;
       } catch (err) {
-        console.warn("Unable to initialize canvas with display-p3 wide color gamut, falling back to srgb:", err);
+        console.warn("Unable to initialize canvas with alpha: false srgb, falling back:", err);
       }
       if (!ctx) {
-        ctx = canvas.getContext('2d', { willReadFrequently: false, desynchronized: false });
+        ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: false, desynchronized: false });
       }
 
       if (ctx) {
@@ -3634,16 +3672,11 @@ export default function App() {
             syncVideoElement(videoEl, Math.min(curTime, videoEl.duration || duration));
           }
 
-          // Track segment changes to trigger high-end transitions
-          const shiftedCurTime = curTime + subtitleOffset;
-          const currentSub = videoSubSegments.find(seg => shiftedCurTime >= seg.start && shiftedCurTime <= seg.end);
-          const currentSubIndex = currentSub && currentSub.sentenceIndex !== undefined ? currentSub.sentenceIndex : -1;
-          
-          if (currentSubIndex !== lastSubIndex) {
-            if (lastSubIndex !== -1 && videoTransition !== 'none') {
+          // Trigger transitions strictly when switching between multi-video clips
+          if (uploadedFiles.length > 1) {
+            if (activeSegIndex !== -1 && lastRecordedSegmentIndex !== -1 && activeSegIndex !== lastRecordedSegmentIndex && videoTransition !== 'none') {
               transitionTriggerTime = curTime;
             }
-            lastSubIndex = currentSubIndex;
           }
 
           const isTransActive = (transitionTriggerTime >= 0 && curTime >= transitionTriggerTime && curTime <= transitionTriggerTime + transitionDuration);
@@ -3676,20 +3709,23 @@ export default function App() {
           }
           
           ctx.filter = filterStr;
-          if (videoTransition === 'cross_dissolve' && isTransActive && lastRecordedSegmentIndex !== -1 && lastRecordedSegmentIndex !== activeSegIndex) {
-            const prevVideoEl = segmentVideoRefs.current[lastRecordedSegmentIndex];
-            if (prevVideoEl) {
-              ctx.drawImage(currentVideoSegmentEl, 0, 0, canvasWidth, canvasHeight);
-              ctx.save();
-              ctx.globalAlpha = 1 - tProgress;
-              ctx.drawImage(prevVideoEl, 0, 0, canvasWidth, canvasHeight);
-              ctx.restore();
+          if (currentVideoSegmentEl && currentVideoSegmentEl.readyState >= 2) {
+            if (videoTransition === 'cross_dissolve' && isTransActive && lastRecordedSegmentIndex !== -1 && lastRecordedSegmentIndex !== activeSegIndex) {
+              const prevVideoEl = segmentVideoRefs.current[lastRecordedSegmentIndex];
+              if (prevVideoEl && prevVideoEl.readyState >= 2) {
+                ctx.drawImage(currentVideoSegmentEl, 0, 0, canvasWidth, canvasHeight);
+                ctx.save();
+                ctx.globalAlpha = 1 - tProgress;
+                ctx.drawImage(prevVideoEl, 0, 0, canvasWidth, canvasHeight);
+                ctx.restore();
+              } else {
+                ctx.drawImage(currentVideoSegmentEl, 0, 0, canvasWidth, canvasHeight);
+              }
             } else {
               ctx.drawImage(currentVideoSegmentEl, 0, 0, canvasWidth, canvasHeight);
             }
-          } else {
-            ctx.drawImage(currentVideoSegmentEl, 0, 0, canvasWidth, canvasHeight);
           }
+          ctx.filter = 'none';
           ctx.restore();
 
           // Render Custom Transition Graphics on Top of frame on Canvas
@@ -4278,12 +4314,22 @@ export default function App() {
         }
         
         if (isDrawing) {
-          drawFrameId = requestAnimationFrame(drawFrame);
+          scheduleNextFrame();
         }
       };
       
+      let isFrameScheduled = false;
+      const scheduleNextFrame = () => {
+        if (!isDrawing || isFrameScheduled) return;
+        isFrameScheduled = true;
+        drawFrameId = requestAnimationFrame(() => {
+          isFrameScheduled = false;
+          drawFrame();
+        });
+      };
+
       // Start drawing frames immediately to the canvas
-      drawFrameId = requestAnimationFrame(drawFrame);
+      scheduleNextFrame();
 
       // Create a background rendering fallback timer.
       // If out-of-focus, minimized, or under heavy CPU load, the browser might suspend requestAnimationFrame completely.
@@ -4291,13 +4337,7 @@ export default function App() {
       fallbackInterval = setInterval(() => {
         if (!isDrawing) return;
         const now = Date.now();
-        if (now - lastDrawTime >= 45) { // If no frame drawn in 45ms, trigger render manual flow
-          if (Math.random() < 0.05) {
-            console.warn("[EXPORT-FAILSAFE] Throttling or backgrounding detected, executing fallback frame draw.");
-          }
-          if (drawFrameId) {
-            cancelAnimationFrame(drawFrameId);
-          }
+        if (now - lastDrawTime >= 45 && !isFrameScheduled) {
           drawFrame();
         }
       }, 33);
@@ -7633,8 +7673,8 @@ export default function App() {
                                     key={idx}
                                     className={wordClass}
                                     style={{
-                                      transform: isCurrent ? 'scale(1.15) translateY(-1px)' : 'scale(1.0)',
-                                      transitionProperty: 'transform, color, opacity, text-shadow'
+                                      transform: 'none',
+                                      transitionProperty: 'color, opacity, text-shadow, filter'
                                     }}
                                   >
                                     {word}
@@ -7927,10 +7967,10 @@ export default function App() {
                         {/* Presets List */}
                         <div className="grid grid-cols-2 gap-1 bg-[#050505] p-1.5 rounded-xl border border-white/5">
                           {[
-                            { id: 'pop', title: 'Vivid TikTok ✨', desc: 'Màu căng mịn, sáng rực', b: 108, c: 112, s: 120 },
-                            { id: 'cinematic', title: 'Trong trẻo 🎬', desc: 'Hiệu quả tương phản sâu', b: 112, c: 118, s: 108 },
-                            { id: 'hdr_boost', title: 'Siêu sáng HDR 🌟', desc: 'Đặc trị video tối mờ', b: 122, c: 115, s: 125 },
-                            { id: 'original', title: 'Gốc 🔄', desc: 'Không bộ lọc màu', b: 100, c: 100, s: 100 },
+                            { id: 'original', title: 'Gốc Tươi Sáng 🔄', desc: '100% màu sắc gốc chân thực, tươi mới', b: 100, c: 100, s: 100 },
+                            { id: 'pop', title: 'Vivid TikTok ✨', desc: 'Màu căng mịn, sáng rực rỡ', b: 106, c: 110, s: 118 },
+                            { id: 'cinematic', title: 'Trong trẻo Điện ảnh 🎬', desc: 'Tương phản sâu, màu sắc sống động', b: 108, c: 114, s: 108 },
+                            { id: 'hdr_boost', title: 'Siêu sáng HDR Pro 🌟', desc: 'Đặc trị video tối mờ, bừng sáng tự nhiên', b: 118, c: 112, s: 120 },
                           ].map((preset) => (
                             <button
                               key={preset.id}
@@ -9344,7 +9384,7 @@ export default function App() {
                   ) : analysisStepIndex === 1 ? (
                     <span>
                       Nhận dạng quang học & cảm quan vật lý đang hoạt động. 
-                      Hệ thống <strong>Gemini-3.5-Flash</strong> phân tích thiết kế, chất liệu, tính năng sản phẩm từ chuỗi hình ảnh được nén tối ưu.
+                      Hệ thống <strong>Gemini 3.7 Flash</strong> phân tích thiết kế, chất liệu, tính năng sản phẩm từ chuỗi hình ảnh được nén tối ưu.
                     </span>
                   ) : (
                     <span>

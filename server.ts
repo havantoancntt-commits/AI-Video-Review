@@ -45,7 +45,7 @@ async function generateWithRetry(
   fn: (modelName: string) => Promise<any>, 
   retries = 5, 
   delayMs = 1500, 
-  defaultModel = "gemini-3.5-flash", 
+  defaultModel = "gemini-3.7-flash", 
   useModelFallback = true
 ) {
   let modelName = defaultModel;
@@ -62,7 +62,7 @@ async function generateWithRetry(
                             errMsg.includes("RESOURCE_EXHAUSTED");
 
       if (isQuotaExceeded) {
-        if (useModelFallback && modelName === "gemini-3.5-flash") {
+        if (useModelFallback && (modelName === "gemini-3.7-flash" || modelName === "gemini-3.6-flash" || modelName === "gemini-3.5-flash")) {
           console.info(`[TIKTOK-OPTIMIZER] Chuyển đổi thông minh sang kênh phụ để giữ tốc độ phản hồi tối ưu...`);
           modelName = "gemini-3.1-flash-lite";
           continue; // Retry instantly without waiting delayMs
@@ -86,7 +86,7 @@ async function generateWithRetry(
                         err.status === 429 ||
                         err.status === 500;
       if (isTemporary && i < retries) {
-        if (useModelFallback && modelName === "gemini-3.5-flash") {
+        if (useModelFallback && (modelName === "gemini-3.7-flash" || modelName === "gemini-3.6-flash" || modelName === "gemini-3.5-flash")) {
           console.info(`[TIKTOK-OPTIMIZER] Điều chỉnh kênh chuyển dịch phân tích thông minh mượt mà...`);
           modelName = "gemini-3.1-flash-lite";
           continue; // Retry instantly using the high-availability model
@@ -566,8 +566,13 @@ function sanitizeTextForVietnameseTTS(text: string): string {
     [/\bxem video\b/gi, 'coi clip'],
     [/\bxem ngay\b/gi, 'coi ngay'],
     [/\bxem hết\b/gi, 'coi hết'],
+    [/\bxem\b/gi, 'coi'],
     [/\bthật là\b/gi, 'thiệt là'],
     [/\bthật sự\b/gi, 'thiệt sự'],
+    [/\bthật ra\b/gi, 'thiệt ra'],
+    [/\bthật luôn\b/gi, 'thiệt luôn'],
+    [/\bthật đấy\b/gi, 'thiệt đó nha'],
+    [/\bthật\b/gi, 'thiệt'],
     [/\bmột tí\b/gi, 'chút xíu'],
     [/\bmột tẹo\b/gi, 'chút xíu'],
     [/\bnhỉ\b/gi, 'nha'],
@@ -577,13 +582,52 @@ function sanitizeTextForVietnameseTTS(text: string): string {
     [/\bđâu nhé\b/gi, 'đâu nha'],
     [/\bđược nhé\b/gi, 'được nha'],
     [/\bnày nhé\b/gi, 'này nha'],
+    [/\bnữa nhé\b/gi, 'nữa nha'],
+    [/\bluôn nhé\b/gi, 'luôn nha'],
+    [/\bnhé bạn\b/gi, 'nha bạn'],
+    [/\bnhé\b/gi, 'nha'],
+    [/\bđấy nhé\b/gi, 'đó nha'],
+    [/\bđấy\b/gi, 'đó'],
+    [/\bthế này\b/gi, 'như vầy'],
+    [/\bthế kia\b/gi, 'như vậy'],
+    [/\bthế nên\b/gi, 'cho nên'],
+    [/\bthế là\b/gi, 'thành ra'],
+    [/\bthế\b/gi, 'vậy'],
+    [/\bvậy nhé\b/gi, 'vậy nha'],
+    [/\bsao thế\b/gi, 'sao vậy'],
+    [/\bkhông đấy\b/gi, 'hông đó'],
+    [/\bkhông nhé\b/gi, 'hông nha'],
+    [/\bkhông nhỉ\b/gi, 'hông nha'],
+    [/\bđược không\b/gi, 'được hông'],
+    [/\bphải không\b/gi, 'phải hông'],
+    [/\bđúng không\b/gi, 'đúng hông'],
+    [/\bcó đúng không\b/gi, 'đúng hông nè'],
     [/\bạ\b/gi, 'nha'],
+    [/\bvâng ạ\b/gi, 'dạ'],
+    [/\bvâng\b/gi, 'dạ'],
     [/\brất là\b/gi, 'cực kỳ'],
     [/\bbảo\b/gi, 'nói'],
     [/\bxử lý\b/gi, 'giải quyết'],
     [/\bsẽ thấy\b/gi, 'sẽ coi thấy'],
     [/\bvào đâu\b/gi, 'vô đâu'],
-    [/\bnhìn vào\b/gi, 'nhìn vô']
+    [/\bnhìn vào\b/gi, 'nhìn vô'],
+    [/\bvào\b/gi, 'vô'],
+    [/\bngõ\b/gi, 'hẻm'],
+    [/\bô\b/gi, 'dù'],
+    [/\bthìa\b/gi, 'muỗng'],
+    [/\bbát\b/gi, 'chén'],
+    [/\bquả\b/gi, 'trái'],
+    [/\bbố\b/gi, 'ba'],
+    [/\bmẹ\b/gi, 'má'],
+    [/\bmọi người\b/gi, 'cả nhà'],
+    [/\bcác bạn\b/gi, 'mấy bạn'],
+    [/\bchúng tôi\b/gi, 'tụi mình'],
+    [/\bsử dụng\b/gi, 'xài'],
+    [/\bdùng\b/gi, 'xài'],
+    [/\bngã\b/gi, 'té'],
+    [/\btất\b/gi, 'vớ'],
+    [/\bchăn\b/gi, 'mền'],
+    [/\bmàn\b/gi, 'mùng']
   ];
 
   for (const [pattern, replacement] of northToSouthMap) {
@@ -596,21 +640,13 @@ function sanitizeTextForVietnameseTTS(text: string): string {
   return clean.trim();
 }
 
-// Helper: Generate fallback clean PCM audio wave (24kHz mono 16-bit) matching script length when Gemini TTS API is hard quota limited
+// Helper: Generate fallback clean silent PCM audio wave (24kHz mono 16-bit) matching script length
 function generateFallbackAudioPcm(text: string): string {
   const durationSec = Math.max(8, Math.min(60, Math.ceil(text.length / 12)));
   const sampleRate = 24000;
   const numSamples = durationSec * sampleRate;
-  const buffer = Buffer.alloc(numSamples * 2);
-
-  for (let i = 0; i < numSamples; i++) {
-    const t = i / sampleRate;
-    // Multi-tone harmonic cadence with subtle cadence modulation mimicking human narration pace
-    const envelope = Math.sin(Math.PI * (i % 8000) / 8000) * 0.35;
-    const freq = 210 + Math.sin(t * 3.5) * 25; // 210Hz smooth pitch
-    const sample = Math.sin(2 * Math.PI * freq * t) * envelope * 14000;
-    buffer.writeInt16LE(Math.floor(sample), i * 2);
-  }
+  // Silent PCM buffer (zero amplitude) to prevent any harsh synthetic tone
+  const buffer = Buffer.alloc(numSamples * 2, 0);
 
   return buffer.toString('base64');
 }
@@ -649,21 +685,18 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
     const phoneticOptimizedText = isEnglish ? cleanSpeechText : sanitizeTextForVietnameseTTS(cleanSpeechText);
 
     let base64Audio: string | null = null;
-    let delay = 1000;
-    const maxRetries = 6;
+    let delay = 1200;
+    const maxRetries = 4;
+    const ttsModel = "gemini-3.1-flash-tts-preview";
 
-    for (let i = 0; i <= maxRetries; i++) {
+    for (let i = 0; i < maxRetries; i++) {
       try {
-        console.info(`[TTS-GEMINI-STUDIO] Khởi tạo lồng tiếng Google AI Studio (Giọng: ${voiceForGemini}, Lần thử: ${i + 1}/${maxRetries + 1})...`);
-        const saigonSystemInstruction = isEnglish
-          ? "You are an elite English voice narrator. Speak with clear pronunciation, natural pacing, and warm, expressive tone."
-          : "Bạn là phát thanh viên lồng tiếng CHUẨN GIỌNG MIỀN NAM SÀI GÒN (NAM BỘ) CHUYÊN NGHIỆP. TUYỆT ĐỐI KHÔNG sử dụng chất giọng Miền Bắc (Hà Nội). BẮT BUỘC phát âm ngữ điệu Miền Nam (Sài Gòn) ngọt ngào, ấm áp, truyền cảm, tròn vành rõ chữ, nhịp điệu tự nhiên như trò chuyện trực tiếp và cực kỳ nịnh tai.";
+        console.info(`[TTS-GEMINI-STUDIO] Khởi tạo lồng tiếng Google AI Studio (Model: ${ttsModel}, Giọng: ${voiceForGemini}, Lần thử: ${i + 1}/${maxRetries})...`);
 
         const response = await ai.models.generateContent({
-          model: "gemini-3.1-flash-tts-preview",
+          model: ttsModel,
           contents: [{ parts: [{ text: phoneticOptimizedText }] }],
           config: {
-            systemInstruction: saigonSystemInstruction,
             responseModalities: ["AUDIO"],
             speechConfig: {
               voiceConfig: {
@@ -688,30 +721,31 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
           waitSec = Math.ceil(parseFloat(match[1]));
         }
 
-        console.info(`[TTS-GEMINI-STUDIO] Đợi làm mới lượt lồng tiếng (Lần thử ${i + 1}/${maxRetries + 1}, Cần chờ: ${waitSec || 2}s)...`);
+        console.info(`[TTS-GEMINI-STUDIO] Server bận tạm thời (503/429/High Demand). Đang thử lại nhịp nhàng (Lần ${i + 1}/${maxRetries})...`);
 
-        if (i < maxRetries) {
-          let waitMs = waitSec > 0 ? (Math.min(waitSec, 25) * 1000 + 800) : delay;
+        if (i < maxRetries - 1) {
+          let waitMs = waitSec > 0 ? (Math.min(waitSec, 10) * 1000 + 500) : delay;
           await new Promise((resolve) => setTimeout(resolve, waitMs));
-          delay = Math.min(delay * 1.8, 5000);
+          delay = Math.min(delay * 1.8, 4000);
         }
       }
     }
 
+    let isFallback = false;
     if (!base64Audio) {
-      console.warn("[TTS-FALLBACK] Hạn ngạch Google AI Studio tạm thời đầy. Khởi tạo bản âm thanh chuẩn hóa tự động...");
+      console.info("[TTS-FALLBACK] Kênh Google AI Studio TTS tạm thời cao điểm. Khởi tạo bản âm thanh chuẩn hóa tự động...");
       base64Audio = generateFallbackAudioPcm(phoneticOptimizedText);
-      ttsMemoryCache.set(cacheKey, base64Audio);
+      isFallback = true;
     }
 
-    return res.json({ audioBase64: base64Audio });
+    return res.json({ audioBase64: base64Audio, isFallback });
 
   } catch (error: any) {
     console.error("Lỗi tạo giọng nói TTS:", error);
     // Fallback on unexpected server error to prevent app crashes
     const fallbackText = req.body?.text || "Xin chào sản phẩm chất lượng tốt.";
     const fallbackBase64 = generateFallbackAudioPcm(fallbackText);
-    return res.json({ audioBase64: fallbackBase64 });
+    return res.json({ audioBase64: fallbackBase64, isFallback: true });
   }
 });
 
@@ -786,8 +820,8 @@ Hãy thực thi nhiệm vụ một cách chuyên nghiệp nhất!`;
           }),
         3,
         1000,
-        "gemini-2.5-flash",
-        false
+        "gemini-3.7-flash",
+        true
       );
 
       resultText = response.text || "";
