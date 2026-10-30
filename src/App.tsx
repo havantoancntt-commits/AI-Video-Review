@@ -53,10 +53,51 @@ import {
   Cpu,
   Move,
   Globe,
-  ShieldAlert
+  ShieldAlert,
+  Sliders,
+  Zap,
+  Music,
+  Radio,
+  Wand2,
+  Flame,
+  Keyboard,
+  Share2,
+  FileAudio,
+  Languages,
+  SlidersHorizontal,
+  Volume1,
+  ShieldCheck,
+  Edit3,
+  ListFilter,
+  CheckCheck,
+  Eye,
+  Radio as RadioIcon,
+  FastForward,
+  RotateCcw,
+  Activity
 } from 'lucide-react';
-import { ReviewReport, TTS_VOICES, TTSVoiceOption, SavedReview, TrendingProduct, UploadedVideoSegment } from './types';
-import { pcmToWav, formatBytes, parseMarkdown, generateSilentWav } from './utils';
+import { ReviewReport, TTS_VOICES, TTSVoiceOption, SavedReview, TrendingProduct, UploadedVideoSegment, SubtitleFontId, SUBTITLE_FONTS } from './types';
+import { 
+  detectSilenceAndAlignSubtitles, 
+  SilenceDetectionResult, 
+  SilenceDetectionOptions 
+} from './audioSilenceDetector';
+import { 
+  pcmToWav, 
+  formatBytes, 
+  parseMarkdown, 
+  generateSilentWav, 
+  exportToSRT, 
+  exportToVTT, 
+  playSynthesizedSFX,
+  parseStoryboardScenes,
+  formatTimeCode,
+  formatTimedSubtitlesClipboard,
+  StoryboardScene,
+  correctVietnameseSpelling,
+  auditAndFixSubtitlesSpelling,
+  getFallbackReviewReport
+} from './utils';
 import ysFixWebmDuration from 'fix-webm-duration';
 
 async function safeParseJSON(response: Response, defaultError: string): Promise<any> {
@@ -70,11 +111,14 @@ async function safeParseJSON(response: Response, defaultError: string): Promise<
     if (text.includes("Payload Too Large") || text.includes("413") || response.status === 413) {
       throw new Error("Kích thước video quá lớn để truyền tải trực tiếp qua API. Vui lòng nén video hoặc tải lên một tệp nhỏ hơn (dưới 300MB) để hệ thống xử lý tối ưu.");
     }
+    if (text.includes("Worker threw exception") || text.includes("Error 1101") || text.includes("workers.dev") || text.includes("cloudflare")) {
+      throw new Error("Máy chủ Cloudflare Worker chưa cấu hình biến môi trường bí mật GEMINI_API_KEY hoặc chưa cấu hình API routes. Hãy thêm GEMINI_API_KEY vào mục Settings > Variables and Secrets trên Cloudflare Dashboard.");
+    }
     if (text.includes("502 Bad Gateway") || text.includes("504 Gateway Timeout") || text.includes("503") || response.status === 502 || response.status === 504) {
       throw new Error("Cổng dịch vụ phụ trợ đang bận hoặc quá tải. Vui lòng thiết lập khóa GEMINI_API_KEY ở mục Settings > Secrets nếu chưa làm, hoặc thử lại sau vài giây.");
     }
     if (text.includes("404 Not Found") || text.includes("Cannot POST") || response.status === 404) {
-      throw new Error("Đường dẫn phân tích không tồn tại hoặc máy chủ đang khởi động.");
+      throw new Error("Đường dẫn API backend (/api/analyze-video) chưa được thiết lập trên máy chủ Cloudflare.");
     }
     const match = text.match(/<pre>(.*?)<\/pre>/s) || text.match(/<h1>(.*?)<\/h1>/s);
     if (match && match[1]) {
@@ -112,13 +156,173 @@ interface SubtitleSegment {
 
 export function cleanScriptForSpeech(scriptText: string): string {
   if (!scriptText) return "";
-  return scriptText
+  let clean = scriptText
+    .normalize('NFC')
     .replace(/\[[^\]]*\]/g, ' ') 
     .replace(/\([^)]*\)/g, ' ')  
     .replace(/[*#_~`]/g, ' ') // remove italics/bold markdown
     .replace(/(KOL:|Người dẫn:|Vlogger:|MC:|Dẫn chương trình:|Lời thoại:|Kịch bản:)/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+
+  // LOẠI BỎ VĨNH VIỄN 100% TỪ NGỮ, NGỮ ĐIỆU, HƯ TỪ, THÁN TỪ VÀ PHÁT ÂM MIỀN BẮC KHỎI TOÀN BỘ ỨNG DỤNG
+  // Chuyển hóa toàn bộ sang phương ngữ Nam Bộ / Sài Gòn ngọt ngào, tự nhiên, sang trọng và chuẩn mực
+  const northToSouthList: [RegExp, string][] = [
+    // 1. Đại từ xưng hô & Đối tượng
+    [/\bchúng tôi\b/gi, 'tụi mình'],
+    [/\bchúng mình\b/gi, 'tụi mình'],
+    [/\bbọn mình\b/gi, 'tụi mình'],
+    [/\bchúng ta\b/gi, 'tụi mình'],
+    [/\bmọi người ơi\b/gi, 'cả nhà ơi'],
+    [/\bmọi người nhé\b/gi, 'cả nhà nha'],
+    [/\bmọi người nghen\b/gi, 'cả nhà nghen'],
+    [/\bmọi người\b/gi, 'cả nhà'],
+    [/\bcác bạn ơi\b/gi, 'mấy bạn ơi'],
+    [/\bcác bạn nhé\b/gi, 'mấy bạn nha'],
+    [/\bcác bạn\b/gi, 'mấy bạn'],
+    [/\bcác bác ơi\b/gi, 'cả nhà ơi'],
+    [/\bcác bác\b/gi, 'mấy bạn'],
+    [/\bchị em ơi\b/gi, 'mấy chị ơi'],
+    [/\banh em ơi\b/gi, 'mấy anh ơi'],
+    [/\bbố mẹ\b/gi, 'ba má'],
+    [/\bbố\b/gi, 'ba'],
+    [/\bmẹ\b/gi, 'má'],
+    [/\bông bà\b/gi, 'ông bà'],
+
+    // 2. Đuôi câu, Hư từ & Ngữ điệu Miền Bắc
+    [/\bnhé cả nhà\b/gi, 'nha cả nhà'],
+    [/\bnhé mọi người\b/gi, 'nha cả nhà'],
+    [/\bnhé các bạn\b/gi, 'nha mấy bạn'],
+    [/\bnhé bạn\b/gi, 'nha bạn'],
+    [/\bđâu nhé\b/gi, 'đâu nha'],
+    [/\bđược nhé\b/gi, 'được nha'],
+    [/\bnày nhé\b/gi, 'này nha'],
+    [/\bnữa nhé\b/gi, 'nữa nha'],
+    [/\bluôn nhé\b/gi, 'luôn nha'],
+    [/\bnhé\b/gi, 'nha'],
+    [/\bnhá cả nhà\b/gi, 'nha cả nhà'],
+    [/\bnhá\b/gi, 'nha'],
+    [/\bnhỉ cả nhà\b/gi, 'nha cả nhà'],
+    [/\bnhỉ bạn\b/gi, 'nha bạn'],
+    [/\bnhỉ\b/gi, 'nha'],
+    [/\bđấy nhé\b/gi, 'đó nha'],
+    [/\bđấy ạ\b/gi, 'đó nha'],
+    [/\bđấy chứ\b/gi, 'đó chớ'],
+    [/\bđấy\b/gi, 'đó'],
+    [/\bthế này này\b/gi, 'như vầy nè'],
+    [/\bthế này nhé\b/gi, 'như vầy nha'],
+    [/\bthế này nha\b/gi, 'như vầy nha'],
+    [/\bthế này\b/gi, 'như vầy'],
+    [/\bthế kia\b/gi, 'như vậy'],
+    [/\bthế nên\b/gi, 'cho nên'],
+    [/\bthế là\b/gi, 'thành ra'],
+    [/\bthế à\b/gi, 'vậy hả'],
+    [/\bthế á\b/gi, 'vậy hả'],
+    [/\bthế hả\b/gi, 'vậy nè'],
+    [/\bthế\b/gi, 'vậy'],
+    [/\bvậy nhé\b/gi, 'vậy nha'],
+    [/\bsao thế\b/gi, 'sao vậy'],
+    [/\bấy nhỉ\b/gi, 'đó nha'],
+    [/\blắm luôn ấy\b/gi, 'lắm luôn á'],
+    [/\blắm ấy\b/gi, 'lắm á'],
+    [/\bấy\b/gi, 'đó'],
+    [/\bđúng rồi đấy\b/gi, 'đúng rồi đó nha'],
+    [/\bchuẩn rồi đấy\b/gi, 'chuẩn rồi đó nha'],
+
+    // 3. Từ ngữ phủ định, nghi vấn & câu hỏi
+    [/\bchẳng\b/gi, 'hông'],
+    [/\bchả\b/gi, 'hông'],
+    [/\bkhông đấy\b/gi, 'hông đó'],
+    [/\bkhông nhé\b/gi, 'hông nha'],
+    [/\bkhông nhỉ\b/gi, 'hông nha'],
+    [/\bđược không ạ\b/gi, 'được hông nè'],
+    [/\bđược không\b/gi, 'được hông'],
+    [/\bphải không ạ\b/gi, 'phải hông nè'],
+    [/\bphải không\b/gi, 'phải hông'],
+    [/\bđúng không ạ\b/gi, 'đúng hông nè'],
+    [/\bđúng không nè\b/gi, 'đúng hông nè'],
+    [/\bđúng không\b/gi, 'đúng hông'],
+    [/\bcó đúng không\b/gi, 'đúng hông nè'],
+
+    // 4. Kính ngữ & Thán từ
+    [/\bvâng ạ\b/gi, 'dạ'],
+    [/\bvâng\b/gi, 'dạ'],
+    [/\bạ\b/gi, 'nha'],
+    [/\brất là\b/gi, 'cực kỳ'],
+    [/\bquá là\b/gi, 'quá chừng'],
+    [/\bquá đi\b/gi, 'quá chừng'],
+    [/\bquá trời luôn\b/gi, 'quá chừng luôn'],
+
+    // 5. Động từ & Hành động đời sống
+    [/\bnghìn\b/gi, 'ngàn'],
+    [/\bxem thử\b/gi, 'coi thử'],
+    [/\bxem clip\b/gi, 'coi clip'],
+    [/\bxem video\b/gi, 'coi clip'],
+    [/\bxem ngay\b/gi, 'coi ngay'],
+    [/\bxem hết\b/gi, 'coi hết'],
+    [/\bxem xong\b/gi, 'coi xong'],
+    [/\bxem\b/gi, 'coi'],
+    [/\bnhìn vào\b/gi, 'nhìn vô'],
+    [/\bvào đâu\b/gi, 'vô đâu'],
+    [/\bvào trong\b/gi, 'vô trong'],
+    [/\bvào\b/gi, 'vô'],
+    [/\bbảo là\b/gi, 'nói là'],
+    [/\bbảo\b/gi, 'nói'],
+    [/\bxử lý\b/gi, 'giải quyết'],
+    [/\bsẽ thấy\b/gi, 'sẽ coi thấy'],
+    [/\bsử dụng\b/gi, 'xài'],
+    [/\bdùng thử\b/gi, 'xài thử'],
+    [/\bdùng\b/gi, 'xài'],
+    [/\bngã\b/gi, 'té'],
+    [/\bchuẩn chỉ\b/gi, 'chuẩn chỉnh'],
+
+    // 6. Tính từ, Trạng từ & Nhận xét
+    [/\bthật là\b/gi, 'thiệt là'],
+    [/\bthật sự\b/gi, 'thiệt sự'],
+    [/\bthật ra\b/gi, 'thiệt ra'],
+    [/\bthật luôn\b/gi, 'thiệt luôn'],
+    [/\bthật đấy\b/gi, 'thiệt đó nha'],
+    [/\bthật nha\b/gi, 'thiệt nha'],
+    [/\bthật\b/gi, 'thiệt'],
+    [/\bmột tí\b/gi, 'chút xíu'],
+    [/\bmột tẹo\b/gi, 'chút xíu'],
+    [/\btẹo\b/gi, 'chút xíu'],
+    [/\btí xíu\b/gi, 'chút xíu'],
+    [/\bđắt đỏ\b/gi, 'mắc tiền'],
+    [/\bđắt quá\b/gi, 'mắc quá'],
+    [/\bđắt\b/gi, 'mắc'],
+    [/\brẻ bèo\b/gi, 'rẻ rề'],
+
+    // 7. Danh từ đời sống & Đồ vật
+    [/\bngõ hẻm\b/gi, 'hẻm'],
+    [/\bngõ\b/gi, 'hẻm'],
+    [/\bcây ô\b/gi, 'cây dù'],
+    [/\bô che\b/gi, 'dù che'],
+    [/\bô\b/gi, 'dù'],
+    [/\bthìa\b/gi, 'muỗng'],
+    [/\bbát ăn cơm\b/gi, 'chén ăn cơm'],
+    [/\bbát đũa\b/gi, 'chén đũa'],
+    [/\bbát\b/gi, 'chén'],
+    [/\bquả táo\b/gi, 'trái táo'],
+    [/\bhoa quả\b/gi, 'trái cây'],
+    [/\bquả\b/gi, 'trái'],
+    [/\bđôi tất\b/gi, 'đôi vớ'],
+    [/\btất chân\b/gi, 'vớ chân'],
+    [/\btất\b/gi, 'vớ'],
+    [/\bchăn màn\b/gi, 'mền mùng'],
+    [/\bchăn\b/gi, 'mền'],
+    [/\bmàn tuyn\b/gi, 'mùng'],
+    [/\bmàn\b/gi, 'mùng'],
+    [/\bbọc lót\b/gi, 'bọc đệm'],
+    [/\bbốc thăm\b/gi, 'bốc thăm']
+  ];
+
+  for (const [pattern, replacement] of northToSouthList) {
+    clean = clean.replace(pattern, replacement);
+  }
+
+  const spellAudit = correctVietnameseSpelling(clean.replace(/\s+/g, ' ').trim());
+  return spellAudit.correctedText;
 }
 
 export function cleanSubtitleTranslation(text: string): string {
@@ -140,6 +344,10 @@ function getSegmentsFromScript(scriptText: string, totalDuration: number = 0): S
 
   if (cleanText.length === 0) return [];
 
+  // Pre-correct spelling on entire script text to preserve multi-word collocations & proper names
+  const preSpellResult = correctVietnameseSpelling(cleanText);
+  const normalizedText = preSpellResult.correctedText;
+
   // Split by words to dynamically cluster them into professional TikTok-styled subtitle frames
   // Rules for premium high-retaining captions:
   // - Maximum 6 words per segment (making them incredibly easy and fast to read)
@@ -147,7 +355,7 @@ function getSegmentsFromScript(scriptText: string, totalDuration: number = 0): S
   // - Smart split on grammatical punctuations (., ?, !, ;, ,)
   // - Smart split on Vietnamese conjunctions/connectors if segment already contains comfortable content
   
-  const words = cleanText.split(/\s+/).filter(Boolean);
+  const words = normalizedText.split(/\s+/).filter(Boolean);
   interface GroupedSegment {
     text: string;
     sentenceIndex: number;
@@ -196,10 +404,22 @@ function getSegmentsFromScript(scriptText: string, totalDuration: number = 0): S
     });
   }
   
-  // Clean punctuation prefix/suffix of each caption block but keep internal markers
+  // Clean punctuation prefix/suffix of each caption block but keep internal markers & correct spelling
   const finalChunks = grouped.map(item => {
     const rawText = item.text;
-    const cleanedText = rawText.replace(/^[\s,.\-!?;:\u2026]+|[\s,.\-!?;:\u2026]+$/g, '').trim();
+    let cleanedText = rawText.replace(/^[\s,.\-!?;:\u2026]+|[\s,.\-!?;:\u2026]+$/g, '').trim();
+    
+    // Auto-fix spelling, accents, and capitalization for highest subtitle quality
+    const spellCheck = correctVietnameseSpelling(cleanedText);
+    cleanedText = spellCheck.correctedText;
+
+    // Remove dangling trailing period or comma in short subtitle frames (TikTok/Reels subtitle standard)
+    // Keep expressive marks '?', '!', '…'
+    cleanedText = cleanedText.replace(/[.,]+$/g, '').trim();
+
+    if (cleanedText.length > 0) {
+      cleanedText = cleanedText.charAt(0).toUpperCase() + cleanedText.slice(1);
+    }
     
     // Determine punctuation pause duration in seconds
     let pauseDuration = 0.0;
@@ -228,24 +448,31 @@ function getSegmentsFromScript(scriptText: string, totalDuration: number = 0): S
   
   if (totalCombinedWeight === 0) return [];
 
-  const duration = (totalDuration && totalDuration > 0 && isFinite(totalDuration)) ? totalDuration : 18;
+  // If no explicit audio duration is supplied, compute natural speaking duration (~2.8 words/sec)
+  const fallbackDuration = Math.max(3.0, Number((totalSpeakingWeight * 1.05 + totalPauseDuration).toFixed(2)));
+  const duration = (totalDuration && totalDuration > 0 && isFinite(totalDuration)) ? totalDuration : fallbackDuration;
   const scale = duration / totalCombinedWeight;
   
   let currentStart = 0;
   const segments: SubtitleSegment[] = [];
 
-  finalChunks.forEach((item) => {
+  finalChunks.forEach((item, idx) => {
     const speechDuration = item.speakingWeight * scale;
     const pauseDurationScaled = item.pauseDuration * scale;
-    const segmentTotalDuration = speechDuration + pauseDurationScaled;
-    
+    const isLast = idx === finalChunks.length - 1;
+
+    // For smooth subtitle transitions on screen, maintain comfortable continuity
+    const segmentEnd = isLast 
+      ? duration 
+      : Number((currentStart + speechDuration + (pauseDurationScaled * 0.35)).toFixed(3));
+
     segments.push({
       text: item.text,
       start: Number(currentStart.toFixed(3)),
-      end: Number((currentStart + speechDuration).toFixed(3)),
+      end: Math.max(Number(currentStart.toFixed(3)) + 0.3, segmentEnd),
       sentenceIndex: item.sentenceIndex
     });
-    currentStart = currentStart + segmentTotalDuration;
+    currentStart = Number((currentStart + speechDuration + pauseDurationScaled).toFixed(3));
   });
 
   return segments;
@@ -583,6 +810,8 @@ export default function App() {
 
   // Dynamic Synchronized Subtitle States
   const [subtitleStyle, setSubtitleStyle] = useState<'tiktok' | 'capcut' | 'cyberpunk' | 'neon' | 'minimal'>('tiktok');
+  const [subtitleFontFamily, setSubtitleFontFamily] = useState<SubtitleFontId>('vietnam');
+  const [subtitleCase, setSubtitleCase] = useState<'uppercase' | 'normal'>('uppercase');
   const [showSubtitles, setShowSubtitles] = useState<boolean>(true);
   const [wordHighlightEnabled, setWordHighlightEnabled] = useState<boolean>(true);
   const [subtitleOffset, setSubtitleOffset] = useState<number>(0.0);
@@ -611,6 +840,89 @@ export default function App() {
   const [customHookSuggestions, setCustomHookSuggestions] = useState<string[]>([]);
   const [isRefreshingHooks, setIsRefreshingHooks] = useState<boolean>(false);
   const [resultSubTab, setResultSubTab] = useState<'review' | 'video-analysis'>('review');
+
+  // WORLD-CLASS PRO STUDIO SUITE STATES
+  const [exportResolution, setExportResolution] = useState<'4k' | '1080p' | '720p'>('1080p');
+  const [exportFps, setExportFps] = useState<60 | 30>(60);
+  const [exportBitratePreset, setExportBitratePreset] = useState<'master' | 'high' | 'standard'>('high');
+  const [autoSFXOnHook, setAutoSFXOnHook] = useState<boolean>(true);
+  const [isKeyboardHelpOpen, setIsKeyboardHelpOpen] = useState<boolean>(false);
+  const [isSFXModalOpen, setIsSFXModalOpen] = useState<boolean>(false);
+  const [activePresetKey, setActivePresetKey] = useState<string | null>('tiktok-viral');
+  const [targetTranslateLang, setTargetTranslateLang] = useState<string>('en');
+
+  // SMART CHECKER & AUTO-FIXER FOR REVIEWS, SCRIPTS & SUBTITLES
+  const [isCheckingAndFixing, setIsCheckingAndFixing] = useState<boolean>(false);
+  const [isFixingSubtitleSpelling, setIsFixingSubtitleSpelling] = useState<boolean>(false);
+  const [subtitleSpellToast, setSubtitleSpellToast] = useState<{ show: boolean; title: string; message: string; fixes: string[] } | null>(null);
+  const [isAuditReportOpen, setIsAuditReportOpen] = useState<boolean>(false);
+  const [lastAuditResult, setLastAuditResult] = useState<{
+    fixedSummary: string;
+    fixedCtaText: string;
+    fixedMarketingScript: string;
+    fixedDetailedReview: string;
+    fixedSubtitles: { start: number; end: number; text: string }[];
+    fixedIssues: string[];
+    qualityScoreBefore: number;
+    qualityScoreAfter: number;
+    optimizationSummary: string;
+  } | null>(null);
+
+  // AUDIO SILENCE & SPEECH ACTIVITY DETECTOR (VAD) STATES
+  const [isSilenceDetectModalOpen, setIsSilenceDetectModalOpen] = useState<boolean>(false);
+  const [isDetectingSilence, setIsDetectingSilence] = useState<boolean>(false);
+  const [silenceDetectResult, setSilenceDetectResult] = useState<SilenceDetectionResult | null>(null);
+  const [silenceThresholdDb, setSilenceThresholdDb] = useState<number>(-36);
+  const [minSilenceDuration, setMinSilenceDuration] = useState<number>(0.22);
+  const [silencePaddingSec, setSilencePaddingSec] = useState<number>(0.05);
+
+  // REVIEW & SUBTITLE SMART SYNCHRONIZATION SUITE
+  const [reviewSyncViewMode, setReviewSyncViewMode] = useState<'storyboard' | 'subtitle-matrix' | 'teleprompter'>('storyboard');
+  const [syncSearchQuery, setSyncSearchQuery] = useState<string>('');
+  const [editingSegmentIdx, setEditingSegmentIdx] = useState<number | null>(null);
+  const [editingSegmentText, setEditingSegmentText] = useState<string>('');
+  const [copiedTimedSubtitles, setCopiedTimedSubtitles] = useState<boolean>(false);
+
+  // 1-Click Viral Formula Preset Applier
+  const applyViralPreset = (presetKey: 'tiktok-viral' | 'luxury-aesthetic' | 'tech-unboxing' | 'flash-sale' | 'organic-asmr') => {
+    setActivePresetKey(presetKey);
+    if (presetKey === 'tiktok-viral') {
+      setHookBannerStyle('tiktok-yellow');
+      setSubtitleStyle('tiktok');
+      setAudioEffect('bass');
+      setWordHighlightEnabled(true);
+      setColorPreset('vibrant');
+      playSynthesizedSFX('chime', 0.9);
+    } else if (presetKey === 'luxury-aesthetic') {
+      setHookBannerStyle('editorial-royal');
+      setSubtitleStyle('capcut');
+      setAudioEffect('reverb');
+      setWordHighlightEnabled(true);
+      setColorPreset('cinematic');
+      playSynthesizedSFX('whoosh', 0.8);
+    } else if (presetKey === 'tech-unboxing') {
+      setHookBannerStyle('cyberpunk-neon');
+      setSubtitleStyle('cyberpunk');
+      setAudioEffect('none');
+      setWordHighlightEnabled(true);
+      setColorPreset('cool');
+      playSynthesizedSFX('shutter', 0.8);
+    } else if (presetKey === 'flash-sale') {
+      setHookBannerStyle('tiktok-red');
+      setSubtitleStyle('tiktok');
+      setAudioEffect('bass');
+      setWordHighlightEnabled(true);
+      setColorPreset('warm');
+      playSynthesizedSFX('chime', 1.0);
+    } else if (presetKey === 'organic-asmr') {
+      setHookBannerStyle('beast-glow');
+      setSubtitleStyle('minimal');
+      setAudioEffect('none');
+      setWordHighlightEnabled(false);
+      setColorPreset('original');
+      playSynthesizedSFX('bell', 0.7);
+    }
+  };
 
   const refreshHookSuggestions = async () => {
     const rawName = activeReview?.productName || productName || "Sản phẩm xu hướng";
@@ -817,6 +1129,261 @@ export default function App() {
       setApiError(e.message || "Không thể kết nối dịch vụ AI tối ưu kịch bản.");
     } finally {
       setIsOptimizingScript(false);
+    }
+  };
+
+  // Comprehensive Smart QA Inspector and Auto-Corrector for Review, Script & Subtitles
+  const handleCheckAndFixReviewAndSubtitles = async () => {
+    let videoDuration = 18;
+    if (videoRef.current && videoRef.current.duration && !isNaN(videoRef.current.duration) && isFinite(videoRef.current.duration)) {
+      videoDuration = videoRef.current.duration;
+    } else if (uploadedVideoDuration && !isNaN(uploadedVideoDuration) && isFinite(uploadedVideoDuration)) {
+      videoDuration = uploadedVideoDuration;
+    } else if (activeReview && activeReview.duration && !isNaN(activeReview.duration)) {
+      videoDuration = activeReview.duration;
+    }
+
+    const scriptToFix = editedScript || (activeReview?.marketingScript || '');
+    const reviewToFix = activeReview?.detailedReview || '';
+    const summaryToFix = activeReview?.summary || '';
+    const ctaToFix = activeReview?.ctaText || '';
+    const subsToFix = customSubtitleSegments || subtitleSegments || [];
+
+    if (!scriptToFix.trim() && !reviewToFix.trim() && (!subsToFix || subsToFix.length === 0)) {
+      setApiError("Vui lòng khởi tạo hoặc nhập bài viết review/kịch bản trước khi thực hiện kiểm tra sửa lỗi!");
+      return;
+    }
+
+    setIsCheckingAndFixing(true);
+    setApiError(null);
+
+    try {
+      const res = await fetch('/api/check-and-fix-review-and-subtitles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          detailedReview: reviewToFix,
+          marketingScript: scriptToFix,
+          summary: summaryToFix,
+          ctaText: ctaToFix,
+          subtitleSegments: subsToFix,
+          videoDuration: videoDuration,
+          language: reviewLanguage,
+          productName: activeReview?.productName || productName || ''
+        })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.error || "Không thể hoàn tất quy trình kiểm tra sửa lỗi.");
+      }
+
+      const data = await res.json();
+      setLastAuditResult(data);
+
+      // Auto-apply fixes directly to state for instant flawless results
+      if (data.fixedMarketingScript) {
+        setEditedScript(data.fixedMarketingScript);
+      }
+      if (data.fixedSubtitles && Array.isArray(data.fixedSubtitles) && data.fixedSubtitles.length > 0) {
+        setCustomSubtitleSegments(data.fixedSubtitles);
+      }
+      if (activeReview) {
+        setActiveReview({
+          ...activeReview,
+          summary: data.fixedSummary || activeReview.summary,
+          ctaText: data.fixedCtaText || activeReview.ctaText,
+          detailedReview: data.fixedDetailedReview || activeReview.detailedReview,
+          marketingScript: data.fixedMarketingScript || activeReview.marketingScript
+        });
+      }
+
+      playSynthesizedSFX('chime', 0.9);
+      setIsAuditReportOpen(true);
+    } catch (e: any) {
+      console.error("Lỗi khi kiểm tra sửa lỗi bài viết review & phụ đề:", e);
+      setApiError(e.message || "Đã xảy ra lỗi khi kiểm tra sửa lỗi bài viết review và phụ đề.");
+    } finally {
+      setIsCheckingAndFixing(false);
+    }
+  };
+
+  // Dedicated AI & Algorithmic Subtitle Spell Checker & Grammar Polisher
+  const handleFixSubtitlesSpellingAI = async () => {
+    const currentSubs = customSubtitleSegments || subtitleSegments || [];
+    if (currentSubs.length === 0) {
+      setSubtitleSpellToast({
+        show: true,
+        title: "Chưa có phân cảnh phụ đề",
+        message: "Vui lòng nhập kịch bản hoặc tạo bài review để tự động sinh phụ đề trước khi kiểm tra chính tả.",
+        fixes: []
+      });
+      return;
+    }
+
+    setIsFixingSubtitleSpelling(true);
+    try {
+      const res = await fetch('/api/fix-subtitles-spelling', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subtitles: currentSubs,
+          productName: activeReview?.productName || productName || '',
+          language: reviewLanguage
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error("Không thể kết nối máy chủ phân tích chính tả.");
+      }
+
+      const data = await res.json();
+      if (data.fixedSubtitles && Array.isArray(data.fixedSubtitles) && data.fixedSubtitles.length > 0) {
+        setCustomSubtitleSegments(data.fixedSubtitles);
+        playSynthesizedSFX('chime', 0.9);
+        setSubtitleSpellToast({
+          show: true,
+          title: "✨ AI Chuẩn Hóa Chính Tả & Dấu Câu Thành Công",
+          message: data.summary || `Đã tối ưu chính xác 100% ngữ pháp & dấu câu cho ${data.fixedSubtitles.length} phân cảnh.`,
+          fixes: data.fixedDetails || []
+        });
+      }
+    } catch (err: any) {
+      console.warn("Dùng bộ quy chuẩn chính tả tiếng Việt nội bộ:", err.message);
+      const localResult = auditAndFixSubtitlesSpelling(currentSubs);
+      setCustomSubtitleSegments(localResult.fixedSubtitles);
+      playSynthesizedSFX('chime', 0.8);
+      setSubtitleSpellToast({
+        show: true,
+        title: "✨ Chuẩn Hóa Chính Tả Tiếng Việt Tức Thì",
+        message: localResult.fixCount > 0 
+          ? `Đã tự động sửa ${localResult.fixCount} lỗi chính tả và dấu câu theo chuẩn ngữ pháp.`
+          : "Tất cả các phân cảnh phụ đề đều đã đạt độ chính xác chính tả 100%.",
+        fixes: localResult.fixedItems.map(item => `Phân cảnh #${item.index + 1}: "${item.before}" → "${item.after}" (${item.reason})`)
+      });
+    } finally {
+      setIsFixingSubtitleSpelling(false);
+    }
+  };
+
+  const handleFixSubtitlesSpellingLocal = () => {
+    const currentSubs = customSubtitleSegments || subtitleSegments || [];
+    if (currentSubs.length === 0) return;
+    const localResult = auditAndFixSubtitlesSpelling(currentSubs);
+    setCustomSubtitleSegments(localResult.fixedSubtitles);
+    playSynthesizedSFX('pop', 0.7);
+    setSubtitleSpellToast({
+      show: true,
+      title: "⚡ Sửa Nhanh Chính Tả & Dấu Câu",
+      message: localResult.fixCount > 0 
+        ? `Đã sửa ${localResult.fixCount} lỗi chính tả tiếng Việt.`
+        : "Toàn bộ phụ đề đã đạt độ chuẩn xác 100%.",
+      fixes: localResult.fixedItems.map(item => `Phân cảnh #${item.index + 1}: "${item.before}" → "${item.after}" (${item.reason})`)
+    });
+  };
+
+  // Automatic Audio Silence & Speech Interval Detection (Voice Activity Detector)
+  const handleRunSilenceDetection = async (overrideOptions?: { thresholdDb?: number; minSilenceDurationSec?: number; startPaddingSec?: number }) => {
+    const activeAudioSource = audioUrl || (audioRef.current ? audioRef.current.src : '');
+    
+    if (!activeAudioSource) {
+      setApiError("Chưa có tệp âm thanh thuyết minh để phân tích khoảng lặng. Hãy nhấp 'Khởi tạo giọng đọc AI' hoặc tải file audio/video lên trước!");
+      return;
+    }
+
+    const currentSubs = customSubtitleSegments || subtitleSegments || [];
+    if (currentSubs.length === 0) {
+      setApiError("Chưa có phân cảnh phụ đề nào để điều chỉnh. Hãy nhập kịch bản hoặc phân tích sản phẩm trước!");
+      return;
+    }
+
+    setIsDetectingSilence(true);
+    setApiError(null);
+
+    const threshold = overrideOptions?.thresholdDb !== undefined ? overrideOptions.thresholdDb : silenceThresholdDb;
+    const minSilence = overrideOptions?.minSilenceDurationSec !== undefined ? overrideOptions.minSilenceDurationSec : minSilenceDuration;
+    const padding = overrideOptions?.startPaddingSec !== undefined ? overrideOptions.startPaddingSec : silencePaddingSec;
+
+    try {
+      const result = await detectSilenceAndAlignSubtitles(
+        activeAudioSource,
+        currentSubs,
+        {
+          thresholdDb: threshold,
+          minSilenceDurationSec: minSilence,
+          startPaddingSec: padding,
+          endPaddingSec: padding * 1.5
+        }
+      );
+
+      setSilenceDetectResult(result);
+      setIsSilenceDetectModalOpen(true);
+      playSynthesizedSFX('chime', 0.85);
+    } catch (err: any) {
+      console.error("Lỗi phân tích khoảng lặng âm thanh:", err);
+      setApiError(err.message || "Không thể phân tích dữ liệu âm thanh. Vui lòng kiểm tra lại file audio.");
+    } finally {
+      setIsDetectingSilence(false);
+    }
+  };
+
+  const handleApplySilenceAlignment = () => {
+    if (!silenceDetectResult || !silenceDetectResult.alignedSubtitles) return;
+    
+    setCustomSubtitleSegments(silenceDetectResult.alignedSubtitles);
+    playSynthesizedSFX('chime', 1.0);
+    setIsSilenceDetectModalOpen(false);
+
+    const count = silenceDetectResult.alignedSubtitles.length;
+    const speechCount = silenceDetectResult.speechIntervals.length;
+    const silenceCount = silenceDetectResult.silenceGaps.length;
+
+    setSubtitleSpellToast({
+      show: true,
+      title: "⚡ Đã Tự Động Khớp Khoảng Lặng Audio",
+      message: `Đã căn chỉnh ${count} phân cảnh phụ đề khớp khít theo ${speechCount} đoạn phát âm và ${silenceCount} khoảng lặng thực tế.`,
+      fixes: silenceDetectResult.adjustments.map(adj => 
+        `Phân cảnh #${adj.index + 1}: Bắt đầu ${adj.oldStart}s ➔ ${adj.newStart}s (Δ ${adj.deltaStart >= 0 ? '+' : ''}${adj.deltaStart}s) | Kết thúc ${adj.oldEnd}s ➔ ${adj.newEnd}s (Δ ${adj.deltaEnd >= 0 ? '+' : ''}${adj.deltaEnd}s)`
+      )
+    });
+  };
+
+  const previewSegmentAudioTimerRef = useRef<any>(null);
+  const handlePreviewSilenceSegment = (start: number, end: number) => {
+    if (previewSegmentAudioTimerRef.current) {
+      clearTimeout(previewSegmentAudioTimerRef.current);
+    }
+
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = Math.max(0, start - 0.05);
+
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.currentTime = Math.max(0, start - 0.05);
+      }
+
+      setTimeout(() => {
+        if (audioRef.current) {
+          audioRef.current.play().then(() => {
+            setIsPlaying(true);
+            if (isSyncPlay && videoRef.current) {
+              videoRef.current.play().catch(() => {});
+            }
+          }).catch(() => {});
+
+          const playDuration = Math.max(0.3, end - start + 0.1);
+          previewSegmentAudioTimerRef.current = setTimeout(() => {
+            if (audioRef.current) {
+              audioRef.current.pause();
+              setIsPlaying(false);
+            }
+            if (videoRef.current) {
+              videoRef.current.pause();
+            }
+          }, (playDuration * 1000) / (playbackSpeed || 1.0));
+        }
+      }, 50);
     }
   };
 
@@ -1124,367 +1691,6 @@ export default function App() {
   const [stickerAnimation, setStickerAnimation] = useState<'fade-in' | 'bounce' | 'slide-in'>('bounce');
   const scriptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // --- START OF DETAILED PRODUCT REVIEW STUDIO CAMERA SERVICES ---
-  const SHOOT_STEPS = [
-    {
-      title: "Mở Đầu Hút Mắt (Hook & Unboxing)",
-      subtitle: "Giữ chân người xem trong 3 giây vàng đầu tiên",
-      angleId: "over_head",
-      grid: "rule_of_thirds" as const,
-      filter: "golden" as const,
-      aspect: "9_16" as const,
-      distance: "CẬN TRUNG BÌNH (35 - 50cm)",
-      motion: "ĐẨY DẦN TIẾN LẠI GẦN (Dolly In)",
-      gripType: "Đặt hộp tĩnh ngay ngắn giữa khung bàn. Dùng cả 2 tay từ từ xé niêm phong và nhấc nắp nghiêng nhẹ f/1.8 để phô bày lớp nhung lót.",
-      sweepDirection: "Tịnh tiến từ Phía Xa, đi thẳng và Hạ Dần camera xuống sát mặt phẳng hộp.",
-      simulatedObject: "Vỏ Hộp Nguyên Seal (Box Grid)",
-      voiceover: "Hế nhô cả nhà! Hôm nay mình sẽ khui hộp nóng hổi siêu phẩm đang khuấy đảo này. Ngay lần đầu cầm vào là cảm nhận được sự tỉ mỉ vượt trội...",
-      instruction: "Đập hộp hoặc lấy sản phẩm từ từ ra khỏi hộp ngay trung tâm dải lưới tỷ lệ vàng. Hãy lia máy tịnh tiến nhẹ nhàng từ xa lại gần để tạo kịch tính cuốn hút.",
-      tip: "Kê sườn đèn lệch 45 độ để tránh tạo bóng sẫm của tay che lấp logo chính."
-    },
-    {
-      title: "Cận Cảnh Chi Tiết (Product Closeup)",
-      subtitle: "Lột tả chất liệu cơ bản và đường nét uốn lượn sắc sảo",
-      angleId: "pov_closeup",
-      grid: "macro_detail" as const,
-      filter: "cinematic" as const,
-      aspect: "9_16" as const,
-      distance: "CỰC CẬN SIÊU SÁT (10 - 20cm)",
-      motion: "QUÉT ĐỨNG CHẬM TRÃI (Tilt Down)",
-      gripType: "Tay trái cầm chắc 2/3 phần góc dưới sản phẩm (Tránh che logo), tay phải xoay khẽ mặt nghiêng 15 độ bắt dải phản chiếu cực quang.",
-      sweepDirection: "Lia máy đều tay theo chiều dọc từ ĐỈNH TRÊN lướt dần xuống CẠNH ĐÁY.",
-      simulatedObject: "Nút Cơ Học & Vân Nhám Kim Loại (Macro Target)",
-      voiceover: "Mọi người so sánh thử nét bo viền này xem, sớ nhám rờ thì cực sướng tay, lấp lánh phản quang bóng bảy vô cùng...",
-      instruction: "Lia máy (Pan hoặc Tilt) siêu chậm sát rạt các chi tiết cơ khí/nút bấm của vật thể. Xoay khẽ góc vật thể 15 độ để phản xạ tia sáng lấp lánh.",
-      tip: "Áp hai mạn khuỷu tay sát sườn làm bệ tỳ, di góc từ vai để chống giật rung tối đa."
-    },
-    {
-      title: "Trải Nghiệm Thực Tế (Feature Demonstration)",
-      subtitle: "Trực quan thao tác kích hoạt tính năng đỉnh cao",
-      angleId: "dolly_broll",
-      grid: "center_focus" as const,
-      filter: "teal_orange" as const,
-      aspect: "9_16" as const,
-      distance: "CẬN CẢNH VỪA PHẢI (25 - 35cm)",
-      motion: "TRƯỢT NGANG CHẬM RÃI (Truck Left-Right)",
-      gripType: "Một tay duy trì tì ngang bệ máy, ngón trỏ hoặc ngón cái nhấp khởi động tính năng rực rỡ để camera phát hiện tín hiệu vật lý tức thì.",
-      sweepDirection: "Quét tịnh tiến đều góc từ mạn TRÁI trượt dần qua mạn PHẢI sản phẩm.",
-      simulatedObject: "Màn Hình / Đèn LED Phản Hồi (Interface Active)",
-      voiceover: "Bật nút khởi chạy là thấy kết nối thông suốt tức thì. Thao tác nhạy bén không hề có một mili giây phản hồi trễ nào luôn!",
-      instruction: "Thao tác ngón tay tự tin chuẩn xác ngay tâm dải tròn hỗ trợ lấy nét. Kết hợp Dolly In (đẩy máy hướng thẳng vào logo/màn hình).",
-      tip: "Bật tông màu Teal & Orange để dải màu sắc của đèn và màn hình phản quang sặc sỡ như phim rạp."
-    },
-    {
-      title: "Tổng Kết & Nhận Diện CV (Verdict & CV Lock)",
-      subtitle: "Tự động khóa mục tiêu sản phẩm bằng Trí Tuệ Nhân Tạo (Computer Vision)",
-      angleId: "cv_tracking_lock",
-      grid: "rule_of_thirds" as const,
-      filter: "high_contrast" as const,
-      aspect: "9_16" as const,
-      distance: "GÓC TOÀN CẢNH (50 - 70cm)",
-      motion: "KHÓA MỤC TIÊU THỰC TẾ (CV Target Lock)",
-      gripType: "Đặt sản phẩm nằm ngay ngắn giữa tầm ngắm. Hệ thống Computer Vision sẽ tự động quét, định tâm và nhận diện nhãn mác vật lý.",
-      sweepDirection: "Hướng trực diện ống kính vào mặt trước sản phẩm và giữ máy cực kỳ ổn định trong 3 giây.",
-      simulatedObject: "Nhận Diện Thực Thể (Cognitive CV Anchor)",
-      voiceover: "Một sản phẩm vô cùng đẳng cấp và chất lượng vượt thời gian cả nhà ơi! Hãy lựa chọn ngay bằng cách click vào giỏ hàng ưu đãi độc quyền ở bên dưới nhé!",
-      instruction: "Hãy căn chỉnh sản phẩm vào vùng chữ thập trung tâm. Cảm biến thị giác máy tính đang khóa vệt lưới laser xanh lá để phân tích kích thước và nhãn hiệu.",
-      tip: "Kích hoạt cài đặt COMPUTER VISION COACHING bên dưới để nhận diện mượt mà hơn."
-    }
-  ];
-
-  const [cameraShootStep, setCameraShootStep] = useState<number>(0);
-  const [showSmartShootingPrompter, setShowSmartShootingPrompter] = useState<boolean>(true);
-  const [cyberCoords, setCyberCoords] = useState<{ x: number; y: number; confidence: number; zoom: number }>({ x: 180, y: 220, confidence: 98.2, zoom: 1.0 });
-
-  const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
-  const [pendingRecordedFile, setPendingRecordedFile] = useState<File | null>(null);
-  const [recordedVideoPreviewUrl, setRecordedVideoPreviewUrl] = useState<string | null>(null);
-  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
-  const [isRecordingCamera, setIsRecordingCamera] = useState<boolean>(false);
-  const [isRecordingPaused, setIsRecordingPaused] = useState<boolean>(false);
-  const [cameraNotice, setCameraNotice] = useState<string | null>(null);
-  const [cameraFilter, setCameraFilter] = useState<'none' | 'cinematic' | 'golden' | 'high_contrast' | 'teal_orange'>('none');
-  const [cameraGrid, setCameraGrid] = useState<'none' | 'rule_of_thirds' | 'center_focus' | 'macro_detail'>('none');
-  const [cameraAspect, setCameraAspect] = useState<'9_16' | '16_9'>('9_16');
-  const [selectedAngleId, setSelectedAngleId] = useState<string>('pov_closeup');
-  const [cameraError, setCameraError] = useState<string | null>(null);
-  const [recordingSeconds, setRecordingSeconds] = useState<number>(0);
-  const [showAnglesGuidePanel, setShowAnglesGuidePanel] = useState<boolean>(true);
-
-  // Real-time AI recognition states for professional cinematography coaching
-  const [aiTargetType, setAiTargetType] = useState<'auto' | 'logo' | 'box' | 'macro'>('auto');
-  const [aiStabilizerScore, setAiStabilizerScore] = useState<number>(98.5);
-  const [aiAngleDeviation, setAiAngleDeviation] = useState<number>(0.15);
-  const [aiLivePrompt, setAiLivePrompt] = useState<string>('GIỮ KHUNG TỶ LỆ VÀNG');
-  const [aiAcousticLevel, setAiAcousticLevel] = useState<number>(-42);
-  const [aiDetectedLabel, setAiDetectedLabel] = useState<string>('BOX_PRO_MAX_GRID');
-
-  // Real-time Computer Vision light analyzing state variables
-  const [liveSceneBrightness, setLiveSceneBrightness] = useState<number>(75);
-  const [liveSceneColorTemp, setLiveSceneColorTemp] = useState<number>(5500);
-  const liveSceneBrightnessRef = useRef<number>(75);
-  const liveSceneColorTempRef = useRef<number>(5500);
-  const [isSmartAwbEnabled, setIsSmartAwbEnabled] = useState<boolean>(true);
-  const [activeDeviceMotion, setActiveDeviceMotion] = useState<'dolly' | 'tilt' | 'pan' | 'orbit' | 'roll'>('dolly');
-  const [completedShootSteps, setCompletedShootSteps] = useState<boolean[]>([false, false, false, false]);
-  const [liveMotionSpeed, setLiveMotionSpeed] = useState<number>(0.12); // simulated m/s
-  const [activeCameraGuideTab, setActiveCameraGuideTab] = useState<'checklist' | 'motions'>('checklist');
-
-  // Real-time Computer Vision (CV) AI Product Detection states
-  const [isComputerVisionActive, setIsComputerVisionActive] = useState<boolean>(true);
-  const [isCvAnalyzerExpanded, setIsCvAnalyzerExpanded] = useState<boolean>(true);
-  const [cvScannerStyle, setCvScannerStyle] = useState<'laser_grid' | 'contour_edges' | 'anchor_points' | 'telemetry_overlay'>('laser_grid');
-  const [isTargetFocusLocked, setIsTargetFocusLocked] = useState<boolean>(false);
-
-  // Intelligent scene switcher helper
-  const handleSwitchCameraShootStep = (idx: number) => {
-    const step = SHOOT_STEPS[idx];
-    if (!step) return;
-    setCameraShootStep(idx);
-    setSelectedAngleId(step.angleId);
-    setCameraGrid(step.grid);
-    setCameraFilter(step.filter);
-    setCameraAspect(step.aspect);
-    
-    // Auto sync active device motion with the step's motion type if matched
-    if (step.motion.toLowerCase().includes("dolly") || step.motion.toLowerCase().includes("tiến")) {
-      setActiveDeviceMotion('dolly');
-    } else if (step.motion.toLowerCase().includes("tilt") || step.motion.toLowerCase().includes("đứng")) {
-      setActiveDeviceMotion('tilt');
-    } else if (step.motion.toLowerCase().includes("pan") || step.motion.toLowerCase().includes("trượt")) {
-      setActiveDeviceMotion('pan');
-    } else if (step.motion.toLowerCase().includes("orbit") || step.motion.toLowerCase().includes("vòng cung")) {
-      setActiveDeviceMotion('orbit');
-    } else if (step.motion.toLowerCase().includes("roll") || step.motion.toLowerCase().includes("nghiêng")) {
-      setActiveDeviceMotion('roll');
-    }
-
-    // Automatically pause continuous recording to allow clean next shot setup
-    if (isRecordingCamera && !isRecordingPaused) {
-      if (typeof pauseRecordingCamera === 'function') {
-        pauseRecordingCamera();
-      }
-    }
-  };
-
-  // Auto-sync active device motion whenever camera shoot step changes
-  useEffect(() => {
-    const motionMap: ('dolly' | 'tilt' | 'pan' | 'orbit' | 'roll')[] = ['dolly', 'tilt', 'pan', 'orbit'];
-    if (cameraShootStep >= 0 && cameraShootStep < motionMap.length) {
-      setActiveDeviceMotion(motionMap[cameraShootStep]);
-    }
-  }, [cameraShootStep]);
-
-  // Analyze feed pixels continuously in background to calculate live lux & temp
-  useEffect(() => {
-    if (!isCameraActive) return;
-    let animFrame: number;
-    let lastAnalyzeTime = 0;
-    
-    // Create local offscreen elements for analysis without clogging DOM
-    const offscreenCanvas = document.createElement('canvas');
-    offscreenCanvas.width = 12;
-    offscreenCanvas.height = 12;
-    const ctx = offscreenCanvas.getContext('2d');
-    
-    const analyzeFrame = (now: number) => {
-      if (now - lastAnalyzeTime > 200) { 
-        lastAnalyzeTime = now;
-        if (cameraVideoRef.current && cameraVideoRef.current.readyState >= 2) {
-          try {
-            if (ctx) {
-              ctx.drawImage(cameraVideoRef.current, 0, 0, 12, 12);
-              const imgData = ctx.getImageData(0, 0, 12, 12);
-              const data = imgData.data;
-              let totalBrightness = 0;
-              let rSum = 0, gSum = 0, bSum = 0;
-              
-              for (let i = 0; i < data.length; i += 4) {
-                const r = data[i];
-                const g = data[i+1];
-                const b = data[i+2];
-                // Perceived luminance coefficients
-                totalBrightness += (0.299 * r + 0.587 * g + 0.114 * b);
-                rSum += r;
-                gSum += g;
-                bSum += b;
-              }
-              const avgBrightness = Math.round((totalBrightness / (12 * 12)) / 2.55); // scale 0 to 100
-              setLiveSceneBrightness(Math.max(5, Math.min(100, avgBrightness)));
-              liveSceneBrightnessRef.current = Math.max(5, Math.min(100, avgBrightness));
-              
-              // Simple Color Temperature approximation
-              const count = 12 * 12;
-              const avgR = rSum / count;
-              const avgB = bSum / count;
-              if (avgR > 4) {
-                const tempRatio = avgB / avgR;
-                const kelvin = Math.round(5000 + (tempRatio - 1.0) * 3500);
-                const finalKelvin = Math.min(9500, Math.max(2800, kelvin));
-                setLiveSceneColorTemp(finalKelvin);
-                liveSceneColorTempRef.current = finalKelvin;
-              }
-
-              // Update realistic relative movement speed of camera (ideal speed: 0.08 - 0.16)
-              const baseSpeed = isRecordingCamera && !isRecordingPaused ? 0.12 : 0.06;
-              const speedNoise = Math.sin(now / 350) * 0.04 + (Math.random() * 0.02 - 0.01);
-              const finalSpeed = Math.max(0.01, baseSpeed + speedNoise);
-              setLiveMotionSpeed(Number(finalSpeed.toFixed(2)));
-            }
-          } catch (e) {
-            // cross-origin security or rendering gap fallback
-          }
-        }
-      }
-      animFrame = requestAnimationFrame(analyzeFrame);
-    };
-    animFrame = requestAnimationFrame(analyzeFrame);
-    return () => {
-      cancelAnimationFrame(animFrame);
-    };
-  }, [isCameraActive]);
-
-  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
-  const cameraStreamRef = useRef<MediaStream | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const cameraChunksRef = useRef<Blob[]>([]);
-  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
-
-  useEffect(() => {
-    let interval: NodeJS.Timeout | null = null;
-    let tickCount = 0;
-    if (isCameraActive) {
-      interval = setInterval(() => {
-        tickCount++;
-        
-        // Dynamic prompt builder logic that is slow, clear, most precise, and smartest
-        const currentBrightness = liveSceneBrightnessRef.current;
-        const currentColorTemp = liveSceneColorTempRef.current;
-        
-        // Randomly simulate a temporary handshake score or look at state
-        const currentStabilizer = parseFloat((97.5 + Math.random() * 2.1).toFixed(1));
-        const currentDeviation = parseFloat((0.1 + Math.random() * 0.2).toFixed(2));
-        
-        setAiStabilizerScore(currentStabilizer);
-        setAiAngleDeviation(currentDeviation);
-        setAiAcousticLevel(Math.round(-55 + Math.random() * 20));
-
-        const isLowLight = currentBrightness < 45;
-        const isHighLight = currentBrightness > 85;
-        const isExtremelyWarm = currentColorTemp < 3000;
-        const isExtremelyCool = currentColorTemp > 8000;
-        const isUnstable = currentStabilizer < 98.0;
-
-        // Build customized priority cues first for "smartest & most precise" feedback!
-        const alertPrompts: string[] = [];
-        if (isUnstable) {
-          alertPrompts.push("⚠️ CHỐNG RUNG CẢNH BÁO: Tỳ sườn khuỷu tay chắc chắn hơn, hít thở nhẹ để giảm dao động tay!");
-        }
-        if (isLowLight) {
-          alertPrompts.push(`⚠️ CẢNH BÁO THIẾU SÁNG: Cường độ ${Math.round(currentBrightness * 3.4)} lx quá tối! Đẩy đèn hoặc mở màn che.`);
-        } else if (isHighLight) {
-          alertPrompts.push(`⚠️ CẢNH BÁO CHÓI MÀU: Cường độ ${Math.round(currentBrightness * 3.4)} lx quá lớn! Sử dụng sườn tản sáng.`);
-        }
-        if (isSmartAwbEnabled) {
-          if (isExtremelyWarm) {
-            alertPrompts.push(`⚖️ NHIỆT ĐỘ CÀI QUÁ ẤM (${currentColorTemp}K): Hãy đưa nguồn sáng trắng vào hoặc tăng đèn b-roll.`);
-          } else if (isExtremelyCool) {
-            alertPrompts.push(`⚖️ NHIỆT ĐỘ CÀI QUÁ LẠNH (${currentColorTemp}K): Cần bù trừ ánh sáng ấm để trung hòa sắc tố da.`);
-          }
-        }
-
-        // Standard cinematic steps guidelines - Translated to Vietnamese, professional and slow
-        const stepPrompts_0 = [
-          "📐 DI CHUYỂN: Đẩy camera tiến từ từ lại gần mặt hộp (Dolly In) ở tốc độ gót chân siêu chậm < 0.1m/s.",
-          "👉 THAO TÁC: Đặt hộp nguyên seal nằm ngay ngắn tâm dải lưới. Dọn dẹp tay áo gọn gàng tránh lấn át.",
-          "🎯 TRỌNG TÂM: Khóa cứng điểm lấy nét AI vào tem nhãn chính dải 1/3 để tạo chiều sâu hút mắt.",
-          "💡 MẸO: Tránh dựng đứng camera quá gắt, hơi nghiêng tự nhiên 75 độ để bắt trọn ánh sáng nền b-roll."
-        ];
-        
-        const stepPrompts_1 = [
-          "📐 DI CHUYỂN: Lia đứng ống kính (Tilt Down) cực kỳ từ tốn, giữ chắc sườn dọc không vẹo trục đứng.",
-          "👉 THAO TÁC: Tay trái cầm vặn khẽ góc sản phẩm 15 độ để phản quang kim loại lấp lánh phản chiếu.",
-          "🎯 TRỌNG TÂM: Đưa camera cực sát (10 - 20cm) tập trung bắt trọn từng sớ nhám cơ khí sắc nét nhất.",
-          "💡 MẸO: Đứng tấn rộng hai chân, di chuyển máy bằng cách đưa cả cơ mông vai thay vì chỉ dùng cổ tay."
-        ];
-        
-        const stepPrompts_2 = [
-          "📐 DI CHUYỂN: Trượt ngang camera (Truck Right) song song, đều tốc < 0.08m/s để lột tả tính năng chân thực.",
-          "👉 THAO TÁC: Dùng một ngón tay gõ nhẹ/kích hoạt tính năng hoặc thao tác ổ cắm để ghi trọn âm thanh chân thật.",
-          "🎯 TRỌNG TÂM: Giữ nguyên khoảng cách sườn ngang, không để sườn máy tiến tới lùi lui gây mất khẩu độ nét.",
-          "💡 MẸO: Hãy cắm sạc hoặc bật đèn sản phẩm lấp lánh trước 1 giây để tăng cảm xúc cho phân cảnh b-roll."
-        ];
-        
-        const stepPrompts_3 = [
-          "📐 DI CHUYỂN: Di dời máy hình bán nguyệt (Orbit Glide) bo tròn ôm quanh sản phẩm lấy tâm trục chính.",
-          "👉 THAO TÁC: Để vật thể kiêu hãnh tâm nền. Kết hợp nghiêng góc bối cảnh 15 độ nâng tầm chiều sâu 3D.",
-          "🎯 TRỌNG TÂM: Khóa cứng tâm vòng tròn vào logo thương hiệu chính diện, duy trì tốc độ vòng cung ổn định nhất.",
-          "💡 MẸO: Nên kết thúc bằng 2 giây cuối cùng giữ trạng thái đứng tĩnh hoàn toàn để ghép cảnh mượt mà."
-        ];
-
-        const stepsMap = [stepPrompts_0, stepPrompts_1, stepPrompts_2, stepPrompts_3];
-        const currentStepPrompts = stepsMap[cameraShootStep] || ["AI CAMERA ĐANG HOẠT ĐỘNG CHUẨN XÁC"];
-
-        // Show warnings first, otherwise slide through helpful prompts in a slow and logical sequence
-        let selectedPrompt = "";
-        if (alertPrompts.length > 0 && tickCount % 2 === 0) {
-          selectedPrompt = alertPrompts[Math.floor(tickCount / 2) % alertPrompts.length];
-        } else {
-          selectedPrompt = currentStepPrompts[tickCount % currentStepPrompts.length];
-        }
-
-        setAiLivePrompt(selectedPrompt);
-
-        // Define dynamic object labeling with user-provided product integration
-        const cleanProdName = productName ? productName.toUpperCase().replace(/[^A-Z0-9]/g, '_').substring(0, 16) : 'PRODUCT';
-        const objectLabels = [
-          [`${cleanProdName}_BOX_COVER`, "SECTOR_PRIMARY_SEAL", "PACKAGING_EDGE"],
-          [`${cleanProdName}_CHASSIS_DETAIL`, "METAL_DIAL_MACRO", "BEAUTY_CURVE"],
-          [`${cleanProdName}_CONTROL_PANEL`, "LED_STATUS_PORT", "DIFFERENTIATOR"],
-          [`${cleanProdName}_GEOMETRY_HERO`, "ANGLE_FULL_SPATIAL", "BEAUTY_GRID"]
-        ];
-        const labelPool = objectLabels[cameraShootStep] || ["PRODUCT_HERO"];
-        setAiDetectedLabel(labelPool[tickCount % labelPool.length]);
-
-        setCyberCoords(prev => {
-          const dx = (Math.random() - 0.5) * 12;
-          const dy = (Math.random() - 0.5) * 12;
-          const dConf = (Math.random() - 0.5) * 0.4;
-          
-          let targetCoords = [
-            { x: 140, y: 150 }, // Step 0 target
-            { x: 120, y: 220 }, // Step 1 target
-            { x: 160, y: 130 }, // Step 2 target
-            { x: 130, y: 180 }, // Step 3 target
-          ];
-
-          if (aiTargetType === 'logo') {
-            targetCoords = [{ x: 150, y: 190 }, { x: 152, y: 188 }, { x: 148, y: 192 }, { x: 150, y: 190 }];
-          } else if (aiTargetType === 'box') {
-            targetCoords = [{ x: 135, y: 135 }, { x: 135, y: 135 }, { x: 135, y: 135 }, { x: 135, y: 135 }];
-          } else if (aiTargetType === 'macro') {
-            targetCoords = [{ x: 180, y: 240 }, { x: 180, y: 245 }, { x: 175, y: 235 }, { x: 180, y: 240 }];
-          }
-
-          const ideal = targetCoords[cameraShootStep] || { x: 140, y: 180 };
-          const nextX = Math.round(ideal.x + dx);
-          const nextY = Math.round(ideal.y + dy);
-          const nextConf = Math.min(99.8, Math.max(97.2, prev.confidence + dConf));
-          
-          return {
-            x: nextX,
-            y: nextY,
-            confidence: nextConf,
-            zoom: Math.max(1.0, Math.min(1.5, prev.zoom + (Math.random() - 0.5) * 0.05))
-          };
-        });
-      }, 2500); // 2.5s interval is slow, clear, perfectly readable and professional
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [isCameraActive, cameraShootStep, aiTargetType, productName]);
-
   // Monitor segment cuts to play transition effects in real-time preview player
   const lastSubtitleIdRef = useRef<number | null>(null);
   const transitionTimerRef = useRef<any>(null);
@@ -1560,371 +1766,6 @@ export default function App() {
       textarea.scrollTop = targetScrollTop;
     }
   }, [currentAudioTime, isAutoScrollEnabled, isPlaying, audioDuration]);
-  
-  // Tự động hồi sinh/phát live stream vào thẻ video khi thẻ này xuất hiện trong DOM (khắc phục lỗi giao diện trì hoãn làm đen màn hình)
-  useEffect(() => {
-    let active = true;
-    const attachVideoObject = async () => {
-      if (active && cameraVideoRef.current && isCameraActive && cameraStreamRef.current) {
-        try {
-          // BẢO VỆ CHỐNG RUNG CHỚP CHỚP: Chỉ gán khi srcObject thực sự khác biệt
-          if (cameraVideoRef.current.srcObject !== cameraStreamRef.current) {
-            cameraVideoRef.current.srcObject = cameraStreamRef.current;
-          }
-          // Chỉ phát trực tiếp nếu thẻ video đang dừng phát
-          if (cameraVideoRef.current.paused) {
-            await cameraVideoRef.current.play();
-            console.log("Phát camera thành công trên giao diện và tránh chớp mành!");
-          }
-        } catch (playErr) {
-          console.warn("Tự động phát camera gặp lỗi hoặc bị trì hoãn:", playErr);
-        }
-      }
-    };
-
-    // Chạy ngắt quãng ngắn để đảm bảo thẻ video đã được gắn hoàn toàn vào DOM
-    const timer = setTimeout(attachVideoObject, 50);
-
-    return () => {
-      active = false;
-      clearTimeout(timer);
-    };
-  }, [isCameraActive, cameraStream]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (cameraStreamRef.current) {
-        cameraStreamRef.current.getTracks().forEach(track => track.stop());
-      }
-      if (recordingTimerRef.current) {
-        clearInterval(recordingTimerRef.current);
-      }
-    };
-  }, []);
-
-  const handleCamViewportClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!isCameraActive || recordedVideoPreviewUrl) return;
-    
-    // Calculate click coordinates relative to the viewport bounding box
-    const rect = e.currentTarget.getBoundingClientRect();
-    const xPercent = ((e.clientX - rect.left) / rect.width) * 100;
-    const yPercent = ((e.clientY - rect.top) / rect.height) * 105; // adjustment for safe scale
-    
-    // Map percentages to cyber coordinates model scale
-    const nextX = Math.round((xPercent / 100) * 280);
-    const nextY = Math.round((yPercent / 100) * 360);
-    
-    setCyberCoords({
-      x: nextX,
-      y: nextY,
-      confidence: 99.9,
-      zoom: 1.25 // temporal target magnification
-    });
-
-    // Smart electronic focus chime feedback (using Web Audio API for 100% reliability)
-    if ('AudioContext' in window || '(window as any).webkitAudioContext' in window) {
-      try {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-        const ctx = new AudioContextClass();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        
-        osc.type = 'sine';
-        // Double pulse chirp
-        osc.frequency.setValueAtTime(800, ctx.currentTime);
-        osc.frequency.setValueAtTime(1600, ctx.currentTime + 0.07);
-        
-        gain.gain.setValueAtTime(0.06, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22);
-        
-        osc.start();
-        osc.stop(ctx.currentTime + 0.22);
-      } catch (audioErr) {}
-    }
-  };
-
-  const handleCamViewportMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!isCameraActive || recordedVideoPreviewUrl || isTargetFocusLocked) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    
-    // Map client coordinates to a proportional 300x300 overlay grid space (safe zone 30 - 250)
-    const normalizedX = Math.round(30 + ((e.clientX - rect.left) / rect.width) * 220);
-    const normalizedY = Math.round(50 + ((e.clientY - rect.top) / rect.height) * 200);
-    
-    setCyberCoords(prev => {
-      const dConf = (Math.random() - 0.5) * 0.3;
-      const nextConf = Math.min(99.8, Math.max(96.8, prev.confidence + dConf));
-      return {
-        x: normalizedX,
-        y: normalizedY,
-        confidence: nextConf,
-        zoom: Math.max(1.0, Math.min(1.4, prev.zoom + (Math.random() - 0.5) * 0.02))
-      };
-    });
-  };
-
-  const handleToggleTargetFocusLock = () => {
-    const nextLocked = !isTargetFocusLocked;
-    setIsTargetFocusLocked(nextLocked);
-    
-    // Play real-time target locking synthesizer chirp
-    if ('AudioContext' in window || '(window as any).webkitAudioContext' in window) {
-      try {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-        const ctx = new AudioContextClass();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        
-        osc.type = 'sine';
-        if (nextLocked) {
-          // Double futuristic high-pitch success chirp
-          osc.frequency.setValueAtTime(800, ctx.currentTime);
-          osc.frequency.setValueAtTime(1500, ctx.currentTime + 0.08);
-          gain.gain.setValueAtTime(0.08, ctx.currentTime);
-          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.28);
-          osc.start();
-          osc.stop(ctx.currentTime + 0.28);
-        } else {
-          // Release unlock scan chirps downward
-          osc.frequency.setValueAtTime(1000, ctx.currentTime);
-          osc.frequency.setValueAtTime(500, ctx.currentTime + 0.08);
-          gain.gain.setValueAtTime(0.06, ctx.currentTime);
-          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22);
-          osc.start();
-          osc.stop(ctx.currentTime + 0.22);
-        }
-      } catch (audioErr) {}
-    }
-  };
-
-  // Live Camera Activation Handler - DANH SÁCH CẤU HÌNH CASCADE CHUẨN QUỐC TẾ KHÔNG THỂ LỖI
-  const startCameraStream = async () => {
-    try {
-      setCameraError(null);
-      if (cameraStreamRef.current) {
-        cameraStreamRef.current.getTracks().forEach(track => track.stop());
-      }
-      
-      let stream: MediaStream | null = null;
-      
-      const configurations = [
-        // 1. Dọc 9:16 tối ưu cho TikTok/Reels/Shorts, camera sau chuyên nghiệp, có microphone
-        {
-          video: {
-            width: { ideal: 720 },
-            height: { ideal: 1280 },
-            aspectRatio: { ideal: 0.5625 },
-            facingMode: 'environment'
-          },
-          audio: true
-        },
-        // 2. Ngang 16:9 chất lượng cao, camera sau chuyên nghiệp, có microphone
-        {
-          video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            facingMode: 'environment'
-          },
-          audio: true
-        },
-        // 3. Sử dụng camera bất kỳ (máy tính/điện thoại trước), có microphone
-        {
-          video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 }
-          },
-          audio: true
-        },
-        // 4. Fallback không có audio (trong trường hợp microphone bị từ chối hoặc đang bận do ứng dụng khác)
-        {
-          video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            facingMode: 'environment'
-          },
-          audio: false
-        },
-        // 5. Cấu hình tối giản nhất, không bận tâm camera trước/sau hay audio để phục hồi hình ảnh tối đa
-        {
-          video: true,
-          audio: false
-        }
-      ];
-
-      let lastError: any = null;
-      for (let i = 0; i < configurations.length; i++) {
-        try {
-          console.log(`Đang khởi tạo camera cấp độ ${i + 1}/${configurations.length}...`);
-          stream = await navigator.mediaDevices.getUserMedia(configurations[i]);
-          if (stream) {
-            console.log(`Kết nối camera thành công tại cấp độ ${i + 1}!`);
-            break;
-          }
-        } catch (err) {
-          lastError = err;
-          console.warn(`Camera cấp độ ${i + 1} không khả dụng, thử cấp độ tiếp theo...`, err);
-        }
-      }
-
-      if (!stream) {
-        throw lastError || new Error("Không thể truy cập bất kỳ ống kính camera nào trên thiết bị này.");
-      }
-      
-      cameraStreamRef.current = stream;
-      setCameraStream(stream);
-      setIsCameraActive(true);
-      
-      // Cố gắng liên kết ngay lập tức nếu ref đã sẵn sàng
-      if (cameraVideoRef.current) {
-        if (cameraVideoRef.current.srcObject !== stream) {
-          cameraVideoRef.current.srcObject = stream;
-        }
-        if (cameraVideoRef.current.paused) {
-          cameraVideoRef.current.play().catch(e => console.log('Chạy camera trực tiếp khi kích hoạt gặp lỗi nhẹ:', e));
-        }
-      }
-    } catch (err: any) {
-      console.error('Lỗi nghiêm trọng khi khởi tạo camera:', err);
-      setCameraError('Không thể mở Camera thực tế hoặc quyền bị chặn. Vui lòng cấp quyền camera & micro trong cài đặt trình duyệt của bạn và thử lại.');
-    }
-  };
-
-  // Close Camera
-  const stopCameraStream = () => {
-    if (cameraStreamRef.current) {
-      cameraStreamRef.current.getTracks().forEach(track => track.stop());
-      cameraStreamRef.current = null;
-    }
-    setCameraStream(null);
-    if (cameraVideoRef.current) {
-      cameraVideoRef.current.srcObject = null;
-    }
-    setIsCameraActive(false);
-    setIsRecordingCamera(false);
-    setIsRecordingPaused(false);
-    setCameraNotice(null);
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch (e) {}
-    }
-    if (recordingTimerRef.current) {
-      clearInterval(recordingTimerRef.current);
-      recordingTimerRef.current = null;
-    }
-    setRecordingSeconds(0);
-    
-    // Reset video preview state
-    if (recordedVideoPreviewUrl) {
-      URL.revokeObjectURL(recordedVideoPreviewUrl);
-      setRecordedVideoPreviewUrl(null);
-    }
-    setPendingRecordedFile(null);
-  };
-
-  // Pause Ghi hình (Tạm dừng thông minh)
-  const pauseRecordingCamera = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      mediaRecorderRef.current.pause();
-      setIsRecordingPaused(true);
-      setCameraNotice('⏸️ Đã tự động tạm dừng! Hãy chuyển góc máy / phân cảnh tiếp theo rồi nhấn "Tiếp tục quay" 🔴');
-    }
-  };
-
-  // Resume Ghi hình (Tiếp tục thông minh)
-  const resumeRecordingCamera = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'paused') {
-      mediaRecorderRef.current.resume();
-      setIsRecordingPaused(false);
-      setCameraNotice(null);
-    }
-  };
-
-  // Start Ghi Hình B-Roll
-  const startRecordingCamera = () => {
-    if (!cameraStreamRef.current) return;
-    
-    cameraChunksRef.current = [];
-    setIsRecordingPaused(false);
-    setCameraNotice(null);
-    try {
-      let options = { mimeType: 'video/webm;codecs=vp9,opus' };
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: 'video/webm;codecs=vp8,opus' };
-      }
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: 'video/webm' };
-      }
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: 'video/mp4' };
-      }
-      
-      const recorder = new MediaRecorder(cameraStreamRef.current, options);
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          cameraChunksRef.current.push(e.data);
-        }
-      };
-      
-      recorder.onstop = () => {
-        const completedBlob = new Blob(cameraChunksRef.current, { type: 'video/webm' });
-        const recordedFile = new File(
-          [completedBlob], 
-          `broll-recorded-${Date.now()}.webm`, 
-          { type: 'video/webm' }
-        );
-        
-        // Ngắt kết nối camera live stream để bảo toàn pin & thiết bị phát
-        if (cameraStreamRef.current) {
-          cameraStreamRef.current.getTracks().forEach(track => track.stop());
-          cameraStreamRef.current = null;
-        }
-        setCameraStream(null);
-        
-        // Tạo URL xem lại cục bộ
-        const url = URL.createObjectURL(completedBlob);
-        setRecordedVideoPreviewUrl(url);
-        setPendingRecordedFile(recordedFile);
-      };
-      
-      mediaRecorderRef.current = recorder;
-      recorder.start(1000);
-      setIsRecordingCamera(true);
-      setRecordingSeconds(0);
-      
-      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
-      recordingTimerRef.current = setInterval(() => {
-        // Chỉ tăng giây khi đang tích cực Ghi (Không bị tạm dừng)
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-          setRecordingSeconds(prev => prev + 1);
-        }
-      }, 1000);
-      
-    } catch (e: any) {
-      console.error('Failed to initialize media recorder', e);
-      setCameraError('Trình ghi hình cục bộ không tương thích, vui lòng thử lại trên trình duyệt khác.');
-    }
-  };
-
-  // Stop Ghi Hình B-Roll
-  const stopRecordingCamera = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-    setIsRecordingCamera(false);
-    setIsRecordingPaused(false);
-    setCameraNotice(null);
-    if (recordingTimerRef.current) {
-      clearInterval(recordingTimerRef.current);
-      recordingTimerRef.current = null;
-    }
-  };
-  // --- END OF DETAILED PRODUCT REVIEW STUDIO CAMERA SERVICES ---
 
   // Merge & export video states
   const [isMerging, setIsMerging] = useState<boolean>(false);
@@ -2823,8 +2664,26 @@ export default function App() {
       setResultSubTab('review');
       setActiveMobileTab('results');
     } catch (err: any) {
-      console.error(err);
-      setApiError(err.message || 'Hệ thống AI đang quá tải. Vui lòng kiểm tra lại thiết lập khóa GEMINI_API_KEY hoặc thử lại sau vài giây.');
+      console.error("Lỗi gọi API phân tích video:", err);
+      // Auto-fallback so the user on Cloudflare Workers / external deploy is NEVER blocked
+      const fallbackData = getFallbackReviewReport(productName, productDesc);
+      const generatedId = `custom_${Date.now()}`;
+      const fallbackReport: ReviewReport = {
+        ...fallbackData,
+        id: generatedId,
+        videoMimeType: uploadedMimeType,
+        videoSize: uploadedFileSize,
+      };
+      setActiveReview(fallbackReport);
+      setResultSubTab('review');
+      setActiveMobileTab('results');
+
+      const isCloudflare = window.location.hostname.includes('workers.dev') || window.location.hostname.includes('pages.dev');
+      if (isCloudflare) {
+        setApiError(`💡 Hướng dẫn Cloudflare Deploy: Máy chủ ${window.location.hostname} chưa cấu hình biến môi trường GEMINI_API_KEY trong Cloudflare Dashboard (Settings > Variables and Secrets). Hệ thống đã tự động tạo Review & Kịch bản thông minh để bạn tiếp tục chỉnh sửa & xuất video bình thường!`);
+      } else {
+        setApiError(err.message ? `${err.message} (Hệ thống đã tự động chuyển sang chế độ tạo kịch bản thông minh cục bộ)` : 'Hệ thống đã tự động chuyển sang chế độ tạo kịch bản thông minh.');
+      }
     } finally {
       setIsAnalyzing(false);
       setExtractionProgress(null);
@@ -2981,7 +2840,7 @@ export default function App() {
 
     // Dynamic Client-side Caching: instantly serve matching voice script configurations from Google AI Studio
     const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
-    const cacheKey = `v16_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
+    const cacheKey = `v18_permanent_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
     const cached = ttsClientCache.current[cacheKey];
     if (cached && cached.audioBase64) {
       console.info("[CLIENT-CACHE-HIT] Khởi chạy tức thì từ bộ nhớ đệm kịch bản Google AI Studio:", cacheKey);
@@ -3074,10 +2933,17 @@ export default function App() {
         }
       }
 
-      setApiError("Không thể tạo giọng đọc lúc này. Vui lòng thử lại.");
+      // Fallback if backend TTS is unavailable (e.g. on Cloudflare Workers without GEMINI_API_KEY)
+      const estimatedSec = Math.max(5, Math.ceil(textToSynthesize.split(/\s+/).length * 0.35));
+      const silentUrl = generateSilentWav(estimatedSec);
+      setAudioUrl(silentUrl);
+      setApiError("Lưu ý: Chưa thể tải giọng đọc AI trực tiếp từ máy chủ (do Cloudflare chưa cấu hình GEMINI_API_KEY). Hệ thống đã tạo mốc thời gian âm thanh dự phòng để đồng bộ video & phụ đề.");
     } catch (err: any) {
       console.error("Lỗi kết nối máy chủ lồng tiếng:", err);
-      setApiError("Sự cố kết nối khi khởi tạo giọng lồng tiếng.");
+      const estimatedSec = Math.max(5, Math.ceil(textToSynthesize.split(/\s+/).length * 0.35));
+      const silentUrl = generateSilentWav(estimatedSec);
+      setAudioUrl(silentUrl);
+      setApiError("Đã tạo đường dẫn âm thanh đồng bộ dự phòng cho video.");
     } finally {
       setIsGeneratingTTS(false);
     }
@@ -3243,7 +3109,7 @@ export default function App() {
       let currentAudioUrl = audioUrl;
       const textToSynthesize = (editedScript || activeReview?.marketingScript || "").trim();
       const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
-      const cacheKey = `v16_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
+      const cacheKey = `v18_permanent_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
       const cached = ttsClientCache.current[cacheKey];
       
       const needsRealTTS = !currentAudioUrl || currentAudioUrl.includes('silent_wav');
@@ -3423,9 +3289,11 @@ export default function App() {
       let canvasWidth = sourceVideoEl.videoWidth || 720;
       let canvasHeight = sourceVideoEl.videoHeight || 1280;
       
-      // High-end video optimization: preserve absolute original resolution of up to 1080p (1920px max dimension)
-      // to guarantee pixel-for-pixel perfect visual quality while keeping performance perfectly fluid and stutter-free.
-      const maxResolution = 1920;
+      // High-end video optimization: dynamic resolution based on exportResolution state
+      let maxResolution = 1920;
+      if (exportResolution === '4k') maxResolution = 3840;
+      else if (exportResolution === '720p') maxResolution = 1280;
+
       if (canvasWidth > maxResolution || canvasHeight > maxResolution) {
         const ratio = Math.min(maxResolution / canvasWidth, maxResolution / canvasHeight);
         canvasWidth = Math.round(canvasWidth * ratio);
@@ -3806,7 +3674,7 @@ export default function App() {
             if (hookBannerStyle === 'cyberpunk-neon') {
               ctx.font = `900 ${hookFontSize}px "JetBrains Mono", "Courier New", monospace`;
             } else {
-              ctx.font = `950 ${hookFontSize}px "Space Grotesk", "Inter", sans-serif`;
+              ctx.font = `900 ${hookFontSize}px "Be Vietnam Pro", "Montserrat", "Plus Jakarta Sans", sans-serif`;
             }
 
             ctx.textAlign = 'center';
@@ -3953,7 +3821,7 @@ export default function App() {
             if (badgeText) {
               ctx.save();
               const badgeFontSize = Math.round(hookFontSize * 0.58);
-              ctx.font = `950 ${badgeFontSize}px "Space Grotesk", "Inter", sans-serif`;
+              ctx.font = `900 ${badgeFontSize}px "Be Vietnam Pro", "Montserrat", sans-serif`;
               const badgeWidth = ctx.measureText(badgeText).width + badgeFontSize * 2;
               const badgeHeight = Math.round(badgeFontSize * 1.6);
 
@@ -4013,25 +3881,27 @@ export default function App() {
               
               // Scale typography with video resolution smoothly
               const baseFontSize = Math.round(canvasWidth * 0.054);
+              const activeFontObj = SUBTITLE_FONTS.find(f => f.id === subtitleFontFamily) || SUBTITLE_FONTS[0];
               
               if (subtitleStyle === 'tiktok') {
-                ctx.font = `900 ${baseFontSize}px "Space Grotesk", "Inter", "Arial Black", sans-serif`;
+                ctx.font = `900 ${baseFontSize}px ${activeFontObj.canvasFont}`;
               } else if (subtitleStyle === 'capcut') {
-                ctx.font = `900 ${baseFontSize - 1}px "Space Grotesk", "Inter", sans-serif`;
+                ctx.font = `900 ${baseFontSize - 1}px ${activeFontObj.canvasFont}`;
               } else if (subtitleStyle === 'cyberpunk') {
                 ctx.font = `900 ${baseFontSize - 2}px "JetBrains Mono", "Courier New", monospace`;
               } else if (subtitleStyle === 'neon') {
-                ctx.font = `900 ${baseFontSize}px "Space Grotesk", "Inter", sans-serif`;
+                ctx.font = `900 ${baseFontSize}px ${activeFontObj.canvasFont}`;
               } else {
-                ctx.font = `700 ${baseFontSize - 1}px "Inter", sans-serif`;
+                ctx.font = `700 ${baseFontSize - 1}px ${activeFontObj.canvasFont}`;
               }
 
               const textY = Math.round(canvasHeight * 0.73); // Elevated lower-third zone for safe phone UI padding (TikTok/Reels)
               const maxWidth = Math.round(canvasWidth * 0.86);
               const lineHeight = Math.round(baseFontSize * 1.38);
 
-              // Subtitles multi-words wrapping logic
-              const words = currentSub.text.split(' ');
+              // Subtitles multi-words wrapping logic with proper case formatting
+              const formattedSubText = subtitleCase === 'uppercase' ? currentSub.text.toUpperCase() : currentSub.text;
+              const words = formattedSubText.split(' ');
               let line = '';
               const lines: string[] = [];
 
@@ -4220,7 +4090,7 @@ export default function App() {
                 ctx.save();
                 // Set font style for translation
                 const transFontSize = Math.round(baseFontSize * 0.78);
-                ctx.font = `500 ${transFontSize}px "Inter", sans-serif`;
+                ctx.font = `600 ${transFontSize}px "Be Vietnam Pro", "Plus Jakarta Sans", "Inter", sans-serif`;
                 if (subtitleStyle === 'cyberpunk') {
                   ctx.font = `600 ${transFontSize}px "JetBrains Mono", "Courier New", monospace`;
                 }
@@ -4344,7 +4214,7 @@ export default function App() {
 
       let videoStream: MediaStream;
       if ((canvas as any).captureStream) {
-        videoStream = (canvas as any).captureStream(30); // 30 FPS high definition stream
+        videoStream = (canvas as any).captureStream(exportFps || 60); // Ultra-smooth Studio FPS stream
       } else if (rawVideoStream) {
         videoStream = rawVideoStream;
       } else {
@@ -4472,16 +4342,18 @@ export default function App() {
       console.log(`MediaRecorder selected MIME type: ${selectedMimeType}`);
 
       // Calculate ultra-high movie-grade dynamic bitrates to matches original raw phone video files
-      // 720p: 8 Mbps, 1080p: 18 Mbps, 4K: 35 Mbps. This avoids any compression blockiness or detail loss!
+      // 720p: 8-15 Mbps, 1080p: 18-30 Mbps, 4K: 35-50 Mbps. This avoids any compression blockiness or detail loss!
       const totalPixels = canvasWidth * canvasHeight;
-      let targetBitrate = 18000000; // default 18 Mbps (perfect for vertical full HD)
+      let targetBitrate = 22000000;
       
+      const bitrateMultiplier = exportBitratePreset === 'master' ? 1.5 : (exportBitratePreset === 'standard' ? 0.7 : 1.0);
+
       if (totalPixels <= 1280 * 720) {
-        targetBitrate = 9000000; // 9 Mbps for crystal-clear HD
+        targetBitrate = Math.round(12000000 * bitrateMultiplier);
       } else if (totalPixels <= 1920 * 1080) {
-        targetBitrate = 22000000; // 22 Mbps for raw matching FHD video
+        targetBitrate = Math.round(25000000 * bitrateMultiplier);
       } else {
-        targetBitrate = 45000000; // 45 Mbps for pristine 4K video files
+        targetBitrate = Math.round(50000000 * bitrateMultiplier);
       }
 
       console.log(`Setting target export video dynamic bitrate: ${targetBitrate / 1000000} Mbps`);
@@ -4816,6 +4688,255 @@ export default function App() {
 
   const activeVoiceConfig = TTS_VOICES.find(v => v.id === selectedVoice) || TTS_VOICES[0];
 
+  // Parse structured Storyboard Scenes from the Detailed Review
+  const storyboardScenes = useMemo<StoryboardScene[]>(() => {
+    if (!activeReview?.detailedReview) return [];
+    const estDuration = audioDuration || (audioRef.current?.duration || videoRef.current?.duration || 20);
+    return parseStoryboardScenes(activeReview.detailedReview, estDuration);
+  }, [activeReview?.detailedReview, audioDuration]);
+
+  // Active Storyboard Scene being played currently
+  const activeStoryboardScene = useMemo(() => {
+    if (!storyboardScenes.length) return null;
+    return storyboardScenes.find(s => currentAudioTime >= s.startSec && currentAudioTime <= s.endSec) || storyboardScenes[0];
+  }, [storyboardScenes, currentAudioTime]);
+
+  // Unified Seek & Instant Synchronized Playback Function
+  const jumpToTimestamp = (targetSeconds: number) => {
+    const safeTarget = Math.max(0, Number(targetSeconds.toFixed(2)));
+    if (audioRef.current && isFinite(audioRef.current.duration) && audioRef.current.duration > 0) {
+      audioRef.current.currentTime = Math.min(safeTarget, audioRef.current.duration);
+    }
+    if (videoRef.current && isFinite(videoRef.current.duration) && videoRef.current.duration > 0) {
+      videoRef.current.currentTime = Math.min(safeTarget, videoRef.current.duration);
+    }
+    setCurrentAudioTime(safeTarget);
+
+    if (audioRef.current && (audioRef.current.paused || !isPlaying)) {
+      audioRef.current.play().then(() => {
+        setIsPlaying(true);
+        if (isSyncPlay && videoRef.current) {
+          videoRef.current.play().catch(e => console.log(e));
+        }
+      }).catch(e => console.log(e));
+    }
+    playSynthesizedSFX('pop', 0.4);
+  };
+
+  // Re-align and synchronize subtitle segments 100% with audio duration
+  const handleAutoAlignSubtitles = () => {
+    const actualDuration = (audioRef.current && audioRef.current.duration > 0 && isFinite(audioRef.current.duration))
+      ? audioRef.current.duration
+      : (audioDuration || videoRef.current?.duration || 18);
+
+    const fresh = getSegmentsFromScript(activeScriptText, actualDuration);
+    const mapped = fresh.map(seg => ({
+      ...seg,
+      translation: cleanSubtitleTranslation(subtitleTranslations[seg.text] || "")
+    }));
+    setCustomSubtitleSegments(mapped);
+    playSynthesizedSFX('chime', 0.6);
+  };
+
+  // Inline Quick Edit for a Subtitle Segment
+  const handleSaveInlineSubtitleEdit = (index: number, newText: string) => {
+    const updated = [...subtitleSegments];
+    if (updated[index]) {
+      updated[index] = {
+        ...updated[index],
+        text: newText.trim()
+      };
+      setCustomSubtitleSegments(updated);
+      setEditingSegmentIdx(null);
+      playSynthesizedSFX('pop', 0.5);
+    }
+  };
+
+  // Copy All Timed Subtitles to Clipboard
+  const handleCopyTimedSubtitles = () => {
+    const segments = customSubtitleSegments || subtitleSegments;
+    const formatted = formatTimedSubtitlesClipboard(segments);
+    navigator.clipboard.writeText(formatted);
+    setCopiedTimedSubtitles(true);
+    playSynthesizedSFX('pop', 0.6);
+    setTimeout(() => setCopiedTimedSubtitles(false), 2000);
+  };
+
+  // Download Subtitles in standard .SRT format
+  const downloadSRTFile = () => {
+    const segments = customSubtitleSegments || subtitleSegments;
+    if (!segments || segments.length === 0) {
+      setApiError("Chưa có phụ đề để xuất file SRT!");
+      return;
+    }
+    const srtText = exportToSRT(segments);
+    const blob = new Blob([srtText], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(activeReview?.productName || "review_subtitles").toLowerCase().replace(/[^a-zA-Z0-9]/g, '_')}.srt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    playSynthesizedSFX('pop', 0.7);
+  };
+
+  // Download Subtitles in WebVTT format
+  const downloadVTTFile = () => {
+    const segments = customSubtitleSegments || subtitleSegments;
+    if (!segments || segments.length === 0) {
+      setApiError("Chưa có phụ đề để xuất file VTT!");
+      return;
+    }
+    const vttText = exportToVTT(segments);
+    const blob = new Blob([vttText], { type: 'text/vtt;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(activeReview?.productName || "review_subtitles").toLowerCase().replace(/[^a-zA-Z0-9]/g, '_')}.vtt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    playSynthesizedSFX('pop', 0.7);
+  };
+
+  // Download complete Creator Marketing Package (Markdown)
+  const downloadCreatorPackage = () => {
+    const prod = activeReview?.productName || productName || "Sản Phẩm Xu Hướng";
+    const cat = activeReview?.category || "Tiện ích thông minh";
+    const script = editedScript || activeReview?.marketingScript || "";
+    const pros = (activeReview?.pros || []).map(p => `- ${p}`).join('\n');
+    const cons = (activeReview?.cons || []).map(c => `- ${c}`).join('\n');
+    const usps = (activeReview?.uniqueSellingPoints || []).map(u => `⭐ ${u}`).join('\n');
+    
+    const content = `# 🎬 GÓI TÀI NGUYÊN SÁNG TẠO VIDEO REVIEW TRIỆU VIEWS
+## 📦 Sản phẩm: ${prod}
+- **Danh mục:** ${cat}
+- **Đánh giá AI:** ${activeReview?.rating || 4.9}/5.0
+- **Khách hàng mục tiêu:** ${activeReview?.targetedAudience || "Người dùng TikTok & Mua sắm thông minh"}
+
+---
+
+### 🔥 1. CÂU HOOK MỞ MÀN 3S ĐẦU
+> "${hookBannerText}"
+
+---
+
+### 🎙️ 2. KỊCH BẢN LỒNG TIẾNG HOÀN CHỈNH (MARKETING SCRIPT)
+\`\`\`
+${script}
+\`\`\`
+
+---
+
+### 💎 3. ĐIỂM NỔI BẬT & USP (UNIQUE SELLING POINTS)
+${usps || "- Tính năng vượt trội, trải nghiệm tiện lợi."}
+
+### ⚡ 4. ĐIỂM MẠNH (PROS)
+${pros || "- Hoàn thiện cao cấp, giá thành hợp lý."}
+
+### ⚠️ 5. ĐIỂM CẦN LƯU Ý (CONS)
+${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
+
+---
+
+### 🏷️ 6. HASHTAGS ĐỀ XUẤT TIKTOK FYP
+#${prod.toLowerCase().replace(/[^a-zA-Z0-9]/g, '')} #review #tiktokshop #sanphamhot #xuhuong #trend #giare #chatluong #fyp
+
+---
+*Xuất từ AI Product Review Studio Pro - Google AI Studio Engine*
+`;
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${prod.toLowerCase().replace(/[^a-zA-Z0-9]/g, '_')}_creator_kit.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+    playSynthesizedSFX('chime', 0.8);
+  };
+
+  // 1-Click Multi-Language Subtitle Neural Translation
+  const translateAllSubtitlesToLang = async (targetLang: string) => {
+    const segments = customSubtitleSegments || subtitleSegments;
+    if (!segments || segments.length === 0) {
+      setApiError("Hãy tạo kịch bản lồng tiếng trước khi dịch phụ đề!");
+      return;
+    }
+    setIsTranslatingSubtitles(true);
+    setTargetTranslateLang(targetLang);
+    playSynthesizedSFX('whoosh', 0.6);
+    try {
+      const textsToTranslate = segments.map(s => s.text);
+      const response = await fetch('/api/translate-subtitles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          texts: textsToTranslate,
+          targetLang
+        })
+      });
+      if (!response.ok) {
+        throw new Error("Không thể dịch phụ đề lúc này.");
+      }
+      const data = await response.json();
+      if (data && Array.isArray(data.translations)) {
+        const newTransMap: Record<string, string> = { ...subtitleTranslations };
+        segments.forEach((seg, idx) => {
+          if (data.translations[idx]) {
+            newTransMap[seg.text] = data.translations[idx];
+          }
+        });
+        setSubtitleTranslations(newTransMap);
+        setBilingualEnabled(true);
+        playSynthesizedSFX('chime', 0.9);
+      }
+    } catch (err: any) {
+      console.error("Lỗi dịch phụ đề:", err);
+      setApiError("Lỗi khi dịch phụ đề đa ngôn ngữ.");
+    } finally {
+      setIsTranslatingSubtitles(false);
+    }
+  };
+
+  // Keyboard Shortcuts Listener for Pro Power Users
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
+        return;
+      }
+      if (e.code === 'Space') {
+        e.preventDefault();
+        togglePlayState();
+      } else if (e.code === 'ArrowLeft') {
+        e.preventDefault();
+        if (videoRef.current) {
+          videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 2);
+        }
+        if (audioRef.current) {
+          audioRef.current.currentTime = Math.max(0, audioRef.current.currentTime - 2);
+        }
+      } else if (e.code === 'ArrowRight') {
+        e.preventDefault();
+        if (videoRef.current) {
+          videoRef.current.currentTime = videoRef.current.currentTime + 2;
+        }
+        if (audioRef.current) {
+          audioRef.current.currentTime = audioRef.current.currentTime + 2;
+        }
+      } else if (e.code === 'KeyM') {
+        setVideoOriginalMute(prev => !prev);
+      } else if (e.code === 'KeyS') {
+        setIsSFXModalOpen(true);
+      } else if (e.code === 'KeyH') {
+        setShowHookBanner(prev => !prev);
+      } else if (e.key === '?') {
+        setIsKeyboardHelpOpen(prev => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
   return (
     <div 
       id="ai_product_review_root" 
@@ -5020,6 +5141,139 @@ export default function App() {
         </div>
       </div>
 
+      {/* TOP STUDIO MASTER FORMULA PRESETS RIBBON - 1-Click Viral Presets & Pro Tools */}
+      <section className="w-full max-w-[1600px] mx-auto px-3 sm:px-6 lg:px-8 pt-4 pb-1 relative z-10">
+        <div className="bg-gradient-to-r from-stone-950 via-zinc-900 to-black border border-amber-500/25 rounded-2xl p-3 sm:p-4 shadow-xl flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 relative overflow-hidden backdrop-blur-md">
+          {/* Ambient glow accent */}
+          <div className="absolute -left-10 -top-10 w-36 h-36 bg-amber-500/10 rounded-full blur-3xl pointer-events-none"></div>
+          <div className="absolute right-0 bottom-0 w-44 h-44 bg-rose-500/5 rounded-full blur-3xl pointer-events-none"></div>
+
+          {/* Left Title & Status Indicator */}
+          <div className="flex items-center gap-3 relative z-10 shrink-0">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-500 via-amber-400 to-yellow-500 p-0.5 shadow-md shadow-amber-500/20 shrink-0 flex items-center justify-center">
+              <div className="w-full h-full bg-[#070707] rounded-[10px] flex items-center justify-center">
+                <Flame className="w-4 h-4 text-amber-400 animate-pulse" />
+              </div>
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs sm:text-sm font-display font-black uppercase text-amber-300 tracking-wider">
+                  Bộ Công Thức Triệu View 1-Chạm
+                </span>
+                <span className="px-1.5 py-0.5 rounded-full text-[8px] font-mono font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                  AI MASTER
+                </span>
+              </div>
+              <p className="text-[10px] text-slate-400 hidden sm:block">
+                Tự động tối ưu Hook 3s đầu, Phụ đề chuyển động & Âm thanh điện ảnh đỉnh cao
+              </p>
+            </div>
+          </div>
+
+          {/* Center 1-Click Viral Preset Buttons */}
+          <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto pb-1 md:pb-0 scrollbar-none relative z-10">
+            <button
+              type="button"
+              onClick={() => applyViralPreset('tiktok-viral')}
+              className={`px-3 py-1.5 rounded-xl text-[11px] font-bold whitespace-nowrap transition-all flex items-center gap-1.5 cursor-pointer border ${
+                activePresetKey === 'tiktok-viral'
+                  ? 'bg-[#ffe600] text-black border-black shadow-[0_0_12px_rgba(255,230,0,0.5)] font-black scale-105'
+                  : 'bg-black/60 text-slate-300 border-white/10 hover:border-amber-500/40 hover:text-amber-300'
+              }`}
+              title="TikTok Mega Viral: Hook vàng neon, phụ đề từng chữ, bass sống động"
+            >
+              <Zap className="w-3.5 h-3.5" />
+              <span>⚡ TikTok Mega Viral</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => applyViralPreset('luxury-aesthetic')}
+              className={`px-3 py-1.5 rounded-xl text-[11px] font-bold whitespace-nowrap transition-all flex items-center gap-1.5 cursor-pointer border ${
+                activePresetKey === 'luxury-aesthetic'
+                  ? 'bg-gradient-to-r from-amber-500 to-yellow-600 text-white border-amber-300 shadow-[0_0_12px_rgba(245,158,11,0.5)] font-black scale-105'
+                  : 'bg-black/60 text-slate-300 border-white/10 hover:border-amber-500/40 hover:text-amber-300'
+              }`}
+              title="Luxury Aesthetic: Tông màu Cinematic ấm, phụ đề CapCut Gold, âm thanh Reverb"
+            >
+              <Gem className="w-3.5 h-3.5" />
+              <span>💎 Luxury 4K</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => applyViralPreset('tech-unboxing')}
+              className={`px-3 py-1.5 rounded-xl text-[11px] font-bold whitespace-nowrap transition-all flex items-center gap-1.5 cursor-pointer border ${
+                activePresetKey === 'tech-unboxing'
+                  ? 'bg-[#ec4899] text-white border-[#22d3ee] shadow-[0_0_12px_rgba(236,72,153,0.5)] font-black scale-105'
+                  : 'bg-black/60 text-slate-300 border-white/10 hover:border-pink-500/40 hover:text-pink-300'
+              }`}
+              title="Tech Unboxing Pro: Phong cách Cyberpunk Neon, tông sắc nét, SFX Shutter"
+            >
+              <Cpu className="w-3.5 h-3.5" />
+              <span>📦 Tech Master</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => applyViralPreset('flash-sale')}
+              className={`px-3 py-1.5 rounded-xl text-[11px] font-bold whitespace-nowrap transition-all flex items-center gap-1.5 cursor-pointer border ${
+                activePresetKey === 'flash-sale'
+                  ? 'bg-[#fe2c55] text-white border-yellow-400 shadow-[0_0_12px_rgba(254,44,85,0.5)] font-black scale-105'
+                  : 'bg-black/60 text-slate-300 border-white/10 hover:border-rose-500/40 hover:text-rose-300'
+              }`}
+              title="Flash Sale Urgency: Hook đỏ rực giục giã, phụ đề viền nổi bật, chuông giỏ hàng"
+            >
+              <ShoppingBag className="w-3.5 h-3.5" />
+              <span>🛒 Flash Sale</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => applyViralPreset('organic-asmr')}
+              className={`px-3 py-1.5 rounded-xl text-[11px] font-bold whitespace-nowrap transition-all flex items-center gap-1.5 cursor-pointer border ${
+                activePresetKey === 'organic-asmr'
+                  ? 'bg-emerald-500 text-black border-black shadow-[0_0_12px_rgba(16,185,129,0.5)] font-black scale-105'
+                  : 'bg-black/60 text-slate-300 border-white/10 hover:border-emerald-500/40 hover:text-emerald-300'
+              }`}
+              title="Organic ASMR: Tối giản chân thực, giữ nguyên âm thanh sản phẩm gốc"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>🌿 Organic ASMR</span>
+            </button>
+          </div>
+
+          {/* Right Tools: Hotkeys & SFX Trigger */}
+          <div className="flex items-center gap-2 relative z-10 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                setIsSFXModalOpen(true);
+                playSynthesizedSFX('chime', 0.8);
+              }}
+              className="px-2.5 py-1.5 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm hover:scale-105"
+              title="Mở Bảng Âm Thanh Hiệu Ứng SFX Studio"
+            >
+              <Music className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Ma Trận SFX</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setIsKeyboardHelpOpen(true);
+                playSynthesizedSFX('pop', 0.6);
+              }}
+              className="px-2.5 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white border border-white/10 text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer"
+              title="Xem danh sách phím tắt chuyên nghiệp"
+            >
+              <Keyboard className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Phím tắt</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
       {/* CORE WORKSPACE - Split sidebar and master report */}
       <main id="main_workspace" className="flex-1 max-w-[1600px] w-full mx-auto grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6 lg:gap-8 p-3 sm:p-6 lg:p-8 min-h-0 relative z-10">
         
@@ -5096,1367 +5350,10 @@ export default function App() {
               )}
             </div>
 
-            {/* INPUT MEDIA TYPE SELECTOR TABS */}
-            <div className="space-y-2 mt-1.5">
-              <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">Thiết Bị Nguồn Quay Review</span>
-              <div className="grid grid-cols-2 gap-1 bg-black/60 p-1 rounded-xl border border-white/5">
-                <button
-                  type="button"
-                  onClick={stopCameraStream}
-                  className={`py-2 px-3 rounded-lg text-[10px] font-bold tracking-wider uppercase transition-all cursor-pointer text-center flex items-center justify-center gap-1.5 ${
-                    !isCameraActive 
-                      ? 'bg-amber-500/15 border border-amber-500/30 text-amber-400 font-extrabold shadow-[0_0_8px_rgba(245,158,11,0.06)]' 
-                      : 'text-slate-400 hover:text-slate-200 bg-transparent border border-transparent'
-                  }`}
-                >
-                  📥 Nhập Tệp Sẵn Có
-                </button>
-                <button
-                  type="button"
-                  onClick={startCameraStream}
-                  className={`py-2 px-3 rounded-lg text-[10px] font-bold tracking-wider uppercase transition-all cursor-pointer text-center flex items-center justify-center gap-1.5 ${
-                    isCameraActive 
-                      ? 'bg-amber-500/15 border border-amber-500/30 text-amber-400 font-extrabold shadow-[0_0_8px_rgba(245,158,11,0.06)]' 
-                      : 'text-slate-400 hover:text-slate-200 bg-transparent border border-transparent'
-                  }`}
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>
-                  🎥 Studio Live Camera
-                </button>
-              </div>
-            </div>
-
             {/* MAIN SOURCE MEDIA WORKSPACE */}
             <div className="space-y-1.5">
-              {isCameraActive ? (
-                /* LIVE CAMERA INTERACTIVE PREVIEW HUB */
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] text-slate-400 font-medium flex items-center gap-1">
-                      <Camera className="w-3 h-3 text-red-500 animate-pulse" />
-                      Màn hình kiểm âm & kiểm hình thực tế
-                    </span>
-                    <button
-                      type="button"
-                      onClick={stopCameraStream}
-                      className="text-[9px] uppercase tracking-wider font-bold text-slate-400 hover:text-rose-400 transition-colors cursor-pointer"
-                    >
-                      Đóng camera
-                    </button>
-                  </div>
-
-                  {/* SMART CAMERA PORTRAIT/LANDSCAPE ASPECT SELECTOR TAB */}
-                  <div className="flex items-center justify-between bg-black/40 p-2 rounded-xl border border-white/5 gap-2">
-                    <span className="text-[9px] text-slate-400 font-bold uppercase tracking-wider">Khung Hình Review</span>
-                    <div className="flex gap-1">
-                      <button
-                        type="button"
-                        onClick={() => setCameraAspect('9_16')}
-                        className={`px-2.5 py-1 rounded-lg text-[9px] font-bold uppercase tracking-wider transition-all cursor-pointer flex items-center gap-1 ${
-                          cameraAspect === '9_16'
-                            ? 'bg-amber-500 text-black font-extrabold shadow-[0_0_8px_rgba(245,158,11,0.3)]'
-                            : 'text-slate-400 hover:text-slate-200 bg-transparent'
-                        }`}
-                      >
-                        📱 Dọc 9:16 (TikTok)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setCameraAspect('16_9')}
-                        className={`px-2.5 py-1 rounded-lg text-[9px] font-bold uppercase tracking-wider transition-all cursor-pointer flex items-center gap-1 ${
-                          cameraAspect === '16_9'
-                            ? 'bg-amber-500 text-black font-extrabold shadow-[0_0_8px_rgba(245,158,11,0.3)]'
-                            : 'text-slate-400 hover:text-slate-200 bg-transparent'
-                        }`}
-                      >
-                        📺 Ngang 16:9 (Youtube)
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* HIGH-FIDELITY CAMCORDER VIEWPORT */}
-                  <div 
-                    onClick={handleCamViewportClick}
-                    onMouseMove={handleCamViewportMouseMove}
-                    className={`relative bg-zinc-950 overflow-hidden border-2 group shadow-2xl mx-auto rounded-3xl transition-all duration-300 cursor-crosshair ${
-                      isSmartAwbEnabled && isCameraActive && (liveSceneColorTemp < 3000 || liveSceneColorTemp > 8000)
-                        ? 'border-pulse-extreme'
-                        : 'border-amber-500/20'
-                    } ${
-                      cameraAspect === '9_16' 
-                        ? 'aspect-[9/16] max-w-[280px] md:max-w-[305px]' 
-                        : 'aspect-video w-full'
-                    }`}
-                    style={
-                      isSmartAwbEnabled && isCameraActive && (liveSceneColorTemp < 3000 || liveSceneColorTemp > 8000)
-                        ? ({
-                            '--extreme-border-max': `${Math.max(3, Math.min(12, 1 + (Math.abs(liveSceneColorTemp - 5500) / 450)))}px`
-                          } as React.CSSProperties)
-                        : undefined
-                    }
-                  >
-                    {recordedVideoPreviewUrl ? (
-                      /* FULL SCREEN REPLAY STAGE FOR USER APPROVAL */
-                      <div className="absolute inset-0 bg-black z-30 flex flex-col justify-center items-center">
-                        <video
-                          src={recordedVideoPreviewUrl}
-                          controls
-                          autoPlay
-                          loop
-                          playsInline
-                          className="w-full h-full object-cover"
-                        />
-                        {/* Elegant floating status header */}
-                        <div className="absolute top-3.5 left-3.5 right-3.5 bg-black/80 backdrop-blur-md border border-amber-500/30 px-3 py-2 rounded-2xl flex items-center justify-between text-[10px] pointer-events-none shadow-xl">
-                          <span className="flex items-center gap-1.5 text-amber-400 font-extrabold uppercase tracking-widest">
-                            <Sparkles className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
-                            CHẾ ĐỘ XEM LẠI B-ROLL
-                          </span>
-                          <span className="text-emerald-400 font-bold bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20 uppercase font-mono text-[8px]">
-                            Đã Sẵn Sàng nháp
-                          </span>
-                        </div>
-                      </div>
-                    ) : (
-                      <>
-                        {/* SMART INTERACTIVE ON-SCREEN FILMING INSTRUCTIONS & PROMPTER (ĐẠO DIỄN QUAY THÔNG MINH - HẬU TRƯỜNG ĐIỆN ẢNH) */}
-                        {showSmartShootingPrompter ? (
-                          <>
-                            {/* HUD Top bar */}
-                            <div className="absolute top-3 inset-x-2.5 flex items-center justify-between gap-1.5 z-20">
-                              <div className="flex items-center gap-1.5">
-                                <div className="bg-black/90 backdrop-blur-md border border-amber-500/35 px-2 py-1 rounded-xl flex items-center gap-1 text-[8px] text-amber-400 font-extrabold uppercase tracking-wider shadow-xl">
-                                  <Sparkles className="w-3 h-3 text-amber-400 animate-pulse" />
-                                  <span>PHÂN ĐOẠN {cameraShootStep + 1}/4</span>
-                                </div>
-                                {isRecordingCamera && (
-                                  <div className={`border px-2 py-1 rounded-xl flex items-center gap-1 text-[8px] font-mono font-black tracking-wider uppercase shadow-md shrink-0 transition-colors ${
-                                    isRecordingPaused 
-                                      ? 'bg-amber-500 border-amber-400 text-black' 
-                                      : 'bg-red-600/95 border-red-500/35 text-white animate-pulse'
-                                  }`}>
-                                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${isRecordingPaused ? 'bg-black animate-pulse' : 'bg-white animate-ping'}`}></span>
-                                    <span>
-                                      {isRecordingPaused ? 'PAUSE' : 'REC'}{' '}
-                                      {Math.floor(recordingSeconds / 60).toString().padStart(2, '0')}:{(recordingSeconds % 60).toString().padStart(2, '0')}
-                                    </span>
-                                  </div>
-                                )}
-                              </div>
-                              
-                              <div className="flex items-center gap-1.5">
-                                <span className="bg-black/90 backdrop-blur-md border border-white/10 px-2 py-1 rounded-xl text-emerald-400 font-mono text-[7.5px] font-bold uppercase tracking-widest shrink-0">
-                                  FHD 60FPS
-                                </span>
-                                <button
-                                  type="button"
-                                  onClick={() => setShowSmartShootingPrompter(false)}
-                                  className="bg-black/90 hover:bg-black border border-white/15 px-2 py-1 rounded-xl text-rose-400 hover:text-rose-300 transition-all cursor-pointer shadow-md text-[7.5px] font-bold uppercase tracking-wider flex items-center justify-center shrink-0"
-                                  title="Ẩn chỉ dẫn nhanh"
-                                >
-                                  <span>ẨN HUD ✕</span>
-                                </button>
-                              </div>
-                            </div>
-
-                             {/* HIGH-END INTERACTIVE AI AR HUD OVERLAY */}
-                             <div className="absolute inset-0 pointer-events-none z-15 select-none overflow-hidden">
-                               
-                               {/* Glowing scanner line animation block */}
-                               <style>{`
-                                 @keyframes sweepLaser {
-                                   0% { transform: translateY(0%); opacity: 0.15; }
-                                   50% { transform: translateY(400px); opacity: 0.95; }
-                                   100% { transform: translateY(0%); opacity: 0.15; }
-                                 }
-                                 .laser-radar-sweep {
-                                   position: absolute;
-                                   left: 0;
-                                   right: 0;
-                                   top: 10%;
-                                   height: 2px;
-                                   background: linear-gradient(90deg, transparent, rgba(52, 211, 153, 0.95), transparent);
-                                   animation: sweepLaser 4.5s infinite ease-in-out;
-                                   box-shadow: 0 0 12px rgba(52, 211, 153, 0.9);
-                                 }
-                                 @keyframes extremeColorPulse {
-                                   0% { border-color: rgba(249, 115, 22, 0.35); box-shadow: 0 0 8px rgba(249, 115, 22, 0.2); border-width: 2px; }
-                                   50% { border-color: rgba(249, 115, 22, 1); box-shadow: 0 0 24px rgba(249, 115, 22, 0.65); border-width: var(--extreme-border-max, 4px); }
-                                   100% { border-color: rgba(249, 115, 22, 0.35); box-shadow: 0 0 8px rgba(249, 115, 22, 0.2); border-width: 2px; }
-                                 }
-                                  @keyframes floatArrowDolly {
-                                    0% { transform: scale(0.85); opacity: 0.15; }
-                                    50% { transform: scale(1.15); opacity: 0.9; }
-                                    100% { transform: scale(0.85); opacity: 0.15; }
-                                  }
-                                  @keyframes floatArrowTilt {
-                                    0% { transform: translateY(-16px); opacity: 0.15; }
-                                    50% { transform: translateY(16px); opacity: 0.9; }
-                                    100% { transform: translateY(-16px); opacity: 0.15; }
-                                  }
-                                  @keyframes floatArrowPan {
-                                    0% { transform: translateX(-24px); opacity: 0.15; }
-                                    50% { transform: translateX(24px); opacity: 0.9; }
-                                    100% { transform: translateX(-24px); opacity: 0.15; }
-                                  }
-                                  @keyframes floatArrowOrbit {
-                                    0% { transform: rotate(0deg) translateY(-32px); opacity: 0.3; }
-                                    50% { transform: rotate(180deg) translateY(-32px); opacity: 0.9; }
-                                    100% { transform: rotate(360deg) translateY(-32px); opacity: 0.3; }
-                                  }
-                                  @keyframes floatArrowRoll {
-                                    0% { transform: rotate(-12deg); opacity: 0.25; }
-                                    50% { transform: rotate(12deg); opacity: 0.9; }
-                                    100% { transform: rotate(-12deg); opacity: 0.25; }
-                                  }
-                                  @keyframes phoneSlideDolly {
-                                    0% { transform: translateY(8px) translate3d(0, 0, 0); }
-                                    50% { transform: translateY(-8px) translate3d(0, 0, 15px); }
-                                    100% { transform: translateY(8px) translate3d(0, 0, 0); }
-                                  }
-                                  @keyframes phoneSlideTilt {
-                                    0% { transform: rotateX(-12deg); }
-                                    50% { transform: rotateX(12deg); }
-                                    100% { transform: rotateX(-12deg); }
-                                  }
-                                  @keyframes phoneSlidePan {
-                                    0% { transform: translateX(-12px); }
-                                    50% { transform: translateX(12px); }
-                                    100% { transform: translateX(-12px); }
-                                  }
-                                  @keyframes phoneSlideOrbit {
-                                    0% { transform: rotateY(0deg) translateZ(15px); }
-                                    100% { transform: rotateY(360deg) translateZ(15px); }
-                                  }
-                                  @keyframes phoneSlideRoll {
-                                    0% { transform: rotateZ(-10deg); }
-                                    50% { transform: rotateZ(10deg); }
-                                    100% { transform: rotateZ(-10deg); }
-                                  }
-                                 .border-pulse-extreme {
-                                   animation: extremeColorPulse 1.5s infinite ease-in-out !important;
-                                 }
-                               `}</style>
-                                 {/* HIGH-TECH FLOWING KINETIC MOTION VECTORS */}
-                                 {isCameraActive && (
-                                   <div className="absolute inset-0 pointer-events-none z-10 flex items-center justify-center">
-                                     {activeDeviceMotion === 'dolly' && (
-                                       <div className="absolute inset-0 flex items-center justify-center" style={{ scale: '0.9' }}>
-                                         {/* Concentric vector squares expanding slowly to coach Dolly depth motion */}
-                                         <div className="absolute w-28 h-28 border border-dashed border-amber-450/25 rounded-2xl animate-[ping_3s_infinite_linear]"></div>
-                                         <div className="absolute w-20 h-20 border border-amber-450/35 rounded-xl animate-[pulse_2s_infinite]"></div>
-                                         <div className="absolute w-10 h-10 border border-amber-450/50 rounded-lg flex items-center justify-center backdrop-blur-xs">
-                                           <Move className="w-4 h-4 text-amber-300 animate-pulse" />
-                                         </div>
-                                         <span className="absolute bottom-16 bg-black/95 border border-amber-500/30 px-2 py-0.5 rounded-lg text-[5px] scale-[0.9] tracking-widest text-amber-300 font-mono uppercase font-black text-center">
-                                           ĐẨY TIẾN / LÙI (DOLLY IN/OUT)
-                                         </span>
-                                       </div>
-                                     )}
-                                     
-                                     {activeDeviceMotion === 'tilt' && (
-                                       <div className="absolute inset-0 flex items-center justify-center" style={{ scale: '0.9' }}>
-                                         {/* Linear cascading indicators on left & right sides */}
-                                         <div className="absolute left-2.5 inset-y-12 w-1 border-l border-dashed border-indigo-400/40 flex flex-col justify-between items-center text-indigo-400 text-[6px]">
-                                           <span className="animate-bounce">▲</span>
-                                           <span className="animate-bounce">▼</span>
-                                         </div>
-                                         <div className="absolute right-2.5 inset-y-12 w-1 border-r border-dashed border-indigo-400/40 flex flex-col justify-between items-center text-indigo-400 text-[6px]">
-                                           <span className="animate-bounce">▲</span>
-                                           <span className="animate-bounce">▼</span>
-                                         </div>
-                                         <div className="flex flex-col items-center justify-center">
-                                           <div className="w-10 h-10 bg-indigo-600/20 border border-indigo-500/30 rounded-full flex items-center justify-center animate-bounce">
-                                             <ChevronDown className="w-4 h-4 text-indigo-300" />
-                                           </div>
-                                         </div>
-                                         <span className="absolute bottom-16 bg-black/95 border border-indigo-500/30 px-2 py-0.5 rounded-lg text-[5px] scale-[0.9] tracking-widest text-indigo-300 font-mono uppercase font-black text-center">
-                                           QUÉT LÊN / XUỐNG (TILT GRADUAL)
-                                         </span>
-                                       </div>
-                                     )}
-
-                                     {activeDeviceMotion === 'pan' && (
-                                       <div className="absolute inset-0 flex items-center justify-center" style={{ scale: '0.9' }}>
-                                         {/* Moving scan lines from left to right */}
-                                         <div className="absolute top-12 inset-x-6 h-1 border-t border-dashed border-emerald-400/40 flex justify-between items-center text-emerald-400 text-[6px]">
-                                           <span className="animate-pulse">◀</span>
-                                           <span className="animate-pulse">▶</span>
-                                         </div>
-                                         <div className="absolute bottom-12 inset-x-6 h-1 border-b border-dashed border-emerald-400/40 flex justify-between items-center text-emerald-400 text-[6px]">
-                                           <span className="animate-pulse">◀</span>
-                                           <span className="animate-pulse">▶</span>
-                                         </div>
-                                         <div className="flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/20 px-2 py-1 rounded-full animate-pulse">
-                                           <ChevronRight className="w-4 h-4 text-emerald-300" />
-                                         </div>
-                                         <span className="absolute bottom-16 bg-black/95 border border-emerald-500/30 px-2 py-0.5 rounded-lg text-[5px] scale-[0.9] tracking-widest text-emerald-300 font-mono uppercase font-black text-center">
-                                           PAN TRÁI / PHẢI (PAN SWEEP)
-                                         </span>
-                                       </div>
-                                     )}
-
-                                     {activeDeviceMotion === 'orbit' && (
-                                        <div className="absolute inset-2 flex items-center justify-center animate-pulse" style={{ scale: '0.9' }}>
-                                          <div className="absolute w-40 h-16 border border-dashed border-cyan-400/35 rounded-full animate-[spin_10s_linear_infinite]">
-                                            <div className="absolute -top-1 left-1/2 w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-md border border-cyan-300" />
-                                            <div className="absolute -bottom-1 left-1/2 w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-md border border-cyan-300" />
-                                          </div>
-                                          <div className="w-10 h-10 rounded-full border border-cyan-500/40 flex items-center justify-center">
-                                            <Compass className="w-4 h-4 text-cyan-300 animate-pulse" />
-                                          </div>
-                                          <span className="absolute bottom-16 bg-black/95 border border-cyan-500/30 px-2 py-0.5 rounded-lg text-[5px] scale-[0.9] tracking-widest text-cyan-300 font-mono uppercase font-black text-center">
-                                            HƯỚNG LIA VÒNG CUNG (ORBIT SWIPE)
-                                          </span>
-                                        </div>
-                                      )}
-                                      {activeDeviceMotion === 'roll' && (
-                                        <div className="absolute inset-2 flex items-center justify-center animate-pulse" style={{ scale: '0.9' }}>
-                                          <div className="absolute w-24 h-24 border-2 border-dashed border-purple-500/25 rounded-full animate-[spin_15s_linear_infinite] flex items-center justify-center">
-                                            <div className="w-1.5 h-6 bg-purple-500/35 absolute" />
-                                            <div className="h-1.5 w-6 bg-purple-500/35 absolute" />
-                                          </div>
-                                          <div className="w-10 h-10 rounded-full border border-purple-500/40 flex items-center justify-center">
-                                            <RefreshCw className="w-4 h-4 text-purple-300 animate-spin" style={{ animationDuration: '6s' }} />
-                                          </div>
-                                          <span className="absolute bottom-16 bg-black/95 border border-purple-500/30 px-2 py-0.5 rounded-lg text-[5px] scale-[0.9] tracking-widest text-purple-300 font-mono uppercase font-black text-center">
-                                            NGHIÊNG DI CHUYỂN (ROLL PIVOT)
-                                         </span>
-                                       </div>
-                                     )}
-                                   </div>
-                                 )}
-
-                                 {/* HIGH-FIDELITY ON-SCREEN INTERACTIVE STEP TIMELINE CHECKLIST (STORY-STYLE TOP PROGRESS INDICATORS) */}
-                                 <div className="absolute top-[44px] inset-x-3 flex gap-1 z-20 pointer-events-auto">
-                                   {SHOOT_STEPS.map((step, idx) => {
-                                     const isActive = cameraShootStep === idx;
-                                     return (
-                                       <button
-                                         key={idx}
-                                         type="button"
-                                         onClick={() => handleSwitchCameraShootStep(idx)}
-                                         className={`group relative h-1 flex-1 rounded-full transition-all duration-300 cursor-pointer ${
-                                           isActive
-                                             ? 'bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.6)]'
-                                             : 'bg-white/15 hover:bg-white/30'
-                                         }`}
-                                         title={step.title}
-                                        >
-                                         {/* Floating quick info overlay popup on hover */}
-                                         <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-black/95 border border-white/10 px-2 py-1 rounded text-[5.5px] font-black uppercase tracking-wider whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none shadow-xl z-30 flex items-center gap-1.5 leading-none">
-                                           <span className={isActive ? 'text-amber-400' : 'text-slate-400'}>PC {idx + 1}:</span>
-                                           <span>{step.title}</span>
-                                         </div>
-                                       </button>
-                                     );
-                                   })}
-                                 </div>
-
-                                 {/* REAL-TIME SPEED STABILITY ANALYZER DIAL (ĐO TỐC ĐỘ DI CHUYỂN B-ROLL) */}
-                                 <div className="absolute top-[88px] right-2 bg-black/85 border border-slate-700/25 px-1 py-1 rounded-lg flex flex-col items-center gap-0.5 shadow-md backdrop-blur-xs z-10 w-[42px] pointer-events-none">
-                                   <span className="text-[3.5px] text-slate-400 font-mono tracking-widest font-extrabold uppercase text-center block">SPEED</span>
-                                   
-                                   {/* Half circle dial / visual speed indicator */}
-                                   <div className="relative w-6 h-3 overflow-hidden flex items-end justify-center">
-                                     <div className="absolute inset-0 border-t border-x border-slate-700 rounded-t-full"></div>
-                                     <div className={`absolute inset-0 border-t border-x rounded-t-full transition-all duration-300 ${
-                                       liveMotionSpeed > 0.16 
-                                         ? 'border-t-rose-500 border-x-rose-500/20' 
-                                         : liveMotionSpeed < 0.05 
-                                           ? 'border-t-yellow-500 border-x-yellow-500/20' 
-                                           : 'border-t-emerald-400 border-x-emerald-400/40'
-                                     }`} style={{ transform: `rotate(${(liveMotionSpeed / 0.3) * 180 - 90}deg)`, transformOrigin: 'bottom center' }}></div>
-                                   </div>
-                                   
-                                   <span className={`text-[5.5px] font-mono font-black ${
-                                     liveMotionSpeed > 0.16 
-                                       ? 'text-rose-450 animate-pulse' 
-                                       : liveMotionSpeed < 0.05 
-                                         ? 'text-yellow-405' 
-                                         : 'text-emerald-405 shadow-sm'
-                                   }`}>
-                                     {liveMotionSpeed} m/s
-                                   </span>
-                                   <span className="text-[3px] text-slate-500 font-sans tracking-wide uppercase scale-[0.85] origin-center -mt-1 text-center font-bold">
-                                     {liveMotionSpeed > 0.16 
-                                       ? 'QUÁ NHANH' 
-                                       : liveMotionSpeed < 0.05 
-                                         ? 'QUÁ CHẬM' 
-                                         : 'LÝ TƯỞNG ✨'
-                                     }
-                                   </span>
-                                 </div>
-
-                               <div className="laser-radar-sweep" />
-
-                               {/* Clean minimalist sci-fi border grids & crop ticks */}
-                               <div className="absolute inset-4 border border-emerald-500/10 rounded-2xl">
-                                 {/* Four corner digital ticks */}
-                                 <div className="absolute -top-1 -left-1 w-3.5 h-3.5 border-t-2 border-l-2 border-emerald-400"></div>
-                                 <div className="absolute -top-1 -right-1 w-3.5 h-3.5 border-t-2 border-r-2 border-emerald-400"></div>
-                                 <div className="absolute -bottom-1 -left-1 w-3.5 h-3.5 border-b-2 border-l-2 border-emerald-400"></div>
-                                 <div className="absolute -bottom-1 -right-1 w-3.5 h-3.5 border-b-2 border-r-2 border-emerald-400"></div>
-                                </div>
-
-                                 {/* Top miniature real-time technical parameters bar */}
-                                 <div className="absolute top-[28px] inset-x-2 flex items-center justify-between text-[6px] text-slate-300 font-mono tracking-wider bg-black/85 px-1.5 py-0.5 rounded-md border border-white/5 backdrop-blur-md z-10">
-                                   <span className="flex items-center gap-1">
-                                     <span className="w-1 h-1 rounded-full bg-emerald-400 animate-pulse"></span>
-                                     AI_LOC_TARGET: {aiTargetType.toUpperCase()}
-                                   </span>
-                                   <span>AF-C [LOCK]</span>
-                                   <span className="text-emerald-300">STB: {aiStabilizerScore}%</span>
-                                 </div>
-
-                                 {/* Manual Touch Lock-On Instruction Badge */}
-                                 <div className="absolute top-[52px] left-2 bg-emerald-500/15 border border-emerald-400/40 px-1.5 py-0.5 rounded-md text-[4.5px] text-emerald-400 font-mono tracking-widest flex items-center gap-1 shadow-md backdrop-blur-xs z-10">
-                                   <span className="w-1 h-1 rounded-full bg-emerald-400 animate-pulse"></span>
-                                   <span>CHẠM KHÓA FOCUS AI</span>
-                                 </div>
-
-                                 {/* HIGH-CLASS REAL-TIME REVIEW STICKER / DECAL */}
-                                 {isCameraActive && (
-                                   <div 
-                                     key={`${cameraShootStep}-${stickerAnimation}`}
-                                     className="absolute top-[78px] left-2 z-10 select-none pointer-events-none transition-all duration-500 ease-in-out transform hover:scale-105"
-                                    >
-                                      {cameraShootStep === 2 && (
-                                       <div className="bg-gradient-to-r from-purple-500/20 via-pink-500/10 to-transparent border-l-2 border-purple-450 bg-black/85 backdrop-blur-md p-1.5 rounded-r-lg shadow-[0_4px_12px_rgba(192,132,252,0.25)] flex flex-col gap-0.5 max-w-[125px]">
-                                         <div className="flex items-center gap-1">
-                                           <span className="flex h-1.5 w-1.5 relative">
-                                             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-purple-400 opacity-75"></span>
-                                             <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-purple-400"></span>
-                                           </span>
-                                           <span className="text-[5.5px] font-black text-purple-400 font-mono tracking-widest uppercase">LIVE DEMO ⚡</span>
-                                         </div>
-                                         <span className="text-[7.5px] font-extrabold text-white leading-tight uppercase">THAO TÁC THỰC TẾ</span>
-                                         <span className="text-[4px] text-slate-450 font-mono uppercase tracking-wider block">FIDELITY: 99.8%</span>
-                                       </div>
-                                     )}
-
-                                     {cameraShootStep === 3 && (
-                                       <div className="bg-gradient-to-r from-emerald-500/20 via-teal-500/10 to-transparent border-l-2 border-emerald-450 bg-black/85 backdrop-blur-md p-1.5 rounded-r-lg shadow-[0_4px_12px_rgba(52,211,153,0.25)] flex flex-col gap-0.5 max-w-[125px]">
-                                         <div className="flex items-center gap-1">
-                                           <span className="flex h-1.5 w-1.5 relative">
-                                             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                                             <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-400"></span>
-                                           </span>
-                                           <span className="text-[5.5px] font-black text-emerald-400 font-mono tracking-widest uppercase">CTA VERDICT 🛍️</span>
-                                         </div>
-                                         <span className="text-[7.5px] font-extrabold text-white leading-tight uppercase">CHỐT ĐƠN 10/10</span>
-                                         <span className="text-[4px] text-slate-450 font-mono uppercase tracking-wider block">CONVERSION: Max</span>
-                                       </div>
-                                     )}
-                                   </div>
-                                 )}
-
-                                 {/* Active Extreme Temperature AWB Warning system */}
-                                 {isSmartAwbEnabled && isCameraActive && (liveSceneColorTemp < 3000 || liveSceneColorTemp > 8000) && (
-                                   <div className="absolute top-[132px] left-2 right-2 bg-orange-600/95 border border-orange-400/60 p-1.5 rounded-xl text-white font-sans text-[6.5px] font-extrabold flex flex-col gap-1 shadow-xl animate-pulse pointer-events-auto leading-normal z-25">
-                                     <div className="flex items-center gap-1 border-b border-orange-400/20 pb-0.5 mb-0.5">
-                                        <AlertCircle className="w-3 h-3 text-white shrink-0 animate-bounce" />
-                                        <span className="font-mono tracking-widest text-[5.5px] uppercase text-orange-200">AWB LIGHT WARNING ({liveSceneColorTemp}K)</span>
-                                     </div>
-                                     <span className="uppercase text-[5.8px] text-orange-100 font-medium">
-                                        CẢNH BÁO: Nhiệt độ màu chênh lệch cực hại ({liveSceneColorTemp < 3000 ? 'QUÁ ẤM / ĐỎ' : 'QUÁ LẠNH / XANH'})! Hãy di dời thiết bị hoặc điều chỉnh lại góc đèn b-roll.
-                                     </span>
-                                   </div>
-                                 )}
-
-                                 {/* Live Audio DB Tracker overlay */}
-                                 <div className="absolute top-[52px] right-2 bg-black/80 border border-cyan-500/20 px-1.5 py-1 rounded-lg flex flex-col items-end gap-0.5 shadow-md backdrop-blur-xs z-10 font-sans">
-                                   <span className="text-[4.5px] text-cyan-400 font-mono tracking-widest font-bold uppercase block">AUDIO DB</span>
-                                   <div className="flex gap-[1px] items-end h-3">
-                                     {[...Array(5)].map((_, i) => (
-                                       <div 
-                                         key={i} 
-                                         className="w-[1.2px] bg-cyan-400 transition-all rounded-full" 
-                                         style={{ height: `${Math.max(2, 10 + aiAcousticLevel + (i * 2) + Math.sin(Date.now()/200 + i) * 5)}px` }}
-                                       />
-                                     ))}
-                                   </div>
-                                   <span className="text-[4.5px] text-slate-450 font-mono scale-[0.9]">{aiAcousticLevel} dB</span>
-                                 </div>
-
-                                 {/* AI COGNITIVE SCANNER & REAL-TIME PRODUCT DETECTOR */}
-                                 {isCameraActive && (
-                                   <div className="absolute top-[128px] right-2 bg-black/95 border border-emerald-500/30 p-1 rounded-lg w-[64px] flex flex-col gap-0.5 shadow-xl backdrop-blur-md z-15 text-left pointer-events-auto select-none transition-all duration-300">
-                                     <div className="flex items-center gap-0.5 border-b border-emerald-500/10 pb-0.5">
-                                       <span className="w-1 h-1 rounded-full bg-emerald-400 animate-pulse shrink-0"></span>
-                                       <span className="text-[3.5px] font-black text-emerald-400 font-mono tracking-wider uppercase truncate">COGNITION</span>
-                                     </div>
-                                     <div className="text-[5px] font-black text-white truncate uppercase font-sans leading-none mt-0.5">
-                                       {productName ? productName : 'OBJECT'}
-                                     </div>
-                                     <div className="text-[3.5px] font-mono text-slate-500 flex justify-between leading-none mt-0.5">
-                                       <span>CLASS:</span>
-                                       <span className="text-amber-400 font-bold">
-                                         {(() => {
-                                           if (!productName) return "GEAR";
-                                           const lower = productName.toLowerCase();
-                                           if (lower.includes("phone") || lower.includes("samsung") || lower.includes("iphone") || lower.includes("xiaomi") || lower.includes("oppo")) return "MOBILE";
-                                           if (lower.includes("key") || lower.includes("chuột") || lower.includes("bàn phím") || lower.includes("rk") || lower.includes("mouse") || lower.includes("máy tính") || lower.includes("laptop")) return "GEAR";
-                                           if (lower.includes("son") || lower.includes("kem") || lower.includes("mỹ phẩm") || lower.includes("sữa") || lower.includes("da") || lower.includes("serum") || lower.includes("collagen")) return "BEAUTY";
-                                           if (lower.includes("tai nghe") || lower.includes("loa") || lower.includes("sound") || lower.includes("mic") || lower.includes("audio")) return "AUDIO";
-                                           return "HARDWARE";
-                                         })()}
-                                       </span>
-                                     </div>
-                                     <div className="text-[3.5px] font-mono text-slate-500 flex justify-between leading-none">
-                                       <span>CONF:</span>
-                                       <span className="text-emerald-400 font-bold">{cyberCoords.confidence.toFixed(1)}%</span>
-                                     </div>
-                                     
-                                     {/* Small simulated real-time scanning signal */}
-                                     <div className="h-[2px] bg-emerald-500/10 rounded-full overflow-hidden mt-1 relative pointer-events-none">
-                                       <div className="absolute top-0 bottom-0 left-0 bg-emerald-400 w-1/3 rounded-full animate-[sweepLaserProgressBar_2.5s_infinite_linear]" />
-                                     </div>
-                                    </div>
-                                  )}
-                                             {/* Corner status metrics - Ultra-polished minimalist cinema style */}
-                                 
-
-                                 {/* Dynamic responsive target tracking box - High-end minimalist design */}
-                                 <div 
-                                   className="absolute border-[0.5px] border-emerald-400/30 bg-emerald-500/[0.02] rounded-lg flex items-center justify-center transition-all duration-700 ease-out shadow-[0_0_8px_rgba(52,211,153,0.08)]"
-                                   style={{
-                                     width: '68px',
-                                     height: '68px',
-                                     left: `calc(50% - 34px + ${cyberCoords.x - 140}px)`,
-                                     top: `calc(50% - 34px + ${cyberCoords.y - 180}px)`,
-                                     transform: `scale(${cyberCoords.zoom})`,
-                                   }}
-                                 >
-                                   {/* Inner crosshair point */}
-                                   <div className="w-1 h-1 bg-emerald-400/60 rounded-full animate-ping absolute"></div>
-                                   <div className="w-0.5 h-0.5 bg-emerald-400/80 rounded-full"></div>
-                                   
-                                   {/* Miniature ticks inside tracking frame */}
-                                   <div className="absolute top-0 left-0 w-1 h-1 border-t-[0.75px] border-l-[0.75px] border-emerald-400"></div>
-                                   <div className="absolute top-0 right-0 w-1 h-1 border-t-[0.75px] border-r-[0.75px] border-emerald-400"></div>
-                                   <div className="absolute bottom-0 left-0 w-1 h-1 border-b-[0.75px] border-l-[0.75px] border-emerald-400"></div>
-                                   <div className="absolute bottom-0 right-0 w-1 h-1 border-b-[0.75px] border-r-[0.75px] border-emerald-400"></div>
-
-                                   {/* Rapid telemetry logs underneath target bounding box */}
-                                   <div className="absolute -top-3 left-0 text-[4.5px] text-emerald-400/95 font-mono tracking-wider bg-black/90 px-1 py-0.2 rounded border border-emerald-500/15 scale-[0.85] origin-left-bottom">
-                                     {aiDetectedLabel}
-                                   </div>
-                                 </div>
-
-                                 {/* HUD Bottom Smart Instruction Strip */}
-                                 <div className="absolute bottom-11 inset-x-2 bg-black/95 border border-emerald-500/30 py-1.5 px-2 rounded-xl flex items-center justify-between gap-1 shadow-lg backdrop-blur-md">
-                                   <div className="flex items-center gap-1 shrink-0">
-                                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-                                     <span className="text-[6.5px] uppercase font-black text-emerald-400 tracking-wider font-mono">CHỈ DẪN AI:</span>
-                                   </div>
-                                   <span className="text-[7.5px] font-extrabold text-white uppercase text-right truncate max-w-[170px] font-sans pb-0.5">
-                                     {aiLivePrompt}
-                                   </span>
-                                 </div>
-
-                                 {/* Corner status metrics - Ultra-polished minimalist cinema style */}
-                                 <div className="absolute bottom-1.5 left-3 flex items-center gap-2 font-mono text-[5px] text-slate-400 opacity-80 z-20">
-                                   <span className="text-emerald-405 font-black uppercase tracking-wider flex items-center gap-0.5">
-                                     <span className="w-1 h-1 rounded-full bg-emerald-400 animate-pulse"></span>
-                                     LOCK {cyberCoords.confidence.toFixed(0)}%
-                                   </span>
-                                   <span className="w-[1px] h-1.5 bg-white/10" />
-                                   <span>{Math.round(liveSceneBrightness * 3.4)} lx</span>
-                                   <span className="w-[1px] h-1.5 bg-white/10" />
-                                   <span>{liveSceneColorTemp}K</span>
-                                 </div>
-
-                                 <div className="absolute bottom-1.5 right-3 flex items-center gap-2 font-mono text-[5px] text-slate-400 opacity-80 z-20">
-                                   <span>f/1.8</span>
-                                   <span className="w-[1px] h-1.5 bg-white/10" />
-                                   <span>ISO {liveSceneBrightness < 45 ? 640 : 200}</span>
-                                   <span className="w-[1px] h-1.5 bg-white/10" />
-                                   <span>UHD 60P</span>
-                                 </div>
-                             </div>
-                          </>
-                        ) : (
-                          <>
-                            {/* Standard light minimal HUD box indicating scan is active despite hidden HUD */}
-                            <div className="absolute top-2.5 left-2.5 bg-emerald-500/95 border border-emerald-400 text-black px-1.5 py-0.5 rounded-lg text-[6.5px] font-black uppercase tracking-widest flex items-center gap-1 z-20 shadow">
-                              <span className="w-1 h-1 rounded-full bg-black animate-ping"></span>
-                              <span>AI SCANNING ACTIVE</span>
-                            </div>
-
-                            <button
-                              type="button"
-                              onClick={() => setShowSmartShootingPrompter(true)}
-                              className="absolute top-2.5 right-2.5 bg-black/90 backdrop-blur-md border border-amber-500/40 px-2 py-1 rounded-xl text-[7.5px] text-amber-400 font-extrabold uppercase tracking-widest flex items-center gap-1 z-20 transition-all cursor-pointer hover:border-amber-450 text-shadow shadow-lg"
-                            >
-                              <Sparkles className="w-2.5 h-2.5 text-amber-400 animate-pulse" />
-                              <span>Hiện Chỉ Dẫn AI 👁️</span>
-                            </button>
-                          </>
-                        )}
-
-                        {/* VIDEO CONTAINER WITH DYNAMIC FILTERS CLIENT-SIDE SIMULATION */}
-                        <video
-                          id="live_product_cam"
-                          ref={cameraVideoRef}
-                          autoPlay
-                          muted
-                          playsInline
-                          className={`w-full h-full object-cover transition-all duration-300 ${
-                            cameraFilter === 'cinematic' ? 'contrast-[1.12] brightness-[1.08] saturate-[1.25]' :
-                            cameraFilter === 'golden' ? 'sepia-[0.25] saturate-[1.3] brightness-[1.03] hue-rotate-[-6deg]' :
-                            cameraFilter === 'high_contrast' ? 'contrast-[1.35] brightness-[0.94] saturate-[1.05]' :
-                            cameraFilter === 'teal_orange' ? 'saturate-[1.35] hue-rotate-[8deg] contrast-[1.18]' : ''
-                          }`}
-                        />
-
-                        {/* SMART INTERACTIVE CONTINUOUS RECORDING PAUSE OVERLAY */}
-                        {isRecordingCamera && isRecordingPaused && (
-                          <div className="absolute inset-0 bg-black/75 backdrop-blur-[2px] flex flex-col items-center justify-center text-center p-4 z-20 pointer-events-none select-none">
-                            <div className="w-11 h-11 rounded-full bg-amber-500/15 border border-amber-400 flex items-center justify-center animate-pulse mb-2 shadow-[0_0_15px_rgba(245,158,11,0.25)]">
-                              <Pause className="w-4 h-4 text-amber-400 fill-amber-400" />
-                            </div>
-                            <h4 className="text-[10px] font-black text-amber-400 uppercase tracking-widest animate-pulse">
-                              TẠM DỪNG GHI HÌNH LIÊN TỤC
-                            </h4>
-                            <p className="text-[8px] text-slate-300 max-w-[190px] leading-relaxed mt-1">
-                              Hãy sắp đặt sản phẩm hoặc lựa chọn <strong className="text-amber-300">Cảnh/Phân đoạn mới</strong> phía dưới, sau đó bấm <strong className="text-emerald-400">"Tiếp tục quay ▶️"</strong> để ghép đoạn mượt mà nhất.
-                            </p>
-                          </div>
-                        )}
-
-                        {/* FLOATING CAMCORDER NOTICE BAR */}
-                        {cameraNotice && (
-                          <div className="absolute bottom-10 inset-x-3 bg-zinc-950/95 border border-amber-500/30 text-amber-300 font-bold px-2 py-1.5 rounded-xl text-[7.5px] text-center shadow-[0_4px_12px_rgba(0,0,0,0.5)] z-20 pointer-events-none animate-bounce">
-                            {cameraNotice}
-                          </div>
-                        )}
-
-                        {/* SMART AUTO WHITE BALANCE CORRECTION TINT LAYER */}
-                        {isSmartAwbEnabled && (
-                          <div 
-                            className="absolute inset-0 pointer-events-none transition-all duration-500 mix-blend-color z-5"
-                            style={{
-                              backgroundColor: liveSceneColorTemp < 5050 
-                                ? `rgba(14, 165, 233, ${Math.min(0.18, (5050 - liveSceneColorTemp) / 11000)})` // Cooling tint
-                                : liveSceneColorTemp > 5950 
-                                  ? `rgba(245, 158, 11, ${Math.min(0.16, (liveSceneColorTemp - 5950) / 16000)})` // Warming tint
-                                  : 'transparent'
-                            }}
-                          />
-                        )}
-
-                    {/* DYNAMIC COMPOSITION OVERLAYS (Golden grids, safe zones, macro corners) */}
-                    {cameraGrid === 'rule_of_thirds' && (
-                      <div className="absolute inset-0 pointer-events-none grid grid-cols-3 grid-rows-3 z-10">
-                        <div className="border-r border-b border-white/20"></div>
-                        <div className="border-r border-b border-white/20"></div>
-                        <div className="border-b border-white/20"></div>
-                        <div className="border-r border-b border-white/20"></div>
-                        <div className="border-r border-b border-white/20 animate-pulse"></div>
-                        <div className="border-b border-white/20"></div>
-                        <div className="border-r border-white/20"></div>
-                        <div className="border-r border-white/20"></div>
-                        <div></div>
-                      </div>
-                    )}
-
-                    {cameraGrid === 'center_focus' && (
-                      <div className="absolute inset-0 pointer-events-none flex items-center justify-center z-10">
-                        <div className="w-20 h-20 rounded-full border-2 border-dashed border-red-500/55 animate-[spin_10s_linear_infinite] flex items-center justify-center">
-                          <div className="w-14 h-14 rounded-full border border-dashed border-amber-400/40"></div>
-                        </div>
-                        {/* crosshair lines */}
-                        <div className="absolute top-1/2 left-8 right-8 h-[0.5px] bg-white/15"></div>
-                        <div className="absolute left-1/2 top-4 bottom-4 w-[0.5px] bg-white/15"></div>
-                        <div className="w-2.5 h-2.5 bg-red-600 rounded-full animate-ping pointer-events-none absolute"></div>
-                        <div className="w-1.5 h-1.5 bg-red-500 rounded-full pointer-events-none absolute"></div>
-                      </div>
-                    )}
-
-                    {cameraGrid === 'macro_detail' && (
-                      <div className="absolute inset-x-8 inset-y-6 pointer-events-none border border-white/5 z-10">
-                        <div className="absolute top-0 left-0 w-6 h-6 border-t-2 border-l-2 border-amber-400"></div>
-                        <div className="absolute top-0 right-0 w-6 h-6 border-t-2 border-r-2 border-amber-400"></div>
-                        <div className="absolute bottom-0 left-0 w-6 h-6 border-b-2 border-l-2 border-amber-400"></div>
-                        <div className="absolute bottom-0 right-0 w-6 h-6 border-b-2 border-r-2 border-amber-400"></div>
-                        <span className="absolute top-2 left-2 text-[6px] tracking-widest text-amber-300 font-mono bg-black/40 px-1 py-0.2 rounded font-bold uppercase">MACRO ZONE</span>
-                      </div>
-                    )}
-
-                    {/* INTELLIGENT COMPUTER VISION REAL-TIME VIEWPORT OVERLAYS */}
-                    {isComputerVisionActive && (
-                      <div className="absolute inset-0 pointer-events-none z-10 flex flex-col items-center justify-center">
-                        <div className="w-full h-full transition-all duration-300 flex items-center justify-center">
-                          {cvScannerStyle === 'laser_grid' && (
-                            <div className="relative w-full h-full flex items-center justify-center pointer-events-none">
-                              {/* Laser scanning visual indicator bar */}
-                              <div className="absolute left-4 right-4 h-[1.5px] bg-[#10b981] shadow-[0_0_12px_#10b981] animate-[sweepLaser_3s_infinite_ease-in-out]"></div>
-                              <svg className="w-56 h-56 text-emerald-500/25" viewBox="0 0 100 100">
-                                <circle cx="50" cy="50" r="45" fill="none" stroke="currentColor" strokeWidth="0.5" strokeDasharray="1,4" />
-                                <rect x="15" y="15" width="70" height="70" fill="none" stroke="currentColor" strokeWidth="0.4" strokeDasharray="3,3" />
-                                <path d="M 15 25 L 15 15 L 25 15 M 75 15 L 85 15 L 85 25 M 15 75 L 15 85 L 25 85 M 75 85 L 85 85 L 85 75" fill="none" stroke="#10b981" strokeWidth="0.8" />
-                                <text x="50" y="52" textAnchor="middle" fill="#10b981" fontSize="4" className="font-mono tracking-[0.2em] font-extrabold uppercase animate-pulse">
-                                  LIDAR GRID ACTIVE
-                                </text>
-                              </svg>
-                            </div>
-                          )}
-
-                          {cvScannerStyle === 'contour_edges' && (
-                            <div className="relative w-full h-full flex items-center justify-center pointer-events-none text-emerald-450">
-                              <svg className="w-48 h-48 drop-shadow-[0_0_8px_rgba(52,211,153,0.2)]" viewBox="0 0 100 100">
-                                <g stroke="currentColor" strokeWidth="0.5" fill="none" opacity="0.8">
-                                  {/* Dynamic Wireframe polygon shape */}
-                                  <polygon points="50,22 84,36 84,68 50,84 16,68 16,36" strokeDasharray="1,2" />
-                                  <polygon points="50,34 76,44 76,64 50,74 24,64 24,44" strokeWidth="0.8" />
-                                  <line x1="50" y1="34" x2="50" y2="74" />
-                                  <line x1="24" y1="44" x2="50" y2="34" />
-                                  <line x1="76" y1="44" x2="50" y2="34" />
-                                  <line x1="16" y1="36" x2="24" y2="44" />
-                                  <line x1="84" y1="36" x2="76" y2="44" />
-                                  <line x1="50" y1="22" x2="50" y2="34" />
-                                  <line x1="16" y1="68" x2="24" y2="64" />
-                                  <line x1="84" y1="68" x2="76" y2="64" />
-                                  <line x1="50" y1="84" x2="50" y2="74" />
-                                </g>
-                                <text x="50" y="15" textAnchor="middle" fill="#10b981" fontSize="4.5" className="font-mono tracking-widest font-black uppercase">
-                                  VECTOR CONTOUR MAP
-                                </text>
-                                <text x="80" y="52" fill="#34d399" fontSize="3.5" className="font-mono">
-                                  H: 142mm
-                                </text>
-                                <text x="18" y="52" fill="#34d399" fontSize="3.5" className="font-mono" textAnchor="end">
-                                  W: 68mm
-                                </text>
-                              </svg>
-                            </div>
-                          )}
-
-                          {cvScannerStyle === 'anchor_points' && (
-                            <div className="relative w-full h-full flex items-center justify-center pointer-events-none text-amber-500">
-                              <svg className="w-52 h-52" viewBox="0 0 100 100">
-                                <g stroke="currentColor" strokeWidth="0.45" fill="none" strokeDasharray="2,3" opacity="0.6">
-                                  <line x1="50" y1="50" x2="35" y2="25" />
-                                  <line x1="50" y1="50" x2="65" y2="25" />
-                                  <line x1="50" y1="50" x2="78" y2="55" />
-                                  <line x1="50" y1="50" x2="22" y2="55" />
-                                  <line x1="50" y1="50" x2="50" y2="78" />
-                                </g>
-                                {/* Glowing Anchor Point Dots */}
-                                {[
-                                  { x: 35, y: 25, label: 'L_01: LOGO' },
-                                  { x: 65, y: 25, label: 'L_02: CAP' },
-                                  { x: 78, y: 55, label: 'L_03: MARGIN_R' },
-                                  { x: 22, y: 55, label: 'L_04: MARGIN_L' },
-                                  { x: 50, y: 78, label: 'L_05: BASE_CTR' }
-                                ].map((pt, i) => (
-                                  <g key={i}>
-                                    <circle cx={pt.x} cy={pt.y} r="2.5" className="animate-pulse" fill="#f59e0b" opacity="0.25" />
-                                    <circle cx={pt.x} cy={pt.y} r="1.2" fill="#f59e0b" />
-                                    <text x={pt.x} y={pt.y - 3} textAnchor="middle" fill="#ffe600" fontSize="3.2" className="font-mono font-bold tracking-tight">
-                                      {pt.label}
-                                    </text>
-                                  </g>
-                                ))}
-                                <text x="50" y="94" textAnchor="middle" fill="#ffe600" fontSize="4.5" className="font-mono font-extrabold tracking-widest uppercase">
-                                  KEYPOINTS EXTRACTED
-                                </text>
-                              </svg>
-                            </div>
-                          )}
-
-                          {cvScannerStyle === 'telemetry_overlay' && (
-                            <div className="relative w-full h-full flex flex-col items-center justify-center pointer-events-none text-cyan-400">
-                              <svg className="w-48 h-48 drop-shadow-[0_0_6px_rgba(34,211,238,0.2)]" viewBox="0 0 100 100">
-                                <circle cx="50" cy="50" r="32" fill="rgba(6,182,212,0.02)" stroke="currentColor" strokeWidth="0.8" />
-                                <circle cx="50" cy="50" r="16" fill="none" stroke="currentColor" strokeWidth="0.4" strokeDasharray="2,2" />
-                                <path d="M 50 10 L 50 25 M 50 75 L 50 90 M 10 50 L 25 50 M 75 50 L 90 50" stroke="currentColor" strokeWidth="0.6" />
-                                <text x="50" y="44" textAnchor="middle" fill="#22d3ee" fontSize="3.5" className="font-mono font-bold">
-                                  DIST: 24.8 cm
-                                </text>
-                                <text x="50" y="58" textAnchor="middle" fill="#22d3ee" fontSize="3.2" className="font-mono font-bold uppercase tracking-wider animate-pulse">
-                                  LOCK OK
-                                </text>
-                              </svg>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* INTERACTIVE COMPUTER VISION REAL-TIME ANALYZER BOARD */}
-                    {isCameraActive && !recordedVideoPreviewUrl && isComputerVisionActive && (
-                      <div className="absolute bottom-20 left-2.5 right-2.5 z-25 bg-black/92 backdrop-blur-md rounded-2xl p-2.5 border border-emerald-500/25 text-left pointer-events-auto select-none space-y-2 shadow-2xl transition-all duration-200">
-                        {isCvAnalyzerExpanded ? (
-                          <div className="space-y-2">
-                            <div className="flex items-center justify-between border-b border-white/5 pb-1.5">
-                              <span className="text-[8.5px] uppercase text-emerald-400 font-black tracking-widest flex items-center gap-1">
-                                <Sparkles className="w-3 h-3 text-emerald-450 animate-pulse" />
-                                HỆ THỐNG TRỢ LÝ COMPUTER VISION (CV) AI CHUYÊN NGHIỆP
-                              </span>
-                              <button 
-                                type="button"
-                                onClick={() => setIsCvAnalyzerExpanded(false)}
-                                className="text-[7.5px] font-mono text-slate-400 hover:text-white px-1.5 py-0.5 bg-white/5 rounded border border-white/10 hover:bg-white/10 cursor-pointer transition-all"
-                              >
-                                Thu gọn [−]
-                              </button>
-                            </div>
-
-                            <p className="text-[7.5px] text-slate-400 leading-normal">
-                              Di chuyển chuột trên camera để kiểm tra sản phẩm. Hệ thống Computer Vision sẽ tự động nhận diện góc nghiêng, khoảng cách vật lý và định vị logo của {productName || "sản phẩm"}.
-                            </p>
-
-                            <div className="grid grid-cols-2 gap-2">
-                              {/* Left column: Live AI status metrics */}
-                              <div className="bg-[#050505] border border-white/5 p-1.5 rounded-xl flex flex-col justify-center items-center text-center space-y-1">
-                                <span className="text-[6.5px] text-slate-500 uppercase tracking-wider">Tọa độ bám quét</span>
-                                <div className="flex items-baseline gap-0.5 font-mono font-black text-emerald-400">
-                                  <span className="text-xs">
-                                    X: {cyberCoords.x} | Y: {cyberCoords.y}
-                                  </span>
-                                </div>
-                                <span className={`text-[6px] font-bold uppercase transition-all px-1 rounded-sm border ${
-                                  isTargetFocusLocked
-                                    ? 'bg-rose-500/10 border-rose-500/20 text-rose-400'
-                                    : 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400'
-                                }`}>
-                                  {isTargetFocusLocked ? '✓ ĐANG KHÓA KIÊN ĐỊNH' : '⚡ BÁM THEO CHUỘT (LIVE)'}
-                                </span>
-                              </div>
-
-                              {/* Right column: Target Lock & Scanning Mode Selectors */}
-                              <div className="flex flex-col justify-between space-y-1">
-                                <button
-                                  type="button"
-                                  onClick={handleToggleTargetFocusLock}
-                                  className={`w-full py-1.5 px-2 border rounded-xl text-[7.5px] font-black uppercase tracking-widest flex items-center justify-center gap-1 cursor-pointer transition-all active:scale-95 shadow-md ${
-                                    isTargetFocusLocked
-                                      ? 'bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border-rose-500/35'
-                                      : 'bg-emerald-500 hover:bg-emerald-400 text-black border-emerald-400/40 shadow-emerald-500/10'
-                                  }`}
-                                >
-                                  {isTargetFocusLocked ? '🔓 Hủy Khóa Bám Nét (Live Scans)' : '🎯 Khóa Điểm Nét (Target Lock)'}
-                                </button>
-
-                                <div className="grid grid-cols-4 gap-0.5">
-                                  {[
-                                    { id: 'laser_grid', label: 'Lưới Lidar' },
-                                    { id: 'contour_edges', label: 'Vector' },
-                                    { id: 'anchor_points', label: 'Điểm Mốc' },
-                                    { id: 'telemetry_overlay', label: 'HUD' },
-                                  ].map((mode) => (
-                                    <button
-                                      key={mode.id}
-                                      type="button"
-                                      onClick={() => setCvScannerStyle(mode.id as any)}
-                                      className={`py-1 rounded-md text-[6px] font-bold text-center cursor-pointer border truncate ${
-                                        cvScannerStyle === mode.id
-                                          ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400'
-                                          : 'bg-[#09090b] border-white/5 text-slate-550 hover:text-slate-300'
-                                      }`}
-                                    >
-                                      {mode.label}
-                                    </button>
-                                  ))}
-                                </div>
-                              </div>
-                            </div>
-
-                            {/* Additional Computer Vision confidence info */}
-                            <div className="flex items-center justify-between bg-black/60 p-1.5 rounded-xl border border-white/5 text-[6.5px]">
-                              <span className="text-slate-400 font-mono">ĐỘ TIN CẬY CV:</span>
-                              <span className="text-emerald-400 font-mono font-bold animate-pulse">{cyberCoords.confidence.toFixed(2)}% (MẪU CHẤT LƯỢNG CAO)</span>
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="flex items-center justify-between py-0.5 text-[8px]">
-                            <span className="uppercase text-emerald-400 font-extrabold tracking-wider flex items-center gap-1">
-                              👁️ COMPUTER VISION: X={cyberCoords.x}, Y={cyberCoords.y} | CONFIDENCE: <strong className="text-emerald-300">{cyberCoords.confidence.toFixed(1)}%</strong>
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => setIsCvAnalyzerExpanded(true)}
-                              className="text-[7.5px] font-mono text-emerald-400 bg-emerald-400/10 px-1.5 py-0.5 rounded border border-emerald-400/20 hover:bg-emerald-400/20 cursor-pointer"
-                            >
-                              Mở rộng [+]
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* RED RECORDING STATUS BADGES */}
-                    {isRecordingCamera && !showSmartShootingPrompter && (
-                      <div className={`absolute top-3.5 left-3.5 border px-2 py-0.5 rounded-full flex items-center gap-1.5 text-[8.5px] font-mono font-black tracking-widest uppercase z-20 transition-colors ${
-                        isRecordingPaused 
-                          ? 'bg-amber-500 border-amber-400 text-black shadow-md' 
-                          : 'bg-red-600/90 border-red-500/20 text-white animate-pulse'
-                      }`}>
-                        <span className={`w-2 h-2 rounded-full ${isRecordingPaused ? 'bg-black animate-pulse' : 'bg-white animate-ping'}`}></span>
-                        <span>
-                          {isRecordingPaused ? 'PAUSED' : 'REC IN PROGRESS'} ({Math.floor(recordingSeconds / 60).toString().padStart(2, '0')}:{(recordingSeconds % 60).toString().padStart(2, '0')})
-                        </span>
-                      </div>
-                    )}
-
-                    {/* FILTER CUE BADGE */}
-                    <div className="absolute bottom-3.5 right-3.5 bg-black/75 border border-white/10 px-2 py-0.5 rounded-lg text-[8px] text-slate-300 font-mono font-bold tracking-widest uppercase flex items-center gap-1 z-20">
-                      <Layers className="w-2.5 h-2.5 text-amber-500" />
-                      <span>GRADE: {cameraFilter.replace('_', ' ')}</span>
-                    </div>
-
-                    {cameraError && (
-                      <div className="absolute inset-0 bg-black/90 p-4 flex flex-col items-center justify-center text-center space-y-2 z-30">
-                        <AlertCircle className="w-8 h-8 text-rose-500 animate-[bounce_1s_infinite]" />
-                        <h4 className="text-xs font-bold text-red-400 uppercase tracking-wider">Không tìm thấy Camera</h4>
-                        <p className="text-[10px] text-slate-400 max-w-xs leading-relaxed">{cameraError}</p>
-                        <button
-                          type="button"
-                          onClick={startCameraStream}
-                          className="px-3 py-1 bg-amber-500 hover:bg-amber-400 text-black font-bold text-[9px] rounded-lg cursor-pointer"
-                        >
-                          Cấp lại quyền Camera
-                        </button>
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-
-                  {/* CAMCORDER CONTROL BENCHMARK PANEL (Thay đổi động nếu có video xem lại hoặc ở chế độ live quay) */}
-                  {recordedVideoPreviewUrl ? (
-                    <div className="bg-[#050505] p-3 rounded-2xl space-y-3 border border-amber-500/35 shadow-xl relative z-20">
-                      <div className="flex flex-col space-y-1">
-                        <span className="text-[10px] text-amber-400 font-black uppercase tracking-widest flex items-center gap-1.5">
-                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping"></span>
-                          KIỂM DUYỆT B-ROLL VỪA QUAY
-                        </span>
-                        <p className="text-[8.5px] text-slate-400 leading-normal">
-                          Hãy xem lại khung hình và âm thanh đã đạt yêu cầu chưa trước khi hệ thống AI tiến hành tối ưu hóa bối cảnh sản phẩm.
-                        </p>
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-2 text-left pt-1">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (recordedVideoPreviewUrl) {
-                              URL.revokeObjectURL(recordedVideoPreviewUrl);
-                              setRecordedVideoPreviewUrl(null);
-                            }
-                            setPendingRecordedFile(null);
-                            startCameraStream();
-                          }}
-                          className="py-2.5 px-3 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-white/10 hover:border-white/20 text-slate-300 hover:text-slate-100 text-[10px] font-bold uppercase tracking-wider transition-all cursor-pointer flex items-center justify-center gap-1.5"
-                        >
-                          🔄 Quay Lại / Thử Lại
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (pendingRecordedFile) {
-                              processVideoFile(pendingRecordedFile);
-                              if (recordedVideoPreviewUrl) {
-                                URL.revokeObjectURL(recordedVideoPreviewUrl);
-                                setRecordedVideoPreviewUrl(null);
-                              }
-                              setPendingRecordedFile(null);
-                              stopCameraStream();
-                            }
-                          }}
-                          className="py-2.5 px-3 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer flex items-center justify-center gap-1.5 shadow-[0_4px_12px_rgba(245,158,11,0.2)]"
-                        >
-                          ✅ Đạt Chỉ Tiêu & Tải Lên
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="bg-[#050505] border border-white/5 p-3 rounded-2xl space-y-3">
-                      <div className="flex items-center justify-between gap-2 border-b border-white/5 pb-2.5">
-                        <div className="flex flex-col text-left">
-                          <span className="text-[10px] text-white font-bold uppercase tracking-wider">Thước Ngắm & Màu Sắc</span>
-                          <span className="text-[8px] text-slate-500">Giúp đồng bộ tỷ lệ vàng của sản phẩm lúc ghi hình</span>
-                        </div>
-                        
-                        {/* DUAL INTERACTIVE CONTINUOUS RECORDING CONTROLS */}
-                        {!isRecordingCamera ? (
-                          <button
-                            type="button"
-                            onClick={startRecordingCamera}
-                            className="py-1.5 px-3.5 rounded-xl text-[9.5px] font-black uppercase tracking-wider flex items-center gap-1.5 cursor-pointer shadow-lg transition-all border bg-red-500 hover:bg-red-400 text-black border-red-400"
-                          >
-                            <span className="w-2 h-2 rounded-full bg-black shrink-0"></span>
-                            <span>Quay B-Roll 🔴</span>
-                          </button>
-                        ) : (
-                          <div className="flex items-center gap-1.5 shrink-0">
-                            {/* Pause/Resume State button */}
-                            <button
-                              type="button"
-                              onClick={isRecordingPaused ? resumeRecordingCamera : pauseRecordingCamera}
-                              className={`py-1.5 px-2.5 rounded-xl text-[9px] font-black uppercase tracking-wider flex items-center gap-1 cursor-pointer transition-all border shadow ${
-                                isRecordingPaused
-                                  ? 'bg-emerald-500 hover:bg-emerald-400 text-black border-emerald-400 animate-pulse'
-                                  : 'bg-amber-500/10 hover:bg-amber-500/25 border-amber-500/30 text-amber-400'
-                              }`}
-                            >
-                              {isRecordingPaused ? (
-                                <>
-                                  <span className="w-1.5 h-1.5 rounded-full bg-black animate-ping shrink-0"></span>
-                                  <span>TIẾP TỤC ▶️</span>
-                                </>
-                              ) : (
-                                <>
-                                  <span className="w-1.5 h-1.5 rounded-full bg-amber-450 animate-pulse shrink-0"></span>
-                                  <span>TẠM DỪNG ⏸️</span>
-                                </>
-                              )}
-                            </button>
-
-                            {/* Stop/Complete sequence button */}
-                            <button
-                              type="button"
-                              onClick={stopRecordingCamera}
-                              className="py-1.5 px-2.5 rounded-xl text-[9px] font-black uppercase tracking-wider flex items-center gap-1 cursor-pointer transition-all border bg-rose-600/20 hover:bg-rose-600/35 border-rose-500 text-rose-400 shadow-md"
-                            >
-                              <span className="w-1.5 h-1.5 rounded-full bg-rose-50 animate-pulse shrink-0"></span>
-                              <span>HOÀN TẤT ⏹️</span>
-                            </button>
-                          </div>
-                        )}
-                      </div>
-
-                      {/* PRESET FILTER AND COMPOSITION GRID SELECTORS */}
-                      <div className="grid grid-cols-2 gap-2 text-left">
-                        <div className="space-y-1">
-                          <label className="text-[8.5px] uppercase text-slate-400 font-bold tracking-widest block font-bold">Màu Điện Ảnh</label>
-                          <select
-                            value={cameraFilter}
-                            onChange={(e) => setCameraFilter(e.target.value as any)}
-                            className="w-full bg-zinc-950 p-1.5 rounded-lg border border-white/10 text-[9.5px] text-slate-300 font-bold outline-none cursor-pointer text-ellipsis overflow-hidden"
-                          >
-                            <option value="none">Mặc định chuẩn (Gốc)</option>
-                            <option value="cinematic">Vivid Epic (Tạo Tương Phản)</option>
-                            <option value="golden">Golden Hour (Vàng Ấm Áp)</option>
-                            <option value="high_contrast">High Contrast (Chân Thực)</option>
-                            <option value="teal_orange">Teal & Orange (Hollywood)</option>
-                          </select>
-                        </div>
-
-                        <div className="space-y-1">
-                          <label className="text-[8.5px] uppercase text-slate-400 font-bold tracking-widest block font-bold">Thước Căn Khung</label>
-                          <select
-                            value={cameraGrid}
-                            onChange={(e) => setCameraGrid(e.target.value as any)}
-                            className="w-full bg-zinc-950 p-1.5 rounded-lg border border-white/10 text-[9.5px] text-slate-300 font-bold outline-none cursor-pointer text-ellipsis overflow-hidden"
-                          >
-                            <option value="none">Tắt đường hỗ trợ</option>
-                            <option value="rule_of_thirds">Quy Tắc 1/3 (Rule of Thirds)</option>
-                            <option value="center_focus">Trung Tâm Vàng (Center Ring)</option>
-                            <option value="macro_detail">Cận Cảnh Macro (Brackets)</option>
-                          </select>
-                        </div>
-
-                        {/* SMART AUTO-WHITE-BALANCE (AWB) HIGH-TECH TOGGLE */}
-                        <div className="col-span-2 pt-2 border-t border-white/5 flex items-center justify-between">
-                          <div className="flex flex-col text-left">
-                            <span className="text-[8.5px] uppercase text-slate-400 font-bold tracking-widest block font-bold flex items-center gap-1.5">
-                              ⚡ SMART AUTO-WHITE-BALANCE (AWB):
-                            </span>
-                            <span className="text-[7.5px] text-slate-500 font-medium">Tự động cân bằng nhiệt độ màu theo ánh sáng thực</span>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => setIsSmartAwbEnabled(!isSmartAwbEnabled)}
-                            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                              isSmartAwbEnabled ? 'bg-emerald-500' : 'bg-zinc-800'
-                            }`}
-                          >
-                            <span
-                              className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
-                                isSmartAwbEnabled ? 'translate-x-4' : 'translate-x-0'
-                              }`}
-                            />
-                          </button>
-                        </div>
-
-                        {/* HIGH-TECH AI COMPUTER VISION REAL-TIME SCANNER TOGGLE */}
-                        <div className="col-span-2 pt-2 border-t border-white/5 flex items-center justify-between">
-                          <div className="flex flex-col text-left">
-                            <span className="text-[8.5px] uppercase text-emerald-450 font-black tracking-widest block flex items-center gap-1.5">
-                              👁️ COMPUTER VISION (CV) COCHING:
-                            </span>
-                            <span className="text-[7.5px] text-slate-500 font-medium font-sans">Nhận diện sản phẩm, logo thương hiệu và ước tính kích thước vật lý bằng thị giác máy tính thời gian thực</span>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => setIsComputerVisionActive(!isComputerVisionActive)}
-                            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                              isComputerVisionActive ? 'bg-emerald-500' : 'bg-zinc-800'
-                            }`}
-                          >
-                            <span
-                              className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
-                                isComputerVisionActive ? 'translate-x-4' : 'translate-x-0'
-                              }`}
-                            />
-                          </button>
-                        </div>
-
-                        {/* HIGH-TECH INTERACTIVE AI COMPUTER VISION TARGET SELECTORS */}
-                        <div className="space-y-1 col-span-2 pt-2 border-t border-white/5">
-                          <label className="text-[8px] uppercase text-emerald-400 font-bold tracking-widest block font-black flex items-center gap-1">
-                            <span className="w-1 h-1 rounded-full bg-emerald-400 animate-ping shrink-0"></span>
-                            AI CHỈ ĐỊNH MỤC TIÊU PHÁT HIỆN THỜI GIAN THỰC:
-                          </label>
-                          <div className="grid grid-cols-4 gap-1 pt-1 opacity-90">
-                            {(['auto', 'logo', 'box', 'macro'] as const).map((type) => (
-                              <button
-                                key={type}
-                                type="button"
-                                onClick={() => setAiTargetType(type)}
-                                className={`py-1 rounded text-[7.5px] font-bold uppercase transition-all cursor-pointer border ${
-                                  aiTargetType === type
-                                    ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300 shadow-[0_0_8px_rgba(52,211,153,0.15)] font-black'
-                                    : 'bg-zinc-950 border-white/5 text-slate-400 hover:text-slate-200 hover:border-white/10'
-                                }`}
-                              >
-                                {type === 'auto' && '🤖 TỰ ĐỘNG'}
-                                {type === 'logo' && '🏷️ LOGO'}
-                                {type === 'box' && '📦 VỎ HỘP'}
-                                {type === 'macro' && '🔍 CẬN CẢNH'}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-
-                        {/* HIGH-CLASS INTERACTIVE STICKER ANIMATION SELECTOR */}
-                        <div className="space-y-1 col-span-2 pt-2 border-t border-white/5">
-                          <label className="text-[8px] uppercase text-amber-400 font-bold tracking-widest block font-black flex items-center gap-1">
-                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-bounce shrink-0"></span>
-                            HIỆU ỨNG HOẠT HỌA NHÃN DÁN VIDEO (STICKER EFFECT):
-                          </label>
-                          <div className="grid grid-cols-3 gap-1 pt-1 opacity-90">
-                            {(['fade-in', 'bounce', 'slide-in'] as const).map((style) => (
-                              <button
-                                key={style}
-                                type="button"
-                                onClick={() => setStickerAnimation(style)}
-                                className={`py-1 rounded text-[7px] font-bold uppercase transition-all cursor-pointer border ${
-                                  stickerAnimation === style
-                                    ? 'bg-amber-500/20 border-amber-400 text-amber-300 shadow-[0_0_8px_rgba(245,158,11,0.15)] font-black'
-                                    : 'bg-zinc-950 border-white/5 text-slate-400 hover:text-slate-200 hover:border-white/10'
-                                }`}
-                              >
-                                {style === 'fade-in' && '🌟 FADE-IN'}
-                                {style === 'bounce' && '🦘 BOUNCE POP'}
-                                {style === 'slide-in' && '➡️ SLIDE-IN'}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-
-                        {/* PROFESSIONAL B-ROLL CINEMATIC STEP SELECTOR (COMPRESSED PRODUCTION ENGINE) */}
-                        <div className="col-span-2 pt-2.5 border-t border-white/5 space-y-2">
-                          <div className="flex items-center justify-between">
-                            <span className="text-[8px] text-amber-500 uppercase font-black tracking-widest block font-sans">
-                              🎬 CHỌN PHÂN ĐOẠN CAMERA CHUYÊN NGHIỆP:
-                            </span>
-                            <span className="text-[7.5px] font-mono font-bold text-slate-450 bg-white/5 px-2 py-0.5 rounded-full uppercase leading-none">
-                              HOẠT CẢNH {cameraShootStep + 1}/4
-                            </span>
-                          </div>
-
-                          <div className="grid grid-cols-4 gap-1">
-                            {SHOOT_STEPS.map((step, idx) => {
-                              const isActive = cameraShootStep === idx;
-                              return (
-                                <button
-                                  key={idx}
-                                  type="button"
-                                  onClick={() => handleSwitchCameraShootStep(idx)}
-                                  className={`py-1.5 px-0.5 rounded-xl text-center border transition-all cursor-pointer flex flex-col justify-center items-center h-10 select-none ${
-                                    isActive
-                                      ? 'bg-amber-500/15 border-amber-400 text-amber-300 shadow-[0_0_10px_rgba(245,158,11,0.12)] font-black'
-                                      : 'bg-zinc-950/90 border-white/5 text-slate-450 hover:text-slate-200 hover:border-white/10'
-                                  }`}
-                                >
-                                  <span className="text-[6.5px] font-mono font-bold leading-none">CẢNH {idx + 1}</span>
-                                  <span className="text-[7.5px] font-bold truncate mt-1 max-w-full block px-1 leading-tight">
-                                    {step.title.includes('(') ? step.title.substring(step.title.indexOf('(') + 1, step.title.indexOf(')')) : step.title}
-                                  </span>
-                                </button>
-                              );
-                            })}
-                          </div>
-
-                          {/* HIGH DECK INTELLIGENT REAL-TIME CO-PILOT HUD DESCRIPTIONS */}
-                          <div className="bg-[#070b08] border border-emerald-500/15 p-2 rounded-xl text-left space-y-1.5 relative overflow-hidden">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[7px] text-emerald-400 font-extrabold tracking-wider block font-sans uppercase flex items-center gap-1">
-                                <span className="w-1 h-1 rounded-full bg-emerald-400 animate-pulse"></span>
-                                CHỈ ĐẠO DI CHUYỂN GÓC QUAY CHẬM (AI CO-PILOT):
-                              </span>
-                              <span className="text-[6.5px] font-mono font-bold text-slate-400">
-                                {SHOOT_STEPS[cameraShootStep].distance}
-                              </span>
-                            </div>
-
-                            <div className="space-y-1 text-[9px]">
-                              {/* Slow Movement Angle and motion coaching */}
-                              <div className="text-slate-200 font-medium">
-                                <span className="text-amber-400 font-extrabold uppercase text-[8px] tracking-wide mr-1 shadow-[0_0_5px_rgba(245,158,11,0.05)]">
-                                  HƯỚNG LIA MÁY:
-                                </span>
-                                {SHOOT_STEPS[cameraShootStep].instruction} 
-                                <strong className="text-emerald-300 ml-1">Hãy di chuyển góc quay siêu chậm để cảnh quay sắc nét không rung nhòe sườn máy.</strong>
-                              </div>
-
-                              <div className="text-slate-400 text-[8.5px] bg-white/5 p-1.5 rounded-lg border border-white/[0.03]">
-                                <span className="text-emerald-400 font-bold uppercase text-[7.5px] block mb-0.5">💡 BÍ QUYẾT BỨT PHÁ B-ROLL:</span>
-                                {SHOOT_STEPS[cameraShootStep].tip} Đẩy mạn sườn máy nghiêng khẽ, lướt chậm rãi ở tốc độ lý tưởng nhất.
-                              </div>
-                            </div>
-
-                            <div className="bg-[#0b0c0f] border border-blue-500/10 p-2 rounded-lg relative">
-                              <div className="flex items-center justify-between mb-0.5">
-                                <span className="text-[7px] text-blue-400 font-black tracking-wider block uppercase">🗣️ KỊCH BẢN THOẠI TRỰC QUAN GỢI Ý</span>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    navigator.clipboard.writeText(SHOOT_STEPS[cameraShootStep].voiceover);
-                                    setCopiedScript(true);
-                                    setTimeout(() => setCopiedScript(false), 2000);
-                                  }}
-                                  className="bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 px-1.5 py-0.5 rounded text-[6.5px] font-bold uppercase tracking-wider cursor-pointer"
-                                >
-                                  {copiedScript ? 'Đã Copy' : 'Sao Chép'}
-                                </button>
-                              </div>
-                              <p className="text-[8.5px] text-blue-350 leading-relaxed italic pr-8">
-                                "{SHOOT_STEPS[cameraShootStep].voiceover}"
-                              </p>
-                            </div>
-                          </div>
-
-                          {/* SMARTPHONE MOTION EDUCATION & DECK SIMULATOR (HƯỚNG DẪN DI CHUYỂN SMARTPHONE CHUYÊN NGHIỆP) */}
-                          <div className="bg-zinc-950/90 border border-amber-500/10 p-3 rounded-2xl space-y-3 relative overflow-hidden mt-2">
-                            <div className="flex items-center gap-1.5">
-                              <Smartphone className="w-4 h-4 text-amber-400 animate-pulse" />
-                              <span className="text-[9px] text-white font-extrabold uppercase tracking-wider block font-sans">
-                                📱 CẨM NANG DI CHUYỂN SMARTPHONE CAMERA ĐẲNG CẤP
-                              </span>
-                            </div>
-                            
-                            <p className="text-[8.5px] text-slate-400 leading-normal">
-                              Chạm chọn một kỹ thuật dưới đây hoặc đổi bước phân cảnh để xem hướng dẫn di chuyển tay thực tế, tốc độ lý tưởng và xem hướng các mũi tên chỉ dẫn trực quan trực tiếp trên màn hình camera.
-                            </p>
-
-                            {/* Tiny micro movement tab switcher */}
-                            <div className="grid grid-cols-5 gap-1 pt-1 bg-black/40 p-1 rounded-xl border border-white/5">
-                              {[
-                                { id: 'dolly', label: 'Dolly' },
-                                { id: 'tilt', label: 'Tilt' },
-                                { id: 'pan', label: 'Pan' },
-                                { id: 'orbit', label: 'Orbit' },
-                                { id: 'roll', label: 'Roll' }
-                              ].map((item) => (
-                                <button
-                                  key={item.id}
-                                  type="button"
-                                  onClick={() => setActiveDeviceMotion(item.id as any)}
-                                  className={`py-1 rounded-lg text-center text-[7.5px] font-black uppercase transition-all cursor-pointer ${
-                                    activeDeviceMotion === item.id
-                                      ? 'bg-amber-500 text-black font-black shadow-[0_0_8px_rgba(245,158,11,0.2)]'
-                                      : 'text-slate-400 hover:text-slate-205 hover:bg-white/5'
-                                  }`}
-                                >
-                                  {item.label}
-                                </button>
-                              ))}
-                            </div>
-
-                            {/* Interactive 3D CSS Animation Simulator & Checklists */}
-                            <div className="grid grid-cols-5 gap-2.5 bg-black/60 p-2 rounded-xl border border-white/5 text-left items-center">
-                              {/* Left animated simulator viewport (2 cols) */}
-                              <div className="col-span-2 aspect-square rounded-lg bg-zinc-900/80 border border-white/10 relative flex items-center justify-center overflow-hidden">
-                                {/* Grid reference lines */}
-                                <div className="absolute inset-0 border border-white/5 bg-[linear-gradient(to_right,rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(to_bottom,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:10px_10px]"></div>
-                                
-                                {/* Target Object icon in center */}
-                                <div className="w-5 h-5 bg-gradient-to-br from-amber-500 to-yellow-400 rounded flex items-center justify-center text-[7px] text-black font-black z-0 shadow-lg select-none transform rotate-12">
-                                  📦
-                                </div>
-
-                                {/* Animated Glassmorphic Phone Device */}
-                                <div 
-                                  className="absolute w-6 h-10 bg-white/10 backdrop-blur-[1px] border border-white/30 rounded-md flex items-center justify-center shadow-xl z-10"
-                                  style={{
-                                    boxShadow: '0 0 10px rgba(245,158,11,0.2), inset 0 0 4px rgba(255,255,255,0.15)',
-                                    animation: activeDeviceMotion === 'dolly' ? 'phoneSlideDolly 2.5s infinite ease-in-out' :
-                                               activeDeviceMotion === 'tilt' ? 'phoneSlideTilt 2.5s infinite ease-in-out' :
-                                               activeDeviceMotion === 'pan' ? 'phoneSlidePan 2.5s infinite ease-in-out' :
-                                               activeDeviceMotion === 'orbit' ? 'phoneSlideOrbit 4s infinite linear' :
-                                               'phoneSlideRoll 2.5s infinite ease-in-out'
-                                  }}
-                                >
-                                  {/* Camera lens notch */}
-                                  <div className="absolute top-1 w-1.5 h-0.5 bg-black rounded-full"></div>
-                                  {/* Active frame highlight crosshair */}
-                                  <div className="w-1 h-1 rounded-full bg-amber-400"></div>
-                                </div>
-                              </div>
-
-                              {/* Right detailed educational checklist (3 cols) */}
-                              <div className="col-span-3 space-y-1.5 text-[8.5px] leading-snug">
-                                {activeDeviceMotion === 'dolly' && (
-                                  <>
-                                    <div className="text-amber-350 font-extrabold uppercase text-[7.5px] tracking-wider">DOLLY (ĐẨY TIẾN / LÙI)</div>
-                                    <p className="text-slate-350 leading-relaxed font-sans">Tịnh tiến cơ thể chậm rãi 5cm/giây lại gần hoặc ra xa sản phẩm. <strong>Bảo toàn tiêu cự quang học</strong>, giúp chi tiết sắc nét tuyệt đối.</p>
-                                    <div className="text-slate-500 font-mono text-[6px]">💡 MẸO: Tỳ hai khuỷu tay chắc vào mạn sườn, đi bằng đầu gối thấp chân, không nhếch gót.</div>
-                                  </>
-                                )}
-                                {activeDeviceMotion === 'tilt' && (
-                                  <>
-                                    <div className="text-indigo-300 font-extrabold uppercase text-[7.5px] tracking-wider">TILT (QUÉT DỌC B-ROLL)</div>
-                                    <p className="text-slate-350 leading-relaxed font-sans">Đứng tĩnh vị trí, gập duỗi nhẹ cổ tay để ống kính lướt từ đỉnh sản phẩm thẳng đứng dọc dần xuống cạnh đáy.</p>
-                                    <div className="text-slate-500 font-mono text-[6px]">💡 MẸO: Giữ trục sườn dọc cân bằng, tránh rung vẹo sườn ngang để bắt sáng phản quang mịn.</div>
-                                  </>
-                                )}
-                                {activeDeviceMotion === 'pan' && (
-                                  <>
-                                    <div className="text-emerald-300 font-extrabold uppercase text-[7.5px] tracking-wider">PAN (LIA SONG SONG NGANG)</div>
-                                    <p className="text-slate-350 leading-relaxed font-sans">Gạt camera song song từ trái qua phải hoặc ngược lại hết mặt phẳng nền. Giúp mở rộng trường nhìn bối cảnh.</p>
-                                    <div className="text-slate-500 font-mono text-[6px]">💡 MẸO: Chọn trước điểm đáp cuối để kiểm soát tốc độ của vai nhằm tránh gây lóa nhòe chuyển động.</div>
-                                  </>
-                                )}
-                                {activeDeviceMotion === 'orbit' && (
-                                  <>
-                                    <div className="text-cyan-300 font-extrabold uppercase text-[7.5px] tracking-wider">ORBIT (QUAY VÒNG CUNG 3D)</div>
-                                    <p className="text-slate-350 leading-relaxed font-sans">Quay điện thoại theo hình bán nguyệt ôm quanh sản phẩm lấy tâm là trục đứng. Thể hiện hình học cao cấp b-roll.</p>
-                                    <div className="text-slate-500 font-mono text-[6px]">💡 MẸO: Kết hợp vạch kẻ Trung Tâm của máy ảnh để khóa cứng vật thể tại hồng tâm.</div>
-                                  </>
-                                )}
-                                {activeDeviceMotion === 'roll' && (
-                                  <>
-                                    <div className="text-purple-300 font-extrabold uppercase text-[7.5px] tracking-wider">ROLL PIVOT (NẠP GÓC CHÉO)</div>
-                                    <p className="text-slate-350 leading-relaxed font-sans">Xoay nghiêng nhẹ sườn máy sang bên lệch 15 độ. Tạo tiết tấu nhanh, hồi hộp vượt trội cho cảnh quay mở đầu.</p>
-                                    <div className="text-slate-500 font-mono text-[6px]">💡 MẸO: Sử dụng ngay khi khui hộp unboxing hoặc cắt cảnh transition nhịp độ tột độ.</div>
-                                  </>
-                                )}
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  <input 
+              <div className="space-y-3">
+                <input 
                     type="file" 
                     ref={fileInputRef}
                     className="hidden" 
@@ -6633,8 +5530,7 @@ export default function App() {
                     </div>
                   )}
                 </div>
-              )}
-            </div>
+              </div>
 
             {/* PRODUCT IMAGE UPLOAD SECTION */}
             <div className="space-y-2 pt-1 border-t border-white/5 mt-1">
@@ -6760,22 +5656,31 @@ export default function App() {
             </div>
 
             {/* SMART RECOGNITION CALL-TO-ACTION */}
-            {(uploadedFile || productImageBase64) && (
+            {(uploadedFile || productImageBase64 || productImages.length > 0) && (
               <div className="pt-1.5 pb-1 select-none">
                 <button
                   type="button"
                   onClick={executeQuickRecognition}
                   disabled={isIdentifying}
-                  className={`w-full py-2.5 px-3 rounded-xl border border-amber-500/30 bg-amber-500/5 hover:bg-amber-500/10 active:scale-[0.98] transition-all flex items-center justify-center gap-2 text-xs text-amber-400 font-semibold group ${
-                    isIdentifying ? 'animate-pulse cursor-wait opacity-80' : ''
+                  className={`w-full py-2.5 px-3.5 rounded-xl border transition-all flex items-center justify-between text-xs font-bold group cursor-pointer relative overflow-hidden shadow-lg ${
+                    isIdentifying 
+                      ? 'border-amber-500/50 bg-gradient-to-r from-amber-950/40 via-amber-900/30 to-black text-amber-300 animate-pulse cursor-wait' 
+                      : 'border-amber-500/30 bg-gradient-to-r from-amber-500/10 via-amber-500/5 to-transparent hover:border-amber-400/60 hover:bg-amber-500/15 text-amber-400 active:scale-[0.99]'
                   }`}
                 >
-                  <Sparkles className={`w-3.5 h-3.5 text-amber-400 ${isIdentifying ? 'animate-spin' : 'group-hover:scale-110 transition-transform'}`} />
-                  <span>
-                    {isIdentifying 
-                      ? 'AI đang quét & nhận dạng sản phẩm...' 
-                      : '💡 Nhận diện thông minh & gợi ý nhanh'
-                    }
+                  <div className="flex items-center gap-2">
+                    <div className="w-6 h-6 rounded-lg bg-amber-500/20 border border-amber-500/30 flex items-center justify-center shrink-0">
+                      <Sparkles className={`w-3.5 h-3.5 text-amber-400 ${isIdentifying ? 'animate-spin' : 'group-hover:rotate-12 transition-transform'}`} />
+                    </div>
+                    <span className="text-left font-display">
+                      {isIdentifying 
+                        ? 'ĐANG QUÉT THỊ GIÁC AI OCR & TÌM KIẾM USP...' 
+                        : '⚡ NHẬN DIỆN THÔNG MINH 1-CHẠM (AI VISION OCR)'
+                      }
+                    </span>
+                  </div>
+                  <span className="text-[8px] font-mono uppercase tracking-wider px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                    {isIdentifying ? 'Scanning...' : 'Sub-Second'}
                   </span>
                 </button>
               </div>
@@ -6784,29 +5689,42 @@ export default function App() {
             {/* Custom Product Inputs */}
             <div className="space-y-3 pt-2">
               <div className="space-y-1">
-                <span className="text-[10px] text-slate-400 font-medium block">Tên sản phẩm</span>
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] text-slate-300 font-semibold block">Tên sản phẩm</span>
+                  {productName && (
+                    <span className="text-[8px] font-mono text-emerald-400 bg-emerald-500/10 px-1.5 py-0.2 rounded border border-emerald-500/20">
+                      Đã nhận diện
+                    </span>
+                  )}
+                </div>
                 <input
                   type="text"
                   value={productName}
                   onChange={(e) => setProductName(e.target.value)}
-                  placeholder="Nhập tên sản phẩm..."
-                  className="w-full rounded-xl bg-[#050505] border border-white/10 p-3 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500"
+                  placeholder="Nhập hoặc quét tự động tên sản phẩm..."
+                  className="w-full rounded-xl bg-[#050505] border border-white/10 p-3 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 transition-all font-sans"
                 />
               </div>
 
               <div className="space-y-1">
-                <span className="text-[10px] text-slate-400 font-medium block">Mô tả sản phẩm</span>
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] text-slate-300 font-semibold block">Mô tả đặc tính & Công năng đột phá</span>
+                  <span className="text-[8px] font-mono text-slate-500">Tự động điền qua AI OCR</span>
+                </div>
                 <textarea
                   value={productDesc}
                   onChange={(e) => setProductDesc(e.target.value)}
-                  placeholder="Nhập hướng dẫn, đặc trưng nổi bật hay mô tả..."
-                  className="w-full h-16 rounded-xl bg-[#050505] border border-white/10 p-3 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 resize-none"
+                  placeholder="Nhập hoặc quét tự động đặc trưng nổi bật, chất liệu, tính năng đột phá..."
+                  className="w-full h-16 rounded-xl bg-[#050505] border border-white/10 p-3 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-amber-500 focus:border-amber-500 resize-none transition-all font-sans"
                 />
               </div>
 
               {suggestedKeywords.length > 0 && (
                 <div className="space-y-1 pt-1">
-                  <span className="text-[9px] text-slate-500 font-medium block">Hashtags thịnh hành đề cử (Nhấp để thêm nhanh):</span>
+                  <span className="text-[9px] text-amber-400 font-bold flex items-center gap-1">
+                    <Sparkles className="w-3 h-3 text-amber-400" />
+                    Hashtags thịnh hành đề xuất (Nhấp để thêm nhanh):
+                  </span>
                   <div className="flex flex-wrap gap-1">
                     {suggestedKeywords.map((kw, idx) => {
                       const cleanTag = kw.startsWith('#') ? kw : `#${kw.replace(/\s+/g, '')}`;
@@ -6820,7 +5738,7 @@ export default function App() {
                               return prev ? `${prev} ${cleanTag}` : cleanTag;
                             });
                           }}
-                          className="text-[9px] bg-amber-500/5 hover:bg-amber-500/10 border border-amber-500/20 hover:border-amber-500/40 text-amber-400 px-2 py-0.5 rounded-full transition-all duration-200"
+                          className="text-[9px] bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/25 hover:border-amber-500/50 text-amber-300 px-2 py-0.5 rounded-full transition-all duration-200 cursor-pointer active:scale-95"
                         >
                           {cleanTag}
                         </button>
@@ -7071,23 +5989,29 @@ export default function App() {
                 id="start-analysis-btn"
                 onClick={executeVideoAnalysis}
                 disabled={isAnalyzing || !uploadedFile}
-                className={`w-full py-3.5 rounded-xl font-display font-medium text-xs uppercase tracking-[0.15em] flex items-center justify-center gap-2 transition-all relative overflow-hidden cursor-pointer ${
+                className={`w-full py-4 rounded-xl font-display font-medium text-xs uppercase tracking-[0.15em] flex items-center justify-center gap-2.5 transition-all relative overflow-hidden cursor-pointer ${
                   isAnalyzing 
-                    ? 'bg-slate-800 text-slate-400 cursor-not-allowed' 
+                    ? 'bg-slate-800 text-amber-300 border border-amber-500/30 cursor-wait' 
                     : !uploadedFile
                       ? 'bg-slate-900 border border-white/10 text-slate-500 cursor-not-allowed'
-                      : 'bg-gradient-to-r from-amber-500 via-amber-400 to-yellow-500 text-black hover:brightness-110 active:scale-95 shadow-[0_4px_20px_rgba(245,158,11,0.25)] hover:shadow-[0_4px_30px_rgba(245,158,11,0.5)] hover:scale-[1.01]'
+                      : 'bg-gradient-to-r from-amber-500 via-amber-400 to-yellow-400 text-black hover:brightness-110 active:scale-[0.98] shadow-[0_4px_25px_rgba(245,158,11,0.35)] hover:shadow-[0_4px_35px_rgba(245,158,11,0.6)] hover:scale-[1.005]'
                 }`}
               >
                 {isAnalyzing ? (
                   <>
-                    <RefreshCw className="w-4 h-4 animate-spin text-black" />
-                    <span className="font-sans font-bold">ĐANG PHÂN TÍCH {reviewType === 'normal' ? 'VLOG' : 'SẢN PHẨM'}...</span>
+                    <RefreshCw className="w-4 h-4 animate-spin text-amber-400 shrink-0" />
+                    <span className="font-sans font-bold tracking-wider text-amber-300">
+                      {extractionProgress !== null 
+                        ? `ĐANG BÓC TÁCH KHUNG HÌNH (${extractionProgress}%)...`
+                        : `AI ĐANG PHÂN TÍCH & SOẠN BÀI REVIEW ${reviewType === 'normal' ? 'VLOG' : 'ĐẲNG CẤP'}...`}
+                    </span>
                   </>
                 ) : (
                   <>
                     <Sparkles className="w-4 h-4 text-black shrink-0 animate-pulse" />
-                    <span className="font-sans font-extrabold tracking-wider">BẮT ĐẦU PHÂN TÍCH & VIẾT REVIEW {reviewType === 'normal' ? 'THƯỜNG' : 'SẢN PHẨM'}</span>
+                    <span className="font-sans font-black tracking-wider">
+                      🚀 BẮT ĐẦU PHÂN TÍCH & VIẾT REVIEW {reviewType === 'normal' ? 'THƯỜNG' : 'SẢN PHẨM'} ĐẲNG CẤP
+                    </span>
                   </>
                 )}
               </button>
@@ -7594,22 +6518,25 @@ export default function App() {
                       animate={{ scale: 1, opacity: 1, y: 0 }}
                       transition={{ duration: 0.15, ease: "easeOut" }}
                       className={`select-none drop-shadow-[0_4px_16px_rgba(0,0,0,0.95)] max-w-full text-center break-words leading-relaxed ${
+                        SUBTITLE_FONTS.find(f => f.id === subtitleFontFamily)?.cssClass || 'font-sub-vietnam'
+                      } ${
                         subtitleStyle === 'tiktok'
-                          ? 'font-display text-[12px] sm:text-[13.5px] md:text-sm uppercase px-3 py-1 rounded tracking-widest font-black'
+                          ? `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-[12.5px] sm:text-[14px] md:text-[15px] px-3 py-1.5 rounded tracking-wide font-black`
                           : subtitleStyle === 'capcut'
-                            ? 'font-display text-white text-[12px] sm:text-[13.5px] bg-[#0c0c0ced]/95 border border-white/15 shadow-[0_8px_24px_rgba(0,0,0,0.95)] px-4.5 py-2.5 rounded-[14px] font-black max-w-[92%] leading-relaxed tracking-wide backdrop-blur-[6px]'
+                            ? `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-white text-[12px] sm:text-[13.5px] bg-[#0c0c0ced]/95 border border-white/15 shadow-[0_8px_24px_rgba(0,0,0,0.95)] px-4.5 py-2.5 rounded-[14px] font-black max-w-[92%] leading-relaxed tracking-wide backdrop-blur-[6px]`
                             : subtitleStyle === 'cyberpunk'
                               ? 'text-[11px] sm:text-[12.5px] font-mono tracking-wider bg-[#020202e0]/95 px-3 py-2 border-2 border-[#ec4899] shadow-[0_0_15px_rgba(236,72,153,0.7)] font-black uppercase rounded-lg'
                               : subtitleStyle === 'neon'
-                                ? 'font-display text-[11px] sm:text-[12px] tracking-widest uppercase bg-[#d946ef]/10 border-2 border-[#d946ef] drop-shadow-[0_0_15px_rgba(217,70,239,0.85)] shadow-[0_0_10px_rgba(255,255,255,0.25)] px-4 py-2 rounded-2xl font-black backdrop-blur-[4px]'
-                                : 'font-sans text-slate-50 text-[11px] sm:text-[12px] font-bold [text-shadow:_0_2px_4px_rgba(0,0,0,1),_0_0_12px_rgba(0,0,0,0.85)] max-w-[85%] border-b-2 border-amber-500/90 pb-1.5 px-3'
+                                ? `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-[11.5px] sm:text-[13px] tracking-wide bg-[#d946ef]/10 border-2 border-[#d946ef] drop-shadow-[0_0_15px_rgba(217,70,239,0.85)] shadow-[0_0_10px_rgba(255,255,255,0.25)] px-4 py-2 rounded-2xl font-black backdrop-blur-[4px]`
+                                : `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-slate-50 text-[11.5px] sm:text-[13px] font-bold [text-shadow:_0_2px_4px_rgba(0,0,0,1),_0_0_12px_rgba(0,0,0,0.85)] max-w-[85%] border-b-2 border-amber-500/90 pb-1.5 px-3`
                       }`}
                     >
                       {(() => {
+                        const formattedActiveText = subtitleCase === 'uppercase' ? activeSubtitleText.toUpperCase() : activeSubtitleText;
                         if (!wordHighlightEnabled || !activeSubtitle) {
                           return (
                             <div className="flex flex-col items-center justify-center">
-                              <span>{activeSubtitleText}</span>
+                              <span>{formattedActiveText}</span>
                               {bilingualEnabled && activeSubtitle?.translation && (
                                 <div className={`mt-2 text-[10px] sm:text-[11.5px] font-sans font-medium opacity-90 max-w-[90%] ${
                                   subtitleStyle === 'tiktok' ? 'text-white border-t border-white/5 pt-1.5 w-full' :
@@ -7625,7 +6552,7 @@ export default function App() {
                           );
                         }
 
-                        const words = activeSubtitleText.split(/\s+/);
+                        const words = formattedActiveText.split(/\s+/);
                         const totalWords = words.length;
                         if (totalWords === 0) return activeSubtitleText;
 
@@ -8119,6 +7046,92 @@ export default function App() {
                           ))}
                         </div>
 
+                        {/* Vietnamese Font Selector & Case Typography Studio (ĐÃ TỐI ƯU 100% TIẾNG VIỆT KHÔNG LỖI FONT) */}
+                        <div className="bg-[#050505] p-2.5 rounded-xl border border-amber-500/20 flex flex-col gap-2 pointer-events-auto shadow-inner">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-[8.5px] font-black text-amber-400 uppercase tracking-wide flex items-center gap-1">
+                                🇻🇳 Phông Chữ Chuẩn Tiếng Việt (100% Việt Hóa):
+                              </span>
+                            </div>
+                            <span className="text-[7px] text-emerald-400 font-mono font-bold bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20">
+                              KHÔNG LỖI DẤU ✨
+                            </span>
+                          </div>
+
+                          {/* Font Options Grid */}
+                          <div className="grid grid-cols-5 gap-1">
+                            {SUBTITLE_FONTS.map((fontOpt) => {
+                              const isSelected = subtitleFontFamily === fontOpt.id;
+                              return (
+                                <button
+                                  key={fontOpt.id}
+                                  type="button"
+                                  onClick={() => {
+                                    setSubtitleFontFamily(fontOpt.id);
+                                    setShowSubtitles(true);
+                                  }}
+                                  className={`p-1.5 rounded-lg text-center flex flex-col items-center justify-between gap-1 transition-all relative border cursor-pointer select-none ${
+                                    isSelected
+                                      ? 'bg-amber-500/15 border-amber-500/50 shadow-[0_0_12px_rgba(245,158,11,0.2)] text-amber-300 font-black'
+                                      : 'bg-white/[0.02] border-white/5 hover:border-white/15 text-slate-400 hover:text-slate-200'
+                                  }`}
+                                  title={fontOpt.description}
+                                >
+                                  <span className={`text-[11px] font-black leading-none ${fontOpt.cssClass}`}>
+                                    Aa
+                                  </span>
+                                  <span className="text-[7.5px] font-bold leading-tight truncate w-full">
+                                    {fontOpt.name}
+                                  </span>
+                                  <span className="text-[6.5px] text-amber-400/80 scale-90 -mt-0.5">
+                                    {fontOpt.badge}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+
+                          {/* Live Subtitle Font Sample & Case Switcher */}
+                          <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-white/5">
+                            <div className="flex items-center gap-1">
+                              <span className="text-[7.5px] text-slate-400 font-bold uppercase">Kiểu Chữ:</span>
+                              <div className="flex items-center bg-white/5 p-0.5 rounded-md border border-white/10 text-[7.5px]">
+                                <button
+                                  type="button"
+                                  onClick={() => setSubtitleCase('uppercase')}
+                                  className={`px-1.5 py-0.5 rounded font-black transition-all cursor-pointer ${
+                                    subtitleCase === 'uppercase'
+                                      ? 'bg-amber-500 text-black shadow'
+                                      : 'text-slate-400 hover:text-white'
+                                  }`}
+                                >
+                                  IN HOA (ABC)
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setSubtitleCase('normal')}
+                                  className={`px-1.5 py-0.5 rounded font-medium transition-all cursor-pointer ${
+                                    subtitleCase === 'normal'
+                                      ? 'bg-amber-500 text-black shadow font-bold'
+                                      : 'text-slate-400 hover:text-white'
+                                  }`}
+                                >
+                                  Thường (Abc)
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Sample Preview Pill with Vietnamese Accents */}
+                            <div className="flex items-center gap-1.5 bg-black/60 px-2 py-1 rounded-md border border-amber-500/30 text-[8px]">
+                              <span className="text-slate-400 text-[7px] font-mono">MẪU:</span>
+                              <span className={`${SUBTITLE_FONTS.find(f => f.id === subtitleFontFamily)?.cssClass || ''} ${subtitleCase === 'uppercase' ? 'uppercase font-black text-amber-300' : 'font-bold text-amber-300'}`}>
+                                {subtitleCase === 'uppercase' ? 'ĐỈNH CAO CHẤT LƯỢNG' : 'Đỉnh cao chất lượng'}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
                         {/* Karaoke Dynamic Word Highlight Switch */}
                         <div className="bg-[#050505] p-2 rounded-xl border border-white/5 flex items-center justify-between pointer-events-auto">
                           <div className="flex flex-col">
@@ -8185,6 +7198,34 @@ export default function App() {
                               </button>
                             </div>
                           )}
+
+                          {/* 1-Click Multi-Language Subtitle Translator */}
+                          <div className="pt-2 border-t border-white/5 space-y-1.5">
+                            <span className="text-[7.5px] font-bold text-slate-400 uppercase tracking-wider block">
+                              🌍 Dịch Phụ Đề Toàn Cầu (1-Chạm)
+                            </span>
+                            <div className="grid grid-cols-6 gap-1">
+                              {[
+                                { lang: 'en', flag: '🇬🇧', label: 'Anh' },
+                                { lang: 'ja', flag: '🇯🇵', label: 'Nhật' },
+                                { lang: 'ko', flag: '🇰🇷', label: 'Hàn' },
+                                { lang: 'zh', flag: '🇨🇳', label: 'Trung' },
+                                { lang: 'th', flag: '🇹🇭', label: 'Thái' },
+                                { lang: 'vi', flag: '🇻🇳', label: 'Việt' },
+                              ].map(l => (
+                                <button
+                                  key={l.lang}
+                                  type="button"
+                                  onClick={() => translateAllSubtitlesToLang(l.lang)}
+                                  disabled={isTranslatingSubtitles}
+                                  className="py-1 px-1 rounded-md bg-white/[0.03] hover:bg-amber-500/15 border border-white/5 hover:border-amber-500/30 text-[8px] font-bold flex items-center justify-center gap-1 transition-all cursor-pointer text-slate-300 hover:text-amber-300"
+                                >
+                                  <span>{l.flag}</span>
+                                  <span>{l.label}</span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
                         </div>
 
                         {/* Interactive Manual Timeline Editor Component */}
@@ -8212,25 +7253,49 @@ export default function App() {
 
                               {/* Global Offset Actions and Setup Button */}
                               {!customSubtitleSegments ? (
-                                <div className="text-center py-3 space-y-2 bg-black/40 rounded-xl border border-dashed border-white/10">
-                                  <span className="text-[8px] text-slate-500 block">Kích hoạt chế độ đệm để tùy chỉnh tự do.</span>
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setCustomSubtitleSegments([...subtitleSegments]);
-                                    }}
-                                    className="px-2.5 py-1 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 text-[8.5px] font-bold uppercase rounded shadow transition-all cursor-pointer inline-flex items-center gap-1"
-                                  >
-                                    <Sparkles className="w-3 h-3 text-slate-950" />
-                                    <span>Bắt Đầu Chỉnh Sửa</span>
-                                  </button>
+                                <div className="text-center py-3 px-2 space-y-2 bg-black/40 rounded-xl border border-dashed border-white/10">
+                                  <span className="text-[8px] text-slate-400 block">Kích hoạt chế độ đệm để tùy chỉnh tự do hoặc sửa lỗi phụ đề tức thì:</span>
+                                  <div className="flex items-center justify-center gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={handleCheckAndFixReviewAndSubtitles}
+                                      disabled={isCheckingAndFixing}
+                                      className="px-2.5 py-1.2 bg-gradient-to-r from-rose-500 to-amber-500 hover:from-rose-400 hover:to-amber-400 text-slate-950 text-[8.5px] font-black uppercase rounded-lg shadow transition-all cursor-pointer inline-flex items-center gap-1 disabled:opacity-50"
+                                      title="Tự động kiểm tra phát hiện lỗi trùng lặp giây, dọn sạch ký tự lạ và căn chỉnh mốc thời gian phụ đề"
+                                    >
+                                      <ShieldCheck className={`w-3 h-3 text-slate-950 ${isCheckingAndFixing ? 'animate-spin' : ''}`} />
+                                      <span>{isCheckingAndFixing ? 'Đang sửa lỗi...' : '✨ Sửa Lỗi Phụ Đề & Timeline'}</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRunSilenceDetection()}
+                                      disabled={isDetectingSilence}
+                                      className="px-2.5 py-1.2 bg-gradient-to-r from-sky-500 to-indigo-500 hover:from-sky-400 hover:to-indigo-400 text-white text-[8.5px] font-black uppercase rounded-lg shadow transition-all cursor-pointer inline-flex items-center gap-1 disabled:opacity-50"
+                                      title="Tự động phát hiện các đoạn im lặng trong file audio và đề xuất điều chỉnh phụ đề khớp audio"
+                                    >
+                                      <Activity className={`w-3 h-3 text-white ${isDetectingSilence ? 'animate-spin' : ''}`} />
+                                      <span>{isDetectingSilence ? 'Đang quét...' : '⚡ Khớp Khoảng Lặng'}</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setCustomSubtitleSegments([...subtitleSegments]);
+                                      }}
+                                      className="px-2.5 py-1.2 bg-white/10 hover:bg-white/15 text-slate-200 text-[8.5px] font-bold uppercase rounded-lg border border-white/10 transition-all cursor-pointer inline-flex items-center gap-1"
+                                    >
+                                      <Sparkles className="w-3 h-3 text-amber-400" />
+                                      <span>Biên Tập Thủ Công</span>
+                                    </button>
+                                  </div>
                                 </div>
                               ) : (
                                 <div className="space-y-2.5">
                                   {/* Global Utilities */}
-                                  <div className="flex items-center justify-between pb-1.5 border-b border-white/5 text-[8.5px]">
+                                  <div className="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-white/5 text-[8.5px]">
                                     <div className="flex items-center gap-1">
-                                      <span className="text-slate-500">Căn chỉnh nhanh:</span>
+                                      <span className="text-slate-500">Căn chỉnh:</span>
                                       <button
                                         type="button"
                                         onClick={() => {
@@ -8260,6 +7325,52 @@ export default function App() {
                                         title="Trễ hơn 0.1s"
                                       >
                                         +0.1s
+                                      </button>
+
+                                      {/* AI Subtitle Spell Checker Button */}
+                                      <button
+                                        type="button"
+                                        onClick={handleFixSubtitlesSpellingAI}
+                                        disabled={isFixingSubtitleSpelling}
+                                        className="ml-1 px-2 py-0.5 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-black rounded text-[7.5px] uppercase cursor-pointer flex items-center gap-1 shadow-sm transition-all disabled:opacity-50"
+                                        title="AI kiểm tra và tự động sửa 100% lỗi chính tả, dấu câu, thanh điệu tiếng Việt"
+                                      >
+                                        <Sparkles className={`w-2.5 h-2.5 ${isFixingSubtitleSpelling ? 'animate-spin' : ''}`} />
+                                        <span>{isFixingSubtitleSpelling ? 'Đang sửa...' : '✨ Sửa Chính Tả AI'}</span>
+                                      </button>
+
+                                      {/* Fast Local Spell Check Button */}
+                                      <button
+                                        type="button"
+                                        onClick={handleFixSubtitlesSpellingLocal}
+                                        className="px-1.5 py-0.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 font-bold rounded border border-emerald-500/20 text-[7.5px] uppercase cursor-pointer flex items-center gap-0.5 transition-all"
+                                        title="Sửa nhanh chính tả ngay lập tức bằng bộ quy chuẩn tiếng Việt"
+                                      >
+                                        <CheckCheck className="w-2.5 h-2.5" />
+                                        <span>Sửa Nhanh</span>
+                                      </button>
+
+                                      {/* Silence VAD Alignment Button */}
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRunSilenceDetection()}
+                                        disabled={isDetectingSilence}
+                                        className="ml-0.5 px-2 py-0.5 bg-gradient-to-r from-sky-500 to-indigo-500 hover:from-sky-400 hover:to-indigo-400 text-white font-black rounded text-[7.5px] uppercase cursor-pointer flex items-center gap-0.5 shadow-sm transition-all disabled:opacity-50"
+                                        title="Tự động phát hiện các đoạn im lặng trong file audio và đề xuất điều chỉnh phụ đề khớp chuẩn từng giây"
+                                      >
+                                        <Activity className={`w-2.5 h-2.5 ${isDetectingSilence ? 'animate-spin' : ''}`} />
+                                        <span>{isDetectingSilence ? 'Đang quét...' : '⚡ Khớp Khoảng Lặng'}</span>
+                                      </button>
+
+                                      <button
+                                        type="button"
+                                        onClick={handleCheckAndFixReviewAndSubtitles}
+                                        disabled={isCheckingAndFixing}
+                                        className="ml-0.5 px-2 py-0.5 bg-gradient-to-r from-amber-500 to-rose-500 text-slate-950 font-black rounded text-[7.5px] uppercase cursor-pointer hover:brightness-110 flex items-center gap-0.5"
+                                        title="Tự động kiểm tra và sửa mốc thời gian"
+                                      >
+                                        <ShieldCheck className="w-2.5 h-2.5" />
+                                        <span>Auto-Fix</span>
                                       </button>
                                     </div>
 
@@ -8745,30 +7856,163 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Video exporter button */}
-                      <div className="pt-2 border-t border-white/5 space-y-2">
+                      {/* Ultra-Pro 4K / 60FPS Creator Export Suite */}
+                      <div className="pt-3 border-t border-white/5 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <label className="text-[10px] uppercase tracking-[0.1em] text-amber-400 font-black flex items-center gap-1.5 leading-none">
+                            <Sparkles className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
+                            TRUNG TÂM XUẤT BẢN MASTER PRO (4K / 60FPS)
+                          </label>
+                          <span className="text-[8px] font-mono font-bold bg-amber-500/10 text-amber-300 border border-amber-500/20 px-2 py-0.5 rounded-full">
+                            TOP 1 ENGINE
+                          </span>
+                        </div>
+
+                        {/* Export Quality Controls Grid */}
+                        <div className="grid grid-cols-3 gap-2 bg-[#060608] p-2 rounded-xl border border-white/5">
+                          {/* Resolution Selector */}
+                          <div className="space-y-1">
+                            <span className="text-[7.5px] font-bold text-slate-400 uppercase tracking-wider block">Độ phân giải</span>
+                            <div className="flex rounded-lg bg-black/60 p-0.5 border border-white/5">
+                              {(['4k', '1080p', '720p'] as const).map(res => (
+                                <button
+                                  key={res}
+                                  type="button"
+                                  onClick={() => setExportResolution(res)}
+                                  className={`flex-1 py-1 text-[8px] font-mono font-bold rounded uppercase transition-all cursor-pointer ${
+                                    exportResolution === res
+                                      ? 'bg-amber-500 text-black shadow-sm'
+                                      : 'text-slate-400 hover:text-white'
+                                  }`}
+                                >
+                                  {res}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* FPS Selector */}
+                          <div className="space-y-1">
+                            <span className="text-[7.5px] font-bold text-slate-400 uppercase tracking-wider block">Khung hình</span>
+                            <div className="flex rounded-lg bg-black/60 p-0.5 border border-white/5">
+                              {([60, 30] as const).map(fps => (
+                                <button
+                                  key={fps}
+                                  type="button"
+                                  onClick={() => setExportFps(fps)}
+                                  className={`flex-1 py-1 text-[8px] font-mono font-bold rounded transition-all cursor-pointer ${
+                                    exportFps === fps
+                                      ? 'bg-amber-500 text-black shadow-sm'
+                                      : 'text-slate-400 hover:text-white'
+                                  }`}
+                                >
+                                  {fps} FPS
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Bitrate Mode */}
+                          <div className="space-y-1">
+                            <span className="text-[7.5px] font-bold text-slate-400 uppercase tracking-wider block">Chất lượng</span>
+                            <div className="flex rounded-lg bg-black/60 p-0.5 border border-white/5">
+                              {[
+                                { id: 'master', label: 'Master' },
+                                { id: 'high', label: 'Pro HD' },
+                              ].map(b => (
+                                <button
+                                  key={b.id}
+                                  type="button"
+                                  onClick={() => setExportBitratePreset(b.id as any)}
+                                  className={`flex-1 py-1 text-[8px] font-mono font-bold rounded transition-all cursor-pointer ${
+                                    exportBitratePreset === b.id
+                                      ? 'bg-amber-500 text-black shadow-sm'
+                                      : 'text-slate-400 hover:text-white'
+                                  }`}
+                                >
+                                  {b.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Main Export Video Button */}
                         <button
                           type="button"
                           onClick={mergeAndDownloadVideo}
                           disabled={isMerging}
-                          className={`w-full py-2 px-3 rounded-xl flex items-center justify-center gap-2 text-xs font-bold uppercase tracking-wider transition-all cursor-pointer ${
+                          className={`w-full py-3 px-4 rounded-xl flex items-center justify-center gap-2.5 text-xs font-black uppercase tracking-wider transition-all cursor-pointer shadow-lg relative overflow-hidden ${
                             isMerging 
                               ? 'bg-slate-800 text-slate-400 cursor-not-allowed'
-                              : 'bg-gradient-to-r from-amber-500/20 to-amber-600/20 border border-amber-500/40 hover:border-amber-400 hover:bg-amber-500/10 text-amber-400 shadow-[0_2px_8px_rgba(245,158,11,0.05)] active:scale-95'
+                              : 'bg-gradient-to-r from-amber-500 via-yellow-400 to-amber-600 text-black hover:brightness-110 shadow-amber-500/20 active:scale-[0.98]'
                           }`}
                         >
                           {isMerging ? (
                             <>
-                              <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-400" />
-                              <span>Đang xuất: {mergeProgress}%</span>
+                              <RefreshCw className="w-4 h-4 animate-spin text-amber-400" />
+                              <span className="text-amber-200">Đang xuất bản {exportResolution.toUpperCase()} @ {exportFps}FPS: {mergeProgress}%</span>
                             </>
                           ) : (
                             <>
-                              <FileVideo className="w-3.5 h-3.5 text-amber-500 animate-pulse" />
-                              <span>🎬 Ghép & Xuất Video AI Review</span>
+                              <FileVideo className="w-4 h-4 text-black animate-pulse" />
+                              <span>🎬 GHÉP & XUẤT VIDEO REVIEW {exportResolution.toUpperCase()} ({exportFps}FPS PRO)</span>
                             </>
                           )}
                         </button>
+
+                        {/* Additional Creator Package Downloads */}
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 pt-1">
+                          <button
+                            type="button"
+                            onClick={downloadSRTFile}
+                            className="py-1.5 px-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-amber-300 border border-white/10 text-[9px] font-bold flex items-center justify-center gap-1 transition-all cursor-pointer"
+                            title="Tải phụ đề định dạng SRT cho CapCut, Premiere, TikTok"
+                          >
+                            <FileText className="w-3 h-3 text-amber-400" />
+                            <span>Tải .SRT</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={downloadVTTFile}
+                            className="py-1.5 px-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-amber-300 border border-white/10 text-[9px] font-bold flex items-center justify-center gap-1 transition-all cursor-pointer"
+                            title="Tải phụ đề định dạng WebVTT"
+                          >
+                            <Globe className="w-3 h-3 text-blue-400" />
+                            <span>Tải .VTT</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (audioUrl) {
+                                const a = document.createElement('a');
+                                a.href = audioUrl;
+                                a.download = `${(activeReview?.productName || "voiceover").toLowerCase().replace(/[^a-zA-Z0-9]/g, '_')}.wav`;
+                                a.click();
+                                playSynthesizedSFX('pop', 0.6);
+                              } else {
+                                setApiError("Chưa có bản thu âm giọng đọc AI!");
+                              }
+                            }}
+                            className="py-1.5 px-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-amber-300 border border-white/10 text-[9px] font-bold flex items-center justify-center gap-1 transition-all cursor-pointer"
+                            title="Tải riêng tệp âm thanh giọng đọc thuyết minh WAV không nén"
+                          >
+                            <FileAudio className="w-3 h-3 text-emerald-400" />
+                            <span>Tải .WAV</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={downloadCreatorPackage}
+                            className="py-1.5 px-2 rounded-lg bg-gradient-to-r from-amber-500/10 to-amber-600/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[9px] font-bold flex items-center justify-center gap-1 transition-all cursor-pointer"
+                            title="Tải trọn bộ tài liệu kịch bản, USP và hashtags cho Creator"
+                          >
+                            <Award className="w-3 h-3 text-amber-400" />
+                            <span>Bộ Kit .MD</span>
+                          </button>
+                        </div>
 
                         {/* If merging is active, display a gorgeous micro progress bar */}
                         {isMerging && (
@@ -9232,6 +8476,29 @@ export default function App() {
                       <span>Phát trễ hơn (+2s)</span>
                     </div>
                   </div>
+
+                  {/* Automatic Audio Silence VAD Alignment Button */}
+                  <div className="pt-2 border-t border-white/5 space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-300 text-[10px] flex items-center gap-1 font-semibold">
+                        <Activity className="w-3 h-3 text-sky-400" />
+                        <span>Khớp Khoảng Lặng Tự Động</span>
+                      </span>
+                      <span className="text-[7.5px] font-mono text-sky-400 bg-sky-500/10 px-1.5 py-0.2 rounded border border-sky-500/20 uppercase font-bold">
+                        VAD AUDIO
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleRunSilenceDetection()}
+                      disabled={isDetectingSilence}
+                      className="w-full py-2 px-2.5 bg-gradient-to-r from-sky-500/15 via-indigo-500/15 to-teal-500/15 hover:from-sky-500/25 hover:to-teal-500/25 border border-sky-500/30 hover:border-sky-400/50 rounded-xl text-sky-200 hover:text-white font-bold text-[10px] flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-sm disabled:opacity-50"
+                      title="Tự động phát hiện nhịp thở, khoảng lặng và khớp phụ đề chính xác từng mili-giây"
+                    >
+                      <Activity className={`w-3 h-3 text-sky-400 ${isDetectingSilence ? 'animate-spin' : ''}`} />
+                      <span>{isDetectingSilence ? 'Đang dò sóng âm thanh...' : '⚡ Khớp Phụ Đề Theo Khoảng Lặng'}</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -9564,25 +8831,541 @@ export default function App() {
                     </p>
                   </div>
 
-                  {/* Simplified Continuous Display for High-Conversion Video Review Script & Analysis */}
-                  <div className="space-y-8 animate-fadeIn">
+                  {/* SMART SYNCHRONIZED REVIEW & SUBTITLE SUITE */}
+                  <div className="space-y-6 animate-fadeIn">
                     
-                    {/* Part 1: Detailed Storyboard Video Review Script */}
-                    <div className="space-y-4 pt-2">
-                      <div className="flex items-center gap-2.5 border-b border-white/5 pb-3">
-                        <div className="p-1.5 bg-amber-500/10 rounded-lg border border-amber-500/20 text-amber-400">
-                          <Sparkles className="w-4 h-4 animate-pulse" />
-                        </div>
-                        <h3 className="text-xs font-mono uppercase tracking-[0.24em] text-slate-300 font-bold">
-                          BÀI REVIEW ĐẲNG CẤP &amp; CHUYÊN NGHIỆP LỒNG VIDEO
-                        </h3>
-                      </div>
+                    {/* View Mode Tabs & Action Controls */}
+                    <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3 border-b border-white/5 pb-4">
                       
-                      <div 
-                        className="text-sm text-slate-300 leading-relaxed space-y-4 font-sans select-text hover:text-white transition-colors bg-[#080808] border border-white/5 p-5 sm:p-7 rounded-2xl"
-                        dangerouslySetInnerHTML={{ __html: parseMarkdown(activeReview.detailedReview) }}
-                      />
+                      {/* Interactive View Switcher Tabs */}
+                      <div className="flex flex-wrap items-center gap-1.5 p-1 bg-black/60 border border-white/10 rounded-2xl">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setReviewSyncViewMode('storyboard');
+                            playSynthesizedSFX('pop', 0.4);
+                          }}
+                          className={`px-3 py-1.5 rounded-xl text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 select-none ${
+                            reviewSyncViewMode === 'storyboard'
+                              ? 'bg-amber-500 text-slate-950 shadow-md font-black'
+                              : 'text-slate-400 hover:text-white hover:bg-white/5'
+                          }`}
+                        >
+                          <Layers className="w-3.5 h-3.5" />
+                          <span>📝 Phân Cảnh Storyboard</span>
+                          <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-black/20 font-mono">
+                            {storyboardScenes.length} cảnh
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setReviewSyncViewMode('subtitle-matrix');
+                            playSynthesizedSFX('pop', 0.4);
+                          }}
+                          className={`px-3 py-1.5 rounded-xl text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 select-none ${
+                            reviewSyncViewMode === 'subtitle-matrix'
+                              ? 'bg-gradient-to-r from-amber-500 to-amber-400 text-slate-950 shadow-md font-black'
+                              : 'text-slate-400 hover:text-white hover:bg-white/5'
+                          }`}
+                        >
+                          <Clock className="w-3.5 h-3.5" />
+                          <span>⏱️ Ma Trận Phụ Đề Đồng Bộ</span>
+                          <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-black/20 font-mono">
+                            {subtitleSegments.length} câu
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setReviewSyncViewMode('teleprompter');
+                            playSynthesizedSFX('pop', 0.4);
+                          }}
+                          className={`px-3 py-1.5 rounded-xl text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 select-none ${
+                            reviewSyncViewMode === 'teleprompter'
+                              ? 'bg-amber-500 text-slate-950 shadow-md font-black'
+                              : 'text-slate-400 hover:text-white hover:bg-white/5'
+                          }`}
+                        >
+                          <Tv className="w-3.5 h-3.5" />
+                          <span>🎙️ Teleprompter Lồng Tiếng</span>
+                        </button>
+                      </div>
+
+                      {/* Right Action Tools: Re-align, Copy Timed, Export & Smart QA */}
+                      <div className="flex flex-wrap items-center gap-1.5 w-full lg:w-auto justify-start lg:justify-end">
+                        <button
+                          type="button"
+                          onClick={handleAutoAlignSubtitles}
+                          className="px-2.5 py-1.5 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-300 hover:text-amber-200 text-[10px] font-bold flex items-center gap-1 transition-all cursor-pointer"
+                          title="Tự động tính toán lại từng mili-giây phụ đề khớp tuyệt đối với giọng đọc AI"
+                        >
+                          <RefreshCw className="w-3 h-3 text-amber-400" />
+                          <span>Khớp 100% Giây</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleCopyTimedSubtitles}
+                          className="px-2.5 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 text-[10px] font-bold flex items-center gap-1 transition-all cursor-pointer"
+                          title="Sao chép toàn bộ danh sách phụ đề có mốc thời gian [00:00 -> 00:02]"
+                        >
+                          {copiedTimedSubtitles ? (
+                            <>
+                              <Check className="w-3 h-3 text-green-400" strokeWidth={3} />
+                              <span className="text-green-400">Đã chép!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3 h-3" />
+                              <span>Chép Phụ Đề</span>
+                            </>
+                          )}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={downloadSRTFile}
+                          className="px-2.5 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 text-[10px] font-bold flex items-center gap-1 transition-all cursor-pointer"
+                          title="Tải tệp phụ đề tiêu chuẩn .SRT cho CapCut, Premiere, DaVinci"
+                        >
+                          <Download className="w-3 h-3 text-amber-400" />
+                          <span>Xuất .SRT</span>
+                        </button>
+
+                        {/* Dedicated AI Subtitle Spell Checker */}
+                        <button
+                          type="button"
+                          onClick={handleFixSubtitlesSpellingAI}
+                          disabled={isFixingSubtitleSpelling}
+                          className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-400 to-teal-500 hover:from-emerald-300 hover:to-teal-400 text-slate-950 text-[10px] font-black uppercase tracking-wider flex items-center gap-1.5 shadow-[0_2px_12px_rgba(16,185,129,0.25)] hover:shadow-[0_4px_20px_rgba(16,185,129,0.35)] active:scale-95 transition-all cursor-pointer disabled:opacity-50"
+                          title="AI kiểm tra và tự động sửa 100% lỗi chính tả, dấu câu, thanh điệu cho phụ đề"
+                        >
+                          <Sparkles className={`w-3.5 h-3.5 ${isFixingSubtitleSpelling ? 'animate-spin text-slate-950' : 'text-slate-950'}`} />
+                          <span>{isFixingSubtitleSpelling ? 'Đang sửa...' : '✨ Chuẩn Chính Tả AI'}</span>
+                        </button>
+
+                        {/* Direct Smart QA & Auto-Fixer Trigger Button */}
+                        <button
+                          type="button"
+                          onClick={handleCheckAndFixReviewAndSubtitles}
+                          disabled={isCheckingAndFixing}
+                          className="px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-amber-400 via-amber-500 to-rose-500 hover:from-amber-300 hover:to-rose-400 text-slate-950 text-[10px] font-black uppercase tracking-wider flex items-center gap-1.5 shadow-[0_2px_12px_rgba(245,158,11,0.25)] hover:shadow-[0_4px_20px_rgba(245,158,11,0.35)] active:scale-95 transition-all cursor-pointer disabled:opacity-50"
+                          title="Tự động kiểm tra và sửa toàn bộ lỗi chính tả, khử giọng Bắc 100%, lọc từ cấm TikTok và đồng bộ phụ đề"
+                        >
+                          <ShieldCheck className={`w-3.5 h-3.5 ${isCheckingAndFixing ? 'animate-spin text-slate-950' : 'text-slate-950'}`} />
+                          <span>{isCheckingAndFixing ? 'Đang sửa lỗi...' : '✨ Sửa Lỗi Thông Minh'}</span>
+                        </button>
+                      </div>
                     </div>
+
+                    {/* LIVE PLAYBACK SYNCHRONIZATION STATUS RIBBON */}
+                    <div className="p-3.5 bg-gradient-to-r from-[#12100b] via-[#161208] to-[#0d0d0d] border border-amber-500/25 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs shadow-inner">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (audioRef.current) {
+                              if (isPlaying) {
+                                audioRef.current.pause();
+                                if (videoRef.current) videoRef.current.pause();
+                                setIsPlaying(false);
+                              } else {
+                                audioRef.current.play().then(() => {
+                                  setIsPlaying(true);
+                                  if (isSyncPlay && videoRef.current) videoRef.current.play().catch(() => {});
+                                }).catch(() => {});
+                              }
+                            }
+                          }}
+                          className="w-8 h-8 rounded-full bg-amber-500 hover:bg-amber-400 text-slate-950 flex items-center justify-center shrink-0 shadow-md cursor-pointer transition-transform active:scale-90"
+                          title={isPlaying ? "Tạm dừng phát" : "Phát đồng bộ bài review & phụ đề"}
+                        >
+                          {isPlaying ? <Pause className="w-4 h-4 fill-slate-950" /> : <Play className="w-4 h-4 fill-slate-950 ml-0.5" />}
+                        </button>
+
+                        <div className="space-y-0.5 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+                              isPlaying ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' : 'bg-white/5 text-slate-400 border border-white/10'
+                            }`}>
+                              <span className={`w-1.5 h-1.5 rounded-full ${isPlaying ? 'bg-amber-400 animate-ping' : 'bg-slate-500'}`} />
+                              {isPlaying ? 'ĐANG PHÁT ĐỒNG BỘ' : 'ĐÃ ĐỒNG BỘ 100%'}
+                            </span>
+                            <span className="font-mono text-[11px] text-slate-400">
+                              {formatTimeCode(currentAudioTime, true)} / {formatTimeCode(audioDuration || (videoRef.current?.duration || 20), true)}
+                            </span>
+                          </div>
+                          
+                          {/* Live Quote / Phrase Preview */}
+                          <p className="text-[11px] text-amber-200 font-sans truncate line-clamp-1 italic">
+                            {activeSubtitleText ? (
+                              <span className="text-amber-300 font-semibold">&ldquo;{activeSubtitleText}&rdquo;</span>
+                            ) : (
+                              <span className="text-slate-400">Nhấp vào bất kỳ câu thoại hoặc phân cảnh nào để nghe tức thì</span>
+                            )}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Speaking Pace & Subtitle Health Badge */}
+                      <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                        <span className="text-[10px] font-mono text-slate-400 bg-white/5 px-2.5 py-1 rounded-lg border border-white/5">
+                          Tốc độ: <strong className="text-amber-300">~{((cleanScriptForSpeech(activeScriptText).split(/\s+/).filter(Boolean).length) / Math.max(1, audioDuration || 20)).toFixed(1)}</strong> từ/s
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => jumpToTimestamp(0)}
+                          className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white border border-white/5 cursor-pointer"
+                          title="Quay lại đầu video (00:00)"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* MODE 1: STORYBOARD SCENES (RICH DETAILED REVIEW) */}
+                    {reviewSyncViewMode === 'storyboard' && (
+                      <div className="space-y-4">
+                        {storyboardScenes.map((scene, sIdx) => {
+                          const isSceneActive = isPlaying && currentAudioTime >= scene.startSec && currentAudioTime <= scene.endSec;
+                          return (
+                            <div 
+                              key={scene.id || sIdx}
+                              className={`p-5 sm:p-6 rounded-2xl transition-all duration-300 border ${
+                                isSceneActive
+                                  ? 'bg-gradient-to-r from-amber-500/10 via-[#14120a] to-[#0a0a0a] border-amber-400 shadow-[0_0_24px_rgba(245,158,11,0.15)] ring-1 ring-amber-400/50'
+                                  : 'bg-[#080808] border-white/5 hover:border-amber-500/30'
+                              }`}
+                            >
+                              {/* Scene Header with Time badge and Jump Button */}
+                              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/5 pb-3 mb-4">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-[10px] font-mono font-bold text-amber-500 bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 rounded-md">
+                                    CẢNH {String(sIdx + 1).padStart(2, '0')}
+                                  </span>
+                                  
+                                  {/* Clickable Time Badge */}
+                                  <button
+                                    type="button"
+                                    onClick={() => jumpToTimestamp(scene.startSec)}
+                                    className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md font-mono text-[11px] font-bold transition-all cursor-pointer shadow-sm ${
+                                      isSceneActive
+                                        ? 'bg-amber-400 text-slate-950 shadow-[0_0_12px_rgba(245,158,11,0.4)] animate-pulse'
+                                        : 'bg-white/10 hover:bg-amber-500 hover:text-slate-950 text-amber-300 border border-white/10'
+                                    }`}
+                                    title={`Nhấp để phát video ngay tại mốc ${scene.timeRangeText}`}
+                                  >
+                                    <Play className="w-3 h-3 fill-current" />
+                                    <span>{scene.timeRangeText}</span>
+                                  </button>
+
+                                  <h4 className="text-sm sm:text-base font-display font-semibold text-white">
+                                    {scene.title}
+                                  </h4>
+                                </div>
+
+                                {isSceneActive && (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-500/20 border border-rose-500/40 text-rose-300 text-[10px] font-bold animate-pulse">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-rose-400 animate-ping" />
+                                    ĐANG PHÁT TRỰC TIẾP
+                                  </span>
+                                )}
+                              </div>
+
+                              {/* Storyboard Scene Markdown Body */}
+                              <div 
+                                className="text-sm text-slate-300 leading-relaxed space-y-3 font-sans select-text"
+                                dangerouslySetInnerHTML={{ __html: parseMarkdown(scene.content) }}
+                              />
+
+                              {/* Voiceover Quote Callout if detected */}
+                              {scene.voiceoverQuote && (
+                                <div className="mt-4 p-3 bg-amber-500/5 border-l-2 border-amber-500 rounded-r-xl flex items-start justify-between gap-3">
+                                  <div className="space-y-1">
+                                    <span className="text-[9px] font-mono uppercase tracking-widest text-amber-400 font-bold block">
+                                      🎙️ LỜI BÌNH LỒNG TIẾNG CHUẨN:
+                                    </span>
+                                    <p className="text-xs text-amber-200 italic font-medium">
+                                      &ldquo;{scene.voiceoverQuote}&rdquo;
+                                    </p>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => jumpToTimestamp(scene.startSec)}
+                                    className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500 text-amber-300 hover:text-slate-950 text-[10px] font-bold shrink-0 transition-all cursor-pointer"
+                                  >
+                                    ▶ Nghe câu này
+                                  </button>
+                                </div>
+                              )}
+
+                              {/* B-Roll Suggestion Callout if detected */}
+                              {scene.brollSuggestion && (
+                                <div className="mt-2.5 p-2.5 bg-purple-500/5 border border-purple-500/20 rounded-xl flex items-center gap-2 text-[11px] text-purple-300">
+                                  <Camera className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+                                  <span><strong>Gợi ý B-Roll:</strong> {scene.brollSuggestion}</span>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* MODE 2: LIVE SUBTITLE MATRIX 1:1 WITH AUDIO TIMESTAMPS */}
+                    {reviewSyncViewMode === 'subtitle-matrix' && (
+                      <div className="space-y-4">
+                        {/* Search Filter Bar */}
+                        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 p-3 bg-black/40 border border-white/5 rounded-2xl">
+                          <div className="relative flex-1">
+                            <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                            <input
+                              type="text"
+                              value={syncSearchQuery}
+                              onChange={(e) => setSyncSearchQuery(e.target.value)}
+                              placeholder="Tìm kiếm câu thoại hoặc từ khóa trong phụ đề..."
+                              className="w-full pl-9 pr-3 py-1.5 bg-[#050505] border border-white/10 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-amber-500/50"
+                            />
+                            {syncSearchQuery && (
+                              <button
+                                type="button"
+                                onClick={() => setSyncSearchQuery('')}
+                                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                          </div>
+                          
+                          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                            <span className="text-[11px] text-slate-400 font-mono">
+                              Hiển thị: <strong className="text-amber-300">{subtitleSegments.filter(s => !syncSearchQuery || s.text.toLowerCase().includes(syncSearchQuery.toLowerCase())).length}</strong>/{subtitleSegments.length} câu
+                            </span>
+
+                            <button
+                              type="button"
+                              onClick={() => handleRunSilenceDetection()}
+                              disabled={isDetectingSilence}
+                              className="px-3 py-1.5 bg-gradient-to-r from-sky-500/20 via-indigo-500/20 to-teal-500/20 hover:from-sky-500/30 hover:to-teal-500/30 border border-sky-400/40 hover:border-sky-300 rounded-xl text-sky-300 hover:text-white font-bold text-xs flex items-center gap-1.5 transition-all cursor-pointer shadow-sm disabled:opacity-50"
+                              title="Tự động phát hiện các đoạn im lặng trong file audio và đề xuất điều chỉnh thời gian phụ đề khớp theo từng khoảng lặng"
+                            >
+                              <Activity className={`w-3.5 h-3.5 text-sky-400 ${isDetectingSilence ? 'animate-spin' : ''}`} />
+                              <span>{isDetectingSilence ? 'Đang dò sóng âm...' : '⚡ Khớp Khoảng Lặng Audio (VAD)'}</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Subtitle Segments List */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5 max-h-[600px] overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-amber-500/20">
+                          {subtitleSegments
+                            .filter(seg => !syncSearchQuery || seg.text.toLowerCase().includes(syncSearchQuery.toLowerCase()) || (seg.translation && seg.translation.toLowerCase().includes(syncSearchQuery.toLowerCase())))
+                            .map((segment, idx) => {
+                              const isSegmentActive = isPlaying && currentAudioTime >= segment.start && currentAudioTime <= segment.end;
+                              const isEditing = editingSegmentIdx === idx;
+                              const segmentDuration = Math.max(0.1, segment.end - segment.start);
+                              const progressWithinSegment = isSegmentActive
+                                ? Math.min(100, Math.max(0, ((currentAudioTime - segment.start) / segmentDuration) * 100))
+                                : (currentAudioTime > segment.end ? 100 : 0);
+
+                              return (
+                                <div
+                                  key={idx}
+                                  className={`relative p-4 rounded-2xl border transition-all duration-200 flex flex-col justify-between gap-3 ${
+                                    isSegmentActive
+                                      ? 'bg-gradient-to-br from-amber-500/15 via-[#18140a] to-[#0c0c0c] border-amber-400 shadow-[0_0_20px_rgba(245,158,11,0.2)] ring-1 ring-amber-400/40'
+                                      : 'bg-[#090909] border-white/5 hover:border-amber-500/30'
+                                  }`}
+                                >
+                                  {/* Top Meta Bar */}
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-2">
+                                      <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold ${
+                                        isSegmentActive ? 'bg-amber-400 text-slate-950 font-black' : 'bg-white/10 text-slate-400'
+                                      }`}>
+                                        #{String(idx + 1).padStart(2, '0')}
+                                      </span>
+
+                                      <button
+                                        type="button"
+                                        onClick={() => jumpToTimestamp(segment.start)}
+                                        className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold flex items-center gap-1 transition-all cursor-pointer ${
+                                          isSegmentActive
+                                            ? 'bg-amber-500 text-slate-950 shadow-sm'
+                                            : 'bg-white/5 hover:bg-amber-500/20 text-amber-400 border border-white/5'
+                                        }`}
+                                        title={`Phát câu này (${segment.start.toFixed(2)}s -> ${segment.end.toFixed(2)}s)`}
+                                      >
+                                        <Play className="w-2.5 h-2.5 fill-current" />
+                                        <span>{segment.start.toFixed(1)}s ➔ {segment.end.toFixed(1)}s</span>
+                                      </button>
+                                    </div>
+
+                                    <div className="flex items-center gap-1">
+                                      <span className="text-[9px] font-mono text-slate-500">
+                                        {segmentDuration.toFixed(1)}s
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          if (isEditing) {
+                                            handleSaveInlineSubtitleEdit(idx, editingSegmentText);
+                                          } else {
+                                            setEditingSegmentIdx(idx);
+                                            setEditingSegmentText(segment.text);
+                                          }
+                                        }}
+                                        className="p-1 text-slate-500 hover:text-amber-400 rounded transition-colors cursor-pointer"
+                                        title={isEditing ? "Lưu thay đổi" : "Chỉnh sửa câu phụ đề này"}
+                                      >
+                                        {isEditing ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Edit3 className="w-3.5 h-3.5" />}
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {/* Subtitle Content / Inline Editor */}
+                                  {isEditing ? (
+                                    <div className="space-y-2">
+                                      <input
+                                        type="text"
+                                        value={editingSegmentText}
+                                        onChange={(e) => setEditingSegmentText(e.target.value)}
+                                        onKeyDown={(e) => {
+                                          if (e.key === 'Enter') {
+                                            handleSaveInlineSubtitleEdit(idx, editingSegmentText);
+                                          }
+                                        }}
+                                        className="w-full p-2 bg-[#040404] border border-amber-500 rounded-xl text-xs text-white focus:outline-none"
+                                        autoFocus
+                                      />
+                                      <div className="flex items-center justify-end gap-1.5">
+                                        <button
+                                          type="button"
+                                          onClick={() => setEditingSegmentIdx(null)}
+                                          className="px-2 py-0.5 text-[10px] text-slate-400 hover:text-white rounded"
+                                        >
+                                          Hủy
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleSaveInlineSubtitleEdit(idx, editingSegmentText)}
+                                          className="px-2.5 py-0.5 bg-amber-500 text-slate-950 font-bold text-[10px] rounded-lg shadow"
+                                        >
+                                          Lưu
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <div className="space-y-1">
+                                      <p className={`text-xs sm:text-sm font-sans font-medium leading-relaxed ${
+                                        isSegmentActive ? 'text-amber-200 font-bold' : 'text-slate-200'
+                                      }`}>
+                                        {segment.text}
+                                      </p>
+
+                                      {segment.translation && (
+                                        <p className="text-[11px] text-slate-400 italic">
+                                          {segment.translation}
+                                        </p>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {/* Bottom Progress & Jump Bar */}
+                                  <div className="space-y-1.5 pt-1">
+                                    {/* Segment Internal Progress Bar */}
+                                    <div className="w-full h-1 bg-white/5 rounded-full overflow-hidden">
+                                      <div 
+                                        className={`h-full transition-all duration-100 ${
+                                          isSegmentActive ? 'bg-amber-400' : 'bg-transparent'
+                                        }`}
+                                        style={{ width: `${progressWithinSegment}%` }}
+                                      />
+                                    </div>
+
+                                    <div className="flex items-center justify-between text-[10px] text-slate-500 font-mono">
+                                      <span>{segment.text.split(/\s+/).filter(Boolean).length} từ</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => jumpToTimestamp(segment.start)}
+                                        className="text-amber-400 hover:text-amber-300 font-bold flex items-center gap-1 cursor-pointer"
+                                      >
+                                        <Play className="w-2.5 h-2.5 fill-current" />
+                                        <span>Nghe đoạn này</span>
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* MODE 3: TELEPROMPTER KARA-SYNC STUDIO */}
+                    {reviewSyncViewMode === 'teleprompter' && (
+                      <div className="space-y-5">
+                        <div className="p-6 sm:p-8 bg-gradient-to-b from-[#0c0a06] to-[#040404] border border-amber-500/20 rounded-3xl space-y-6 shadow-2xl">
+                          <div className="flex items-center justify-between border-b border-white/5 pb-4">
+                            <div className="flex items-center gap-2">
+                              <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+                              <h4 className="text-xs font-mono uppercase tracking-[0.2em] text-amber-400 font-bold">
+                                TELEPROMPTER LỒNG TIẾNG STUDIO LIVE
+                              </h4>
+                            </div>
+                            <span className="text-[10px] font-mono text-slate-400">
+                              Nhấp vào câu bất kỳ để tua giọng đọc tới câu đó
+                            </span>
+                          </div>
+
+                          {/* Large Readable Teleprompter Flow */}
+                          <div className="space-y-4 max-h-[480px] overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-amber-500/30">
+                            {subtitleSegments.map((seg, sIdx) => {
+                              const isCurrent = isPlaying && currentAudioTime >= seg.start && currentAudioTime <= seg.end;
+                              const isPast = currentAudioTime > seg.end;
+
+                              return (
+                                <div
+                                  key={sIdx}
+                                  onClick={() => jumpToTimestamp(seg.start)}
+                                  className={`p-4 rounded-2xl transition-all duration-200 cursor-pointer select-none border ${
+                                    isCurrent
+                                      ? 'bg-amber-500/15 border-amber-400 text-amber-200 shadow-[0_0_20px_rgba(245,158,11,0.25)] scale-[1.01]'
+                                      : isPast
+                                      ? 'bg-black/30 border-white/5 text-slate-500 opacity-60 hover:opacity-90'
+                                      : 'bg-black/40 border-white/5 text-slate-300 hover:border-amber-500/30'
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between gap-2 mb-1.5">
+                                    <span className="text-[10px] font-mono font-bold text-amber-400">
+                                      #{String(sIdx + 1).padStart(2, '0')} • {seg.start.toFixed(1)}s - {seg.end.toFixed(1)}s
+                                    </span>
+                                    {isCurrent && (
+                                      <span className="px-2 py-0.2 bg-amber-400 text-slate-950 text-[9px] font-black uppercase rounded-full">
+                                        ĐANG ĐỌC
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className={`text-base sm:text-lg font-display font-medium leading-relaxed ${
+                                    isCurrent ? 'text-amber-300 font-bold text-xl' : 'text-slate-200'
+                                  }`}>
+                                    {seg.text}
+                                  </p>
+                                  {seg.translation && (
+                                    <p className="text-xs text-slate-400 italic mt-1 font-sans">
+                                      {seg.translation}
+                                    </p>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
                   </div>
                 </div>
 
@@ -9651,20 +9434,37 @@ export default function App() {
                             <p className="text-[11px] opacity-80 leading-snug">{health.description}</p>
                           </div>
                           
-                          {/* Optimization Trigger action button */}
-                          <button
-                            type="button"
-                            onClick={handleOptimizeScriptLength}
-                            disabled={isOptimizingScript || !editedScript.trim()}
-                            className={`w-full sm:w-auto px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 shadow-md active:scale-95 shrink-0 ${
-                              isOptimizingScript 
-                                ? 'bg-slate-800 text-slate-500 cursor-not-allowed animate-pulse border border-white/5'
-                                : 'bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-300 hover:to-amber-400 text-slate-950 shadow-[0_2px_10px_rgba(245,158,11,0.15)] hover:shadow-[0_4px_16px_rgba(245,158,11,0.25)] border border-amber-300/30'
-                            }`}
-                          >
-                            <Sparkles className={`w-3.5 h-3.5 ${isOptimizingScript ? 'animate-spin text-slate-500' : 'animate-pulse text-slate-950'}`} />
-                            <span>{isOptimizingScript ? 'Đang căn chỉnh...' : '🤖 Khớp Độ Dài AI'}</span>
-                          </button>
+                          {/* Action Buttons: Optimization & Smart QA */}
+                          <div className="flex items-center gap-2 w-full sm:w-auto shrink-0">
+                            <button
+                              type="button"
+                              onClick={handleCheckAndFixReviewAndSubtitles}
+                              disabled={isCheckingAndFixing || (!editedScript.trim() && !activeReview?.marketingScript)}
+                              className={`w-full sm:w-auto px-3.5 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 shadow-md active:scale-95 shrink-0 ${
+                                isCheckingAndFixing 
+                                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed animate-pulse border border-white/5'
+                                  : 'bg-gradient-to-r from-rose-500 to-amber-500 hover:from-rose-400 hover:to-amber-400 text-slate-950 shadow-[0_2px_10px_rgba(244,63,94,0.25)] hover:shadow-[0_4px_16px_rgba(244,63,94,0.35)] border border-rose-400/30'
+                              }`}
+                              title="Tự động phát hiện và sửa toàn diện chính tả, khử 100% giọng Bắc, lọc từ cấm TikTok và đồng bộ phụ đề"
+                            >
+                              <ShieldCheck className={`w-3.5 h-3.5 ${isCheckingAndFixing ? 'animate-spin text-slate-950' : 'text-slate-950'}`} />
+                              <span>{isCheckingAndFixing ? 'Đang sửa lỗi...' : '🛡️ Sửa Lỗi Toàn Diện'}</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={handleOptimizeScriptLength}
+                              disabled={isOptimizingScript || !editedScript.trim()}
+                              className={`w-full sm:w-auto px-3.5 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all duration-200 cursor-pointer flex items-center justify-center gap-1.5 shadow-md active:scale-95 shrink-0 ${
+                                isOptimizingScript 
+                                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed animate-pulse border border-white/5'
+                                  : 'bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-300 hover:to-amber-400 text-slate-950 shadow-[0_2px_10px_rgba(245,158,11,0.15)] hover:shadow-[0_4px_16px_rgba(245,158,11,0.25)] border border-amber-300/30'
+                              }`}
+                            >
+                              <Sparkles className={`w-3.5 h-3.5 ${isOptimizingScript ? 'animate-spin text-slate-500' : 'animate-pulse text-slate-950'}`} />
+                              <span>{isOptimizingScript ? 'Đang căn chỉnh...' : '🤖 Khớp Độ Dài AI'}</span>
+                            </button>
+                          </div>
                         </div>
                       );
                     })()}
@@ -9899,11 +9699,11 @@ export default function App() {
               </div>
               <div>
                 <h2 className="text-xs sm:text-sm font-display font-black uppercase tracking-widest text-slate-100 flex flex-wrap items-center gap-2">
-                  <span>Hệ Thống Sáng Tạo Nội Dung Video Tiếp Thị Đa Phương Tiện</span>
-                  <span className="text-[7.5px] font-mono font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded uppercase tracking-widest shadow-sm">AI STUDIO PRO v2.4</span>
+                  <span>Hệ Sinh Thái Sáng Tạo Video Tiếp Thị Đa Phương Tiện Đột Phá</span>
+                  <span className="text-[7.5px] font-mono font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded uppercase tracking-widest shadow-sm">AI STUDIO PRO V2.4</span>
                 </h2>
-                <p className="text-[10px] sm:text-[11px] text-slate-400 font-medium mt-1 leading-relaxed max-w-3xl">
-                  Nền tảng xử lý tín hiệu thông minh tích hợp thị giác máy tính UHD, công nghệ lồng tiếng phòng thu lập thể và hệ thống đồng bộ phụ đề động thời gian thực đỉnh cao.
+                <p className="text-[10.5px] sm:text-[11.5px] text-slate-300 font-medium mt-1.5 leading-relaxed max-w-3xl">
+                  Nền tảng trí tuệ nhân tạo toàn diện kiến tạo video review & affiliate triệu views — Tự động phân tích sản phẩm sắc nét, sáng tạo kịch bản bán hàng thôi miên, lồng tiếng truyền cảm chuẩn phòng thu và đồng bộ phụ đề động bắt mắt chuẩn xu hướng TikTok, Reels & Shorts.
                 </p>
               </div>
             </div>
@@ -10201,6 +10001,647 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* SFX STUDIO MATRIX MODAL */}
+      {isSFXModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-[#0b0b0d] border border-amber-500/30 rounded-3xl max-w-lg w-full p-6 shadow-2xl space-y-6 relative overflow-hidden">
+            <div className="absolute -right-12 -top-12 w-32 h-32 bg-amber-500/10 rounded-full blur-3xl pointer-events-none"></div>
+
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-2xl bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                  <Music className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white font-display">Ma Trận Hiệu Ứng Âm Thanh SFX</h3>
+                  <p className="text-xs text-slate-400">Bộ âm thanh tổng hợp Web Audio zero-latency đỉnh cao cho Creator</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsSFXModalOpen(false)}
+                className="w-8 h-8 rounded-full bg-white/5 hover:bg-white/10 flex items-center justify-center text-slate-400 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              {[
+                { type: 'chime' as const, label: '🔔 Chuông Chime', desc: 'Sáng bừng, tinh tế' },
+                { type: 'whoosh' as const, label: '💨 Vút Whoosh', desc: 'Chuyển cảnh nhanh' },
+                { type: 'pop' as const, label: '💥 Nổ Pop', desc: 'Nhấn mạnh điểm nhấn' },
+                { type: 'shutter' as const, label: '📸 Màn Chụp Shutter', desc: 'Chụp ảnh khoảnh khắc' },
+                { type: 'bell' as const, label: '🛎️ Chuông Vàng Bell', desc: 'Mua hàng, kêu gọi' },
+                { type: 'impact' as const, label: '⚡ Va Chạm Impact', desc: 'Kịch tính cao độ' },
+              ].map(sfx => (
+                <button
+                  key={sfx.type}
+                  type="button"
+                  onClick={() => playSynthesizedSFX(sfx.type, 0.9)}
+                  className="p-3.5 rounded-2xl bg-white/[0.03] hover:bg-amber-500/10 border border-white/5 hover:border-amber-500/30 flex flex-col items-center justify-center gap-1.5 transition-all text-center cursor-pointer group active:scale-95"
+                >
+                  <span className="text-xs font-bold text-slate-200 group-hover:text-amber-400">{sfx.label}</span>
+                  <span className="text-[9px] text-slate-500 group-hover:text-amber-500/70">{sfx.desc}</span>
+                  <span className="text-[8px] font-mono text-amber-500/80 bg-amber-500/10 px-2 py-0.5 rounded-full mt-1">Phát thử 🔊</span>
+                </button>
+              ))}
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-white/[0.02] border border-white/5 text-[11px] text-slate-400 leading-relaxed">
+              💡 <strong>Mẹo chuyên nghiệp:</strong> Các hiệu ứng âm thanh này được tổng hợp toán học trực tiếp qua Web Audio API, sẵn sàng phát tức thì mà không cần tải thêm bất kỳ file âm thanh nào từ bên ngoài!
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* KEYBOARD SHORTCUTS HELP MODAL */}
+      {isKeyboardHelpOpen && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-[#0b0b0d] border border-white/10 rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-6 relative overflow-hidden">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-2xl bg-white/10 text-white">
+                  <Keyboard className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white font-display">Phím Tắt Biên Tập Master</h3>
+                  <p className="text-xs text-slate-400">Tăng tốc độ làm việc như chuyên gia dựng phim</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsKeyboardHelpOpen(false)}
+                className="w-8 h-8 rounded-full bg-white/5 hover:bg-white/10 flex items-center justify-center text-slate-400 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              {[
+                { key: 'Space', desc: 'Phát / Tạm dừng xem trước video & giọng đọc' },
+                { key: '← / →', desc: 'Tua lùi / Tua tới 2 giây' },
+                { key: 'M', desc: 'Bật / Tắt tiếng âm thanh gốc' },
+                { key: 'S', desc: 'Mở nhanh Ma Trận SFX Studio' },
+                { key: 'H', desc: 'Bật / Tắt khung Hook Tiêu đề 3s' },
+                { key: '?', desc: 'Mở cửa sổ danh sách phím tắt' },
+              ].map(item => (
+                <div key={item.key} className="flex items-center justify-between p-2.5 rounded-xl bg-white/[0.02] border border-white/5">
+                  <span className="text-xs text-slate-300">{item.desc}</span>
+                  <kbd className="px-2 py-1 rounded bg-black border border-white/20 text-[10px] font-mono font-bold text-amber-400 shadow-sm">
+                    {item.key}
+                  </kbd>
+                </div>
+              ))}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setIsKeyboardHelpOpen(false)}
+              className="w-full py-2.5 rounded-xl bg-amber-500 text-black font-bold text-xs hover:bg-amber-400 transition-colors cursor-pointer"
+            >
+              Đã hiểu & Bắt đầu sáng tạo
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* AUTOMATIC AUDIO SILENCE & SPEECH ACTIVITY DETECTOR (VAD) MODAL */}
+      {isSilenceDetectModalOpen && silenceDetectResult && (
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto">
+          <div className="bg-[#0b0f14] border border-sky-500/30 rounded-3xl max-w-4xl w-full p-5 sm:p-6 shadow-[0_25px_80px_rgba(0,0,0,0.9),0_0_40px_rgba(14,165,233,0.15)] relative overflow-hidden max-h-[92vh] flex flex-col space-y-4">
+            <div className="absolute -right-20 -top-20 w-48 h-48 bg-gradient-to-br from-sky-500/20 via-indigo-500/10 to-teal-500/20 rounded-full blur-3xl pointer-events-none" />
+            <div className="absolute -left-20 -bottom-20 w-48 h-48 bg-gradient-to-tr from-emerald-500/15 via-sky-500/10 to-transparent rounded-full blur-3xl pointer-events-none" />
+
+            {/* Modal Header */}
+            <div className="flex items-center justify-between border-b border-white/10 pb-3.5 shrink-0 relative z-10">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-2xl bg-gradient-to-br from-sky-500 to-indigo-600 text-white shadow-lg shadow-sky-500/20">
+                  <Activity className="w-5 h-5 animate-pulse" />
+                </div>
+                <div>
+                  <h3 className="text-base sm:text-lg font-bold text-white font-display flex items-center gap-2">
+                    ⚡ Tự Động Khớp Phụ Đề Theo Khoảng Lặng Audio
+                    <span className="text-[9px] font-mono font-black uppercase tracking-wider bg-sky-500/20 text-sky-300 border border-sky-500/30 px-2 py-0.5 rounded-full">
+                      AI Voice VAD
+                    </span>
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Phân tích sóng âm thanh thực tế, nhận diện nhịp ngắt nghỉ/thở và đề xuất điều chỉnh mốc phụ đề chuẩn từng giây
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsSilenceDetectModalOpen(false)}
+                className="w-8 h-8 rounded-full bg-white/5 hover:bg-white/10 flex items-center justify-center text-slate-400 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Body Scrollable */}
+            <div className="overflow-y-auto space-y-4 pr-1 relative z-10 flex-1">
+              {/* Detection Sensitivity Tuning Bar */}
+              <div className="p-3.5 bg-black/60 border border-sky-500/20 rounded-2xl space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                  <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-sky-400 flex items-center gap-1.5">
+                    <SlidersHorizontal className="w-3.5 h-3.5 text-sky-400" />
+                    Căn chỉnh độ nhạy bóc tách sóng âm (Audio Tuning)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleRunSilenceDetection()}
+                    disabled={isDetectingSilence}
+                    className="self-end sm:self-auto px-3 py-1 bg-gradient-to-r from-sky-500 to-indigo-500 hover:from-sky-400 hover:to-indigo-400 text-white font-bold text-[10px] rounded-lg transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-sm"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${isDetectingSilence ? 'animate-spin' : ''}`} />
+                    <span>{isDetectingSilence ? 'Đang quét lại...' : 'Quét lại với cấu hình này'}</span>
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
+                  {/* Slider 1: Threshold dB */}
+                  <div className="space-y-1 bg-white/[0.02] p-2.5 rounded-xl border border-white/5">
+                    <div className="flex items-center justify-between text-[10px]">
+                      <span className="text-slate-300">Ngưỡng nhạy (Threshold)</span>
+                      <span className="font-mono font-bold text-sky-300 bg-sky-500/10 px-1.5 py-0.2 rounded border border-sky-500/20 text-[9px]">
+                        {silenceThresholdDb} dB
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-48"
+                      max="-20"
+                      step="1"
+                      value={silenceThresholdDb}
+                      onChange={(e) => setSilenceThresholdDb(parseInt(e.target.value, 10))}
+                      className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-sky-400"
+                    />
+                    <div className="flex justify-between text-[8px] font-mono text-slate-500">
+                      <span>Rất nhạy (-48dB)</span>
+                      <span>Lọc tạp âm (-20dB)</span>
+                    </div>
+                  </div>
+
+                  {/* Slider 2: Min Silence Duration */}
+                  <div className="space-y-1 bg-white/[0.02] p-2.5 rounded-xl border border-white/5">
+                    <div className="flex items-center justify-between text-[10px]">
+                      <span className="text-slate-300">Khoảng lặng tối thiểu</span>
+                      <span className="font-mono font-bold text-emerald-300 bg-emerald-500/10 px-1.5 py-0.2 rounded border border-emerald-500/20 text-[9px]">
+                        {minSilenceDuration.toFixed(2)}s
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.10"
+                      max="0.50"
+                      step="0.02"
+                      value={minSilenceDuration}
+                      onChange={(e) => setMinSilenceDuration(parseFloat(e.target.value))}
+                      className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-emerald-400"
+                    />
+                    <div className="flex justify-between text-[8px] font-mono text-slate-500">
+                      <span>Ngắt ngắn (0.10s)</span>
+                      <span>Dài (0.50s)</span>
+                    </div>
+                  </div>
+
+                  {/* Slider 3: Safety Padding */}
+                  <div className="space-y-1 bg-white/[0.02] p-2.5 rounded-xl border border-white/5">
+                    <div className="flex items-center justify-between text-[10px]">
+                      <span className="text-slate-300">Độ đệm bảo vệ (Padding)</span>
+                      <span className="font-mono font-bold text-amber-300 bg-amber-500/10 px-1.5 py-0.2 rounded border border-amber-500/20 text-[9px]">
+                        +{silencePaddingSec.toFixed(2)}s
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.02"
+                      max="0.12"
+                      step="0.01"
+                      value={silencePaddingSec}
+                      onChange={(e) => setSilencePaddingSec(parseFloat(e.target.value))}
+                      className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                    />
+                    <div className="flex justify-between text-[8px] font-mono text-slate-500">
+                      <span>Sát âm (0.02s)</span>
+                      <span>Êm ái (0.12s)</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Visual Waveform & Audio Spectrum Bar */}
+              <div className="p-3.5 bg-black/70 border border-white/10 rounded-2xl space-y-2.5">
+                <div className="flex items-center justify-between text-[10px]">
+                  <span className="font-mono text-slate-400 flex items-center gap-1.5 font-bold uppercase tracking-wider">
+                    <Activity className="w-3.5 h-3.5 text-sky-400" />
+                    Biểu đồ phổ sóng âm &amp; phân đoạn giọng nói thực tế:
+                  </span>
+                  <div className="flex items-center gap-3 text-[9px] font-mono">
+                    <span className="flex items-center gap-1 text-emerald-400">
+                      <span className="w-2 h-2 rounded bg-emerald-400 shadow-sm shadow-emerald-400/50" />
+                      🗣️ Giọng nói ({silenceDetectResult.speechIntervals.length})
+                    </span>
+                    <span className="flex items-center gap-1 text-slate-400">
+                      <span className="w-2 h-2 rounded bg-slate-700 border border-slate-500" />
+                      ⏸️ Khoảng lặng ({silenceDetectResult.silenceGaps.length})
+                    </span>
+                  </div>
+                </div>
+
+                {/* Waveform Canvas / SVG Container */}
+                <div className="h-14 w-full bg-[#05070a] rounded-xl p-1.5 flex items-end gap-0.5 border border-sky-500/20 overflow-hidden relative">
+                  {silenceDetectResult.waveformData && silenceDetectResult.waveformData.length > 0 ? (
+                    silenceDetectResult.waveformData.map((pt, pIdx) => {
+                      const heightPct = Math.max(8, Math.min(100, Math.round(pt.rms * 100)));
+                      return (
+                        <div
+                          key={pIdx}
+                          className={`flex-1 rounded-t transition-all ${
+                            pt.isSpeech
+                              ? 'bg-gradient-to-t from-emerald-600 to-teal-400 hover:brightness-125'
+                              : 'bg-slate-700/40 hover:bg-slate-600/60'
+                          }`}
+                          style={{ height: `${heightPct}%` }}
+                          title={`Thời điểm: ${pt.time}s | Biên độ: ${Math.round(pt.rms * 100)}% | ${pt.isSpeech ? 'Phát âm' : 'Khoảng lặng'}`}
+                        />
+                      );
+                    })
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-xs text-slate-500 font-mono">
+                      Đang dựng biểu đồ sóng âm thanh...
+                    </div>
+                  )}
+
+                  {/* Playhead indicator if audio is playing */}
+                  {isPlaying && audioDuration > 0 && (
+                    <div 
+                      className="absolute top-0 bottom-0 w-[2px] bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,1)] pointer-events-none transition-all duration-75"
+                      style={{ left: `${Math.min(100, Math.max(0, (currentAudioTime / audioDuration) * 100))}%` }}
+                    />
+                  )}
+                </div>
+
+                {/* Timeline timecode labels */}
+                <div className="flex justify-between text-[8px] font-mono text-slate-500 px-0.5">
+                  <span>00:00.0s</span>
+                  <span>{formatTimeCode((silenceDetectResult.totalDuration || 20) * 0.25, true)}</span>
+                  <span>{formatTimeCode((silenceDetectResult.totalDuration || 20) * 0.5, true)}</span>
+                  <span>{formatTimeCode((silenceDetectResult.totalDuration || 20) * 0.75, true)}</span>
+                  <span>{formatTimeCode(silenceDetectResult.totalDuration || 20, true)}</span>
+                </div>
+              </div>
+
+              {/* Statistics Metric Cards */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <div className="p-2.5 rounded-xl bg-white/[0.02] border border-white/5 space-y-0.5">
+                  <span className="text-[9px] font-mono text-slate-400 uppercase block">Tổng thời lượng:</span>
+                  <span className="text-sm font-mono font-bold text-white">
+                    {silenceDetectResult.totalDuration.toFixed(2)}s
+                  </span>
+                </div>
+                <div className="p-2.5 rounded-xl bg-emerald-500/[0.04] border border-emerald-500/20 space-y-0.5">
+                  <span className="text-[9px] font-mono text-emerald-400/80 uppercase block">Đoạn phát âm (Speech):</span>
+                  <span className="text-sm font-mono font-bold text-emerald-300">
+                    {silenceDetectResult.speechIntervals.length} phân đoạn
+                  </span>
+                </div>
+                <div className="p-2.5 rounded-xl bg-sky-500/[0.04] border border-sky-500/20 space-y-0.5">
+                  <span className="text-[9px] font-mono text-sky-400/80 uppercase block">Khoảng im lặng (Silence):</span>
+                  <span className="text-sm font-mono font-bold text-sky-300">
+                    {silenceDetectResult.silenceGaps.length} nhịp nghỉ
+                  </span>
+                </div>
+                <div className="p-2.5 rounded-xl bg-amber-500/[0.04] border border-amber-500/20 space-y-0.5">
+                  <span className="text-[9px] font-mono text-amber-400/80 uppercase block">Phụ đề đề xuất khớp:</span>
+                  <span className="text-sm font-mono font-bold text-amber-300">
+                    {silenceDetectResult.adjustments.length} câu thoại
+                  </span>
+                </div>
+              </div>
+
+              {/* Subtitle Alignment Comparison Table */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-xs font-bold text-slate-200 uppercase tracking-wide flex items-center gap-1.5 font-mono">
+                    <CheckCheck className="w-3.5 h-3.5 text-emerald-400" />
+                    Chi tiết đề xuất điều chỉnh thời gian theo từng phân cảnh ({silenceDetectResult.adjustments.length}):
+                  </h4>
+                  <span className="text-[10px] text-slate-400 font-mono">
+                    Độ lệch TB: <strong className="text-emerald-400">±{(silenceDetectResult.adjustments.reduce((acc, a) => acc + Math.abs(a.deltaStart) + Math.abs(a.deltaEnd), 0) / (silenceDetectResult.adjustments.length * 2 || 1)).toFixed(2)}s</strong>
+                  </span>
+                </div>
+
+                <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                  {silenceDetectResult.adjustments.map((adj) => {
+                    const hasChanged = Math.abs(adj.deltaStart) >= 0.05 || Math.abs(adj.deltaEnd) >= 0.05;
+                    const oldDuration = Math.max(0.1, adj.oldEnd - adj.oldStart);
+                    const newDuration = Math.max(0.1, adj.newEnd - adj.newStart);
+
+                    return (
+                      <div
+                        key={adj.index}
+                        className={`p-3 rounded-xl border transition-all ${
+                          hasChanged
+                            ? 'bg-[#060a0f] border-sky-500/25 hover:border-sky-500/40'
+                            : 'bg-[#080808] border-white/5 text-slate-400'
+                        }`}
+                      >
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                          <div className="space-y-1 min-w-0 flex-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 font-mono font-bold text-[9px] border border-sky-500/30">
+                                #{adj.index + 1}
+                              </span>
+                              <p className="text-xs text-white font-medium font-sans truncate">
+                                &ldquo;{adj.text}&rdquo;
+                              </p>
+                            </div>
+
+                            {/* Comparison timecodes */}
+                            <div className="flex flex-wrap items-center gap-3 text-[10px] font-mono">
+                              <span className="text-slate-400">
+                                Mốc cũ: <span className="line-through text-slate-500">{adj.oldStart.toFixed(2)}s &rarr; {adj.oldEnd.toFixed(2)}s</span> ({oldDuration.toFixed(2)}s)
+                              </span>
+                              <span className="text-emerald-300 font-bold">
+                                Khớp mới: <span className="text-emerald-400">{adj.newStart.toFixed(2)}s &rarr; {adj.newEnd.toFixed(2)}s</span> ({newDuration.toFixed(2)}s)
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Delta Badges & Listen Preview Button */}
+                          <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                            <div className="flex items-center gap-1 font-mono text-[9px]">
+                              <span className={`px-1.5 py-0.5 rounded border ${
+                                adj.deltaStart === 0 
+                                  ? 'bg-white/5 border-white/10 text-slate-400' 
+                                  : adj.deltaStart > 0 
+                                    ? 'bg-amber-500/10 border-amber-500/30 text-amber-300' 
+                                    : 'bg-teal-500/10 border-teal-500/30 text-teal-300'
+                              }`}>
+                                Bắt đầu: {adj.deltaStart >= 0 ? `+${adj.deltaStart.toFixed(2)}s` : `${adj.deltaStart.toFixed(2)}s`}
+                              </span>
+                              <span className={`px-1.5 py-0.5 rounded border ${
+                                adj.deltaEnd === 0 
+                                  ? 'bg-white/5 border-white/10 text-slate-400' 
+                                  : adj.deltaEnd > 0 
+                                    ? 'bg-amber-500/10 border-amber-500/30 text-amber-300' 
+                                    : 'bg-teal-500/10 border-teal-500/30 text-teal-300'
+                              }`}>
+                                Kết thúc: {adj.deltaEnd >= 0 ? `+${adj.deltaEnd.toFixed(2)}s` : `${adj.deltaEnd.toFixed(2)}s`}
+                              </span>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => handlePreviewSilenceSegment(adj.newStart, adj.newEnd)}
+                              className="px-2 py-1 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 hover:text-white border border-sky-500/30 text-[9px] font-bold flex items-center gap-1 transition-all cursor-pointer"
+                              title="Nghe thử đoạn audio khớp mốc mới này"
+                            >
+                              <Play className="w-2.5 h-2.5 fill-current" />
+                              <span>Nghe</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Actions Footer */}
+            <div className="pt-3 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0 relative z-10">
+              <span className="text-[10px] text-slate-400 font-sans flex items-center gap-1">
+                <Check className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                <span>Nhấn <strong>Áp Dụng Điều Chỉnh</strong> để cập nhật ngay vào phụ đề video &amp; timeline lồng tiếng.</span>
+              </span>
+
+              <div className="flex items-center gap-2.5 w-full sm:w-auto">
+                <button
+                  type="button"
+                  onClick={() => setIsSilenceDetectModalOpen(false)}
+                  className="w-full sm:w-auto px-4 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-slate-300 font-bold text-xs transition-colors cursor-pointer"
+                >
+                  Hủy Bỏ
+                </button>
+                <button
+                  type="button"
+                  onClick={handleApplySilenceAlignment}
+                  className="w-full sm:w-auto px-5 py-2 rounded-xl bg-gradient-to-r from-sky-500 via-teal-500 to-emerald-500 hover:brightness-110 text-slate-950 font-black text-xs transition-all shadow-lg shadow-sky-500/25 cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Sparkles className="w-3.5 h-3.5 fill-slate-950" />
+                  <span>Áp Dụng Điều Chỉnh Phụ Đề ⚡</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* SMART AUDIT & FIX REPORT MODAL */}
+      {isAuditReportOpen && lastAuditResult && (
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-[#0b0b0d] border border-amber-500/30 rounded-3xl max-w-2xl w-full p-6 shadow-2xl space-y-5 relative overflow-hidden max-h-[90vh] flex flex-col">
+            <div className="absolute -right-16 -top-16 w-40 h-40 bg-gradient-to-br from-amber-500/20 to-rose-500/20 rounded-full blur-3xl pointer-events-none"></div>
+
+            {/* Modal Header */}
+            <div className="flex items-center justify-between border-b border-white/10 pb-4 shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-2xl bg-gradient-to-br from-amber-500 to-rose-500 text-slate-950 shadow-md">
+                  <ShieldCheck className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white font-display flex items-center gap-2">
+                    Báo Cáo Kiểm Định &amp; Sửa Lỗi Chuyên Sâu
+                    <span className="text-[9px] font-mono font-black uppercase tracking-wider bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-full">
+                      Tự Động 100%
+                    </span>
+                  </h3>
+                  <p className="text-xs text-slate-400">Đã sửa triệt để chính tả, ngữ điệu Nam Bộ, từ cấm TikTok và mốc thời gian phụ đề</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsAuditReportOpen(false)}
+                className="w-8 h-8 rounded-full bg-white/5 hover:bg-white/10 flex items-center justify-center text-slate-400 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Scrollable Content Body */}
+            <div className="space-y-4 overflow-y-auto pr-1">
+              {/* Quality Score Progress Banner */}
+              <div className="p-4 rounded-2xl bg-gradient-to-r from-white/[0.04] to-white/[0.01] border border-white/10 flex flex-col sm:flex-row items-center justify-between gap-4">
+                <div className="space-y-1 text-center sm:text-left">
+                  <span className="text-[10px] font-mono uppercase tracking-widest text-slate-400 font-bold block">
+                    ĐIỂM CHẤT LƯỢNG NỘI DUNG (QUALITY SCORE)
+                  </span>
+                  <p className="text-xs text-slate-300">
+                    {lastAuditResult.optimizationSummary || "Kịch bản và phụ đề đã được chuẩn hóa đạt chuẩn phân phối video triệu view."}
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-3 shrink-0">
+                  <div className="text-center px-3 py-1.5 rounded-xl bg-slate-900 border border-white/10">
+                    <span className="text-[8.5px] text-slate-500 font-mono block uppercase">Ban đầu</span>
+                    <span className="text-base font-mono font-bold text-slate-400">{lastAuditResult.qualityScoreBefore || 75}/100</span>
+                  </div>
+                  <ChevronRight className="w-4 h-4 text-amber-500" />
+                  <div className="text-center px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30">
+                    <span className="text-[8.5px] text-emerald-400 font-mono block uppercase font-bold">Sau khi sửa</span>
+                    <span className="text-lg font-mono font-black text-emerald-400">{lastAuditResult.qualityScoreAfter || 99}/100</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* 4 Pillars Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+                <div className="p-3 rounded-2xl bg-white/[0.02] border border-white/5 space-y-1">
+                  <div className="flex items-center gap-1.5 text-amber-400 font-bold">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Chính Tả &amp; Cú Pháp</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Sửa toàn bộ lỗi chính tả tiếng Việt, dấu hỏi/ngã, lỗi gõ Telex và chuẩn hóa danh từ riêng sản phẩm.
+                  </p>
+                </div>
+
+                <div className="p-3 rounded-2xl bg-white/[0.02] border border-white/5 space-y-1">
+                  <div className="flex items-center gap-1.5 text-amber-400 font-bold">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Khử 100% Giọng Bắc</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Chuyển toàn bộ từ ngữ, hư từ miền Bắc sang phong cách Nam Bộ / Sài Gòn ngọt ngào, tự nhiên.
+                  </p>
+                </div>
+
+                <div className="p-3 rounded-2xl bg-white/[0.02] border border-white/5 space-y-1">
+                  <div className="flex items-center gap-1.5 text-amber-400 font-bold">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Chính Sách TikTok Shop</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Thanh lọc triệt để các từ cấm ("cam kết 100%", "trị dứt điểm", "rẻ nhất"...), an toàn tài khoản 100%.
+                  </p>
+                </div>
+
+                <div className="p-3 rounded-2xl bg-white/[0.02] border border-white/5 space-y-1">
+                  <div className="flex items-center gap-1.5 text-amber-400 font-bold">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Phụ Đề &amp; Khớp Timeline</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Tách câu ngắn 3-6 từ, xóa ký tự lạ, cân chỉnh mốc thời gian liên tục không bị trùng lặp giây.
+                  </p>
+                </div>
+              </div>
+
+              {/* Specific Fixed Issues List */}
+              {lastAuditResult.fixedIssues && lastAuditResult.fixedIssues.length > 0 && (
+                <div className="p-3.5 rounded-2xl bg-white/[0.02] border border-white/5 space-y-2">
+                  <span className="text-[10px] font-mono uppercase tracking-widest text-slate-400 font-bold block">
+                    CHI TIẾT CÁC HẠNG MỤC ĐÃ ĐƯỢC TỰ ĐỘNG KHẮC PHỤC ({lastAuditResult.fixedIssues.length}):
+                  </span>
+                  <ul className="space-y-1.5">
+                    {lastAuditResult.fixedIssues.map((issue, idx) => (
+                      <li key={idx} className="flex items-start gap-2 text-xs text-slate-300">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 mt-1.5 shrink-0"></span>
+                        <span className="leading-relaxed">{issue}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Actions Footer */}
+            <div className="pt-3 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
+              <span className="text-[10px] text-emerald-400 font-mono flex items-center gap-1">
+                <Check className="w-3 h-3 text-emerald-400" />
+                Toàn bộ dữ liệu đã được cập nhật trực tiếp vào kịch bản &amp; phụ đề!
+              </span>
+
+              <div className="flex items-center gap-2 w-full sm:w-auto">
+                <button
+                  type="button"
+                  onClick={() => setIsAuditReportOpen(false)}
+                  className="w-full sm:w-auto px-4 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-slate-200 font-bold text-xs transition-colors cursor-pointer"
+                >
+                  Đóng Báo Cáo
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsAuditReportOpen(false);
+                    // Trigger voice generation if available
+                    generateVoiceover();
+                  }}
+                  className="w-full sm:w-auto px-4 py-2 rounded-xl bg-gradient-to-r from-amber-500 to-rose-500 hover:from-amber-400 hover:to-rose-400 text-slate-950 font-black text-xs transition-all shadow-lg shadow-amber-500/20 cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Lồng Giọng AI Ngay 🎙️</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* SMART SUBTITLE SPELL CHECK TOAST NOTIFICATION */}
+      <AnimatePresence>
+        {subtitleSpellToast && subtitleSpellToast.show && (
+          <motion.div
+            initial={{ opacity: 0, y: 40, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 30, scale: 0.95 }}
+            className="fixed bottom-6 right-6 z-50 max-w-md w-full p-4 rounded-2xl bg-[#0e1311] border border-emerald-500/30 shadow-[0_10px_40px_rgba(0,0,0,0.8),0_0_20px_rgba(16,185,129,0.2)] text-slate-200 space-y-2.5 backdrop-blur-xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 shrink-0">
+                  <CheckCheck className="w-4 h-4" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-bold text-white font-display flex items-center gap-1.5">
+                    {subtitleSpellToast.title}
+                  </h4>
+                  <p className="text-[11px] text-slate-300 leading-snug mt-0.5">
+                    {subtitleSpellToast.message}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSubtitleSpellToast(null)}
+                className="w-6 h-6 rounded-lg bg-white/5 hover:bg-white/10 flex items-center justify-center text-slate-400 hover:text-white transition-colors cursor-pointer shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {subtitleSpellToast.fixes && subtitleSpellToast.fixes.length > 0 && (
+              <div className="p-2.5 rounded-xl bg-black/40 border border-white/5 max-h-36 overflow-y-auto space-y-1 text-[10px] font-mono">
+                <span className="text-[9px] uppercase font-bold text-emerald-400/80 block">
+                  Chi tiết các từ ngữ đã tối ưu ({subtitleSpellToast.fixes.length}):
+                </span>
+                {subtitleSpellToast.fixes.map((fix, idx) => (
+                  <div key={idx} className="flex items-start gap-1.5 text-slate-300">
+                    <span className="text-emerald-400 font-bold">•</span>
+                    <span className="leading-tight">{fix}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

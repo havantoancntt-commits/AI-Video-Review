@@ -1,6 +1,6 @@
 {
   "name": "AI Product Review Studio",
   "description": "An advanced AI-powered studio to analyze product videos, generate high-converting marketing scripts, synthesize professional voiceovers, and auto-sync beautiful dynamic subtitles with custom manual timeline editing.",
-  "requestFramePermissions": ["camera", "microphone"],
+  "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

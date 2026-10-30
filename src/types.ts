@@ -85,3 +85,57 @@ export interface UploadedVideoSegment {
   mimeType: string;
 }
 
+export type SubtitleFontId = 'vietnam' | 'montserrat' | 'lexend' | 'jakarta' | 'mono';
+
+export interface SubtitleFontOption {
+  id: SubtitleFontId;
+  name: string;
+  badge: string;
+  canvasFont: string;
+  cssClass: string;
+  description: string;
+}
+
+export const SUBTITLE_FONTS: SubtitleFontOption[] = [
+  {
+    id: 'vietnam',
+    name: 'Be Vietnam Pro',
+    badge: 'Chuẩn TV 100% 🇻🇳',
+    canvasFont: '"Be Vietnam Pro", "Segoe UI", Roboto, sans-serif',
+    cssClass: 'font-sub-vietnam',
+    description: 'Bộ phông chuẩn quốc gia thiết kế tối ưu cho tiếng Việt, không bao giờ lỗi dấu.'
+  },
+  {
+    id: 'montserrat',
+    name: 'Montserrat',
+    badge: 'TikTok Viral 🎬',
+    canvasFont: '"Montserrat", "Be Vietnam Pro", "Segoe UI", sans-serif',
+    cssClass: 'font-sub-montserrat',
+    description: 'Phông chữ đậm nét, nổi tiếng nhất trên TikTok & CapCut hiện đại.'
+  },
+  {
+    id: 'lexend',
+    name: 'Lexend',
+    badge: 'Siêu Nét ⚡',
+    canvasFont: '"Lexend", "Be Vietnam Pro", "Segoe UI", sans-serif',
+    cssClass: 'font-sub-lexend',
+    description: 'Thiết kế khoa học giúp mắt đọc phụ đề nhanh hơn 20% trên điện thoại.'
+  },
+  {
+    id: 'jakarta',
+    name: 'Jakarta Sans',
+    badge: 'Sang Trọng 💎',
+    canvasFont: '"Plus Jakarta Sans", "Be Vietnam Pro", sans-serif',
+    cssClass: 'font-sub-jakarta',
+    description: 'Đường nét hiện đại, cao cấp cho các thương hiệu đẳng cấp.'
+  },
+  {
+    id: 'mono',
+    name: 'JetBrains Mono',
+    badge: 'Cyberpunk 🤖',
+    canvasFont: '"JetBrains Mono", "Courier New", monospace',
+    cssClass: 'font-sub-mono',
+    description: 'Phong cách công nghệ, hacker cá tính cho video review thiết bị số.'
+  }
+];
+
