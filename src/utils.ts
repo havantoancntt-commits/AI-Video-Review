@@ -675,6 +675,22 @@ const VIETNAMESE_SPELL_RULES: Array<{ pattern: RegExp; replacement: string | ((m
   { pattern: /\brấtt\b/gi, replacement: 'rất', reason: "Sửa lỗi nhân đôi ký tự 'rấtt' -> 'rất'" },
   { pattern: /\bxịnn\b/gi, replacement: 'xịn', reason: "Sửa lỗi nhân đôi ký tự 'xịnn' -> 'xịn'" },
 
+  // Sửa lỗi gõ dính phím, lỗi OCR hoặc phiên âm món ăn & ẩm thực
+  { pattern: /\bmđóm\b/gi, replacement: 'món', reason: "Sửa lỗi gõ/nhận diện sai 'mđóm' -> 'món'" },
+  { pattern: /\bmđon\b/gi, replacement: 'món', reason: "Sửa lỗi nhận diện 'mđon' -> 'món'" },
+  { pattern: /\bmđom\b/gi, replacement: 'món', reason: "Sửa lỗi nhận diện 'mđom' -> 'món'" },
+  { pattern: /\bliu r\.?u\b/gi, replacement: 'liu riu', reason: "Sửa chính tả nấu nướng 'liu riu'" },
+  { pattern: /\bliuriu\b/gi, replacement: 'liu riu', reason: "Tách từ 'liu riu'" },
+  { pattern: /\bmiếngchuối\b/gi, replacement: 'miếng chuối', reason: "Tách từ dính phím 'miếng chuối'" },
+  { pattern: /\bchuốinam\b/gi, replacement: 'chuối nam', reason: "Tách từ dính phím 'chuối nam'" },
+  { pattern: /\bchuốixiêm\b/gi, replacement: 'chuối xiêm', reason: "Tách từ dính phím 'chuối xiêm'" },
+  { pattern: /\bbánhchuối\b/gi, replacement: 'bánh chuối', reason: "Tách từ dính phím 'bánh chuối'" },
+  { pattern: /\bmónăn\b/gi, replacement: 'món ăn', reason: "Tách từ dính phím 'món ăn'" },
+  { pattern: /\bthơmngon\b/gi, replacement: 'thơm ngon', reason: "Tách từ dính phím 'thơm ngon'" },
+  { pattern: /\bbéongậy\b/gi, replacement: 'béo ngậy', reason: "Tách từ dính phím 'béo ngậy'" },
+  { pattern: /\bgiònrụm\b/gi, replacement: 'giòn rụm', reason: "Tách từ dính phím 'giòn rụm'" },
+  { pattern: /\bđậmđà\b/gi, replacement: 'đậm đà', reason: "Tách từ dính phím 'đậm đà'" },
+
   // 6. Modern Standard Vietnamese Tone Placement (Quy chuẩn vị trí dấu thanh Bộ GD&ĐT)
   { pattern: /\bhoà\b/gi, replacement: 'hòa', reason: "Chuẩn hóa vị trí dấu thanh: 'hòa'" },
   { pattern: /\bhoá\b/gi, replacement: 'hóa', reason: "Chuẩn hóa vị trí dấu thanh: 'hóa'" },

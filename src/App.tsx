@@ -3995,7 +3995,7 @@ export default function App() {
                       if (isElementCurrent) {
                         ctx.save();
                         ctx.translate(startX + wordOnlyWidth / 2, currentY);
-                        ctx.scale(1.20, 1.20);
+                        ctx.scale(1.08, 1.08);
                         ctx.textAlign = 'center';
                         ctx.strokeText(cleanWord, 0, 0);
                         ctx.restore();
@@ -4009,7 +4009,7 @@ export default function App() {
                       if (isElementCurrent) {
                         ctx.save();
                         ctx.translate(startX + wordOnlyWidth / 2, currentY);
-                        ctx.scale(1.20, 1.20);
+                        ctx.scale(1.08, 1.08);
                         ctx.textAlign = 'center';
                         ctx.strokeText(cleanWord, 0, 0);
                         ctx.restore();
@@ -4033,7 +4033,7 @@ export default function App() {
                     if (isElementCurrent) {
                       ctx.save();
                       ctx.translate(startX + wordOnlyWidth / 2, currentY);
-                      ctx.scale(1.20, 1.20);
+                      ctx.scale(1.08, 1.08);
                       ctx.textAlign = 'center';
                       ctx.fillText(cleanWord, 0, 0);
                       ctx.restore();
@@ -6521,13 +6521,13 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                         SUBTITLE_FONTS.find(f => f.id === subtitleFontFamily)?.cssClass || 'font-sub-vietnam'
                       } ${
                         subtitleStyle === 'tiktok'
-                          ? `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-[12.5px] sm:text-[14px] md:text-[15px] px-3 py-1.5 rounded tracking-wide font-black`
+                          ? `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-[13px] sm:text-[14.5px] md:text-[16px] px-3.5 py-1.5 rounded tracking-normal font-black`
                           : subtitleStyle === 'capcut'
-                            ? `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-white text-[12px] sm:text-[13.5px] bg-[#0c0c0ced]/95 border border-white/15 shadow-[0_8px_24px_rgba(0,0,0,0.95)] px-4.5 py-2.5 rounded-[14px] font-black max-w-[92%] leading-relaxed tracking-wide backdrop-blur-[6px]`
+                            ? `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-white text-[12px] sm:text-[13.5px] bg-[#0c0c0ced]/95 border border-white/15 shadow-[0_8px_24px_rgba(0,0,0,0.95)] px-4.5 py-2.5 rounded-[14px] font-black max-w-[92%] leading-relaxed tracking-normal backdrop-blur-[6px]`
                             : subtitleStyle === 'cyberpunk'
-                              ? 'text-[11px] sm:text-[12.5px] font-mono tracking-wider bg-[#020202e0]/95 px-3 py-2 border-2 border-[#ec4899] shadow-[0_0_15px_rgba(236,72,153,0.7)] font-black uppercase rounded-lg'
+                              ? 'text-[11px] sm:text-[12.5px] font-mono tracking-wide bg-[#020202e0]/95 px-3 py-2 border-2 border-[#ec4899] shadow-[0_0_15px_rgba(236,72,153,0.7)] font-black uppercase rounded-lg'
                               : subtitleStyle === 'neon'
-                                ? `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-[11.5px] sm:text-[13px] tracking-wide bg-[#d946ef]/10 border-2 border-[#d946ef] drop-shadow-[0_0_15px_rgba(217,70,239,0.85)] shadow-[0_0_10px_rgba(255,255,255,0.25)] px-4 py-2 rounded-2xl font-black backdrop-blur-[4px]`
+                                ? `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-[11.5px] sm:text-[13px] tracking-normal bg-[#d946ef]/10 border-2 border-[#d946ef] drop-shadow-[0_0_15px_rgba(217,70,239,0.85)] shadow-[0_0_10px_rgba(255,255,255,0.25)] px-4 py-2 rounded-2xl font-black backdrop-blur-[4px]`
                                 : `${subtitleCase === 'uppercase' ? 'uppercase' : ''} text-slate-50 text-[11.5px] sm:text-[13px] font-bold [text-shadow:_0_2px_4px_rgba(0,0,0,1),_0_0_12px_rgba(0,0,0,0.85)] max-w-[85%] border-b-2 border-amber-500/90 pb-1.5 px-3`
                       }`}
                     >
@@ -6536,7 +6536,7 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                         if (!wordHighlightEnabled || !activeSubtitle) {
                           return (
                             <div className="flex flex-col items-center justify-center">
-                              <span>{formattedActiveText}</span>
+                              <span className="subtitle-word-container">{formattedActiveText}</span>
                               {bilingualEnabled && activeSubtitle?.translation && (
                                 <div className={`mt-2 text-[10px] sm:text-[11.5px] font-sans font-medium opacity-90 max-w-[90%] ${
                                   subtitleStyle === 'tiktok' ? 'text-white border-t border-white/5 pt-1.5 w-full' :
@@ -6568,31 +6568,31 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
 
                         return (
                           <div className="flex flex-col items-center justify-center">
-                            <span className="flex flex-wrap items-center justify-center gap-x-1 sm:gap-x-1.5 leading-relaxed">
+                            <span className="subtitle-word-container">
                               {words.map((word, idx) => {
                                 const isCurrent = idx === currentWordIdx;
-                                let wordClass = "transition-all duration-150 inline-block ";
+                                let wordClass = "subtitle-word-item transition-all duration-150 ";
                                 
                                 if (subtitleStyle === 'tiktok') {
                                   wordClass += isCurrent 
-                                    ? "text-[#ffe600] scale-112 [text-shadow:_0_2px_0_#000,_0_-2px_0_#000,_2px_0_#000,_-2px_0_#000,_1.5px_1.5px_0_#000,_-1.5px_-1.5px_0_#000,_0_0_12px_rgba(255,230,0,0.85)] font-black"
-                                    : "text-white opacity-85 [text-shadow:_0_1.5px_0_#000,_0_-1.5px_0_#000,_1.5px_0_#000,_-1.5px_0_#000]";
+                                    ? "text-[#ffe600] z-10 [text-shadow:_0_2px_0_#000,_0_-2px_0_#000,_2px_0_#000,_-2px_0_#000,_1.5px_1.5px_0_#000,_-1.5px_-1.5px_0_#000,_0_0_12px_rgba(255,230,0,0.85)] font-black"
+                                    : "text-white opacity-90 [text-shadow:_0_1.5px_0_#000,_0_-1.5px_0_#000,_1.5px_0_#000,_-1.5px_0_#000]";
                                 } else if (subtitleStyle === 'capcut') {
                                   wordClass += isCurrent
-                                    ? "text-[#ffe600] scale-110 drop-shadow-[0_0_8px_rgba(255,230,0,0.9)] font-black"
-                                    : "text-white opacity-60 font-black";
+                                    ? "text-[#ffe600] z-10 drop-shadow-[0_0_8px_rgba(255,230,0,0.9)] font-black"
+                                    : "text-white opacity-70 font-black";
                                 } else if (subtitleStyle === 'cyberpunk') {
                                   wordClass += isCurrent
-                                    ? "text-[#ec4899] scale-112 [text-shadow:_1.5px_1.5px_0_#22d3ee] font-black"
-                                    : "text-[#22d3ee] opacity-70 font-bold";
+                                    ? "text-[#ec4899] z-10 [text-shadow:_1.5px_1.5px_0_#22d3ee] font-black"
+                                    : "text-[#22d3ee] opacity-75 font-bold";
                                 } else if (subtitleStyle === 'neon') {
                                   wordClass += isCurrent
-                                    ? "text-[#ffe600] scale-115 drop-shadow-[0_0_15px_rgba(255,230,0,0.95)] [text-shadow:_0_0_6px_#fff] font-black"
-                                    : "text-white opacity-60 font-bold [text-shadow:_0_0_4px_rgba(255,255,255,0.4)]";
+                                    ? "text-[#ffe600] z-10 drop-shadow-[0_0_15px_rgba(255,230,0,0.95)] [text-shadow:_0_0_6px_#fff] font-black"
+                                    : "text-white opacity-70 font-bold [text-shadow:_0_0_4px_rgba(255,255,255,0.4)]";
                                 } else {
                                   wordClass += isCurrent
-                                    ? "text-amber-400 scale-110 font-bold underline decoration-amber-400 decoration-2 underline-offset-4"
-                                    : "text-slate-300 opacity-60 font-normal";
+                                    ? "text-amber-400 z-10 font-bold underline decoration-amber-400 decoration-2 underline-offset-4"
+                                    : "text-slate-300 opacity-70 font-normal";
                                 }
 
                                 return (
@@ -6600,8 +6600,9 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                                     key={idx}
                                     className={wordClass}
                                     style={{
-                                      transform: 'none',
-                                      transitionProperty: 'color, opacity, text-shadow, filter'
+                                      transform: isCurrent ? 'scale(1.08)' : 'scale(1)',
+                                      display: 'inline-block',
+                                      transitionProperty: 'color, opacity, text-shadow, filter, transform'
                                     }}
                                   >
                                     {word}

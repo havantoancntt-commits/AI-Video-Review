@@ -10,25 +10,47 @@
   --color-brand-accent: #f43f5e; /* Rose */
 }
 
-/* Subtitle Font Family Specialized Utility Classes */
+/* Subtitle Font Family Specialized Utility Classes - 100% Vietnamese Diacritics Compliant */
 .font-sub-vietnam {
-  font-family: "Be Vietnam Pro", "Segoe UI", sans-serif !important;
+  font-family: "Be Vietnam Pro", "Plus Jakarta Sans", "Segoe UI", sans-serif !important;
 }
 
 .font-sub-montserrat {
-  font-family: "Montserrat", "Be Vietnam Pro", "Segoe UI", sans-serif !important;
+  font-family: "Montserrat", "Be Vietnam Pro", "Plus Jakarta Sans", "Segoe UI", sans-serif !important;
 }
 
 .font-sub-lexend {
-  font-family: "Lexend", "Be Vietnam Pro", "Segoe UI", sans-serif !important;
+  font-family: "Lexend", "Be Vietnam Pro", "Plus Jakarta Sans", "Segoe UI", sans-serif !important;
 }
 
 .font-sub-jakarta {
-  font-family: "Plus Jakarta Sans", "Be Vietnam Pro", sans-serif !important;
+  font-family: "Plus Jakarta Sans", "Be Vietnam Pro", "Segoe UI", sans-serif !important;
 }
 
 .font-sub-mono {
-  font-family: "JetBrains Mono", "Courier New", monospace !important;
+  font-family: "JetBrains Mono", "Be Vietnam Pro", "Courier New", monospace !important;
+}
+
+/* Ensure subtitle words never overlap or lose spacing when animated */
+.subtitle-word-container {
+  display: inline-flex !important;
+  flex-wrap: wrap !important;
+  align-items: center !important;
+  justify-content: center !important;
+  column-gap: 0.38em !important;
+  row-gap: 0.2em !important;
+  word-spacing: 0.15em !important;
+  letter-spacing: 0.015em !important;
+  text-rendering: optimizeLegibility !important;
+  -webkit-font-smoothing: antialiased !important;
+}
+
+.subtitle-word-item {
+  display: inline-block !important;
+  position: relative !important;
+  white-space: nowrap !important;
+  transform-origin: center center !important;
+  padding: 0 0.04em !important;
 }
 
 /* Base typography setup: Be Vietnam Pro + Plus Jakarta Sans for flawless Vietnamese accents */
