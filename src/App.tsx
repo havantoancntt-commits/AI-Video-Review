@@ -778,6 +778,21 @@ export default function App() {
   // Theme state: dark or light
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
 
+  // Server & Gemini Engine Status
+  const [systemStatus, setSystemStatus] = useState<{
+    geminiStatus: string;
+    defaultModel: string;
+    ttsModel: string;
+    message: string;
+  } | null>(null);
+
+  useEffect(() => {
+    fetch('/api/system-status')
+      .then(r => r.json())
+      .then(data => setSystemStatus(data))
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     const savedTheme = localStorage.getItem('review_studio_theme') as 'dark' | 'light' | null;
     if (savedTheme) {
@@ -4997,8 +5012,23 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                 Review<span className="text-amber-500 font-bold ml-0.5">Studio AI</span>
               </span>
               <span className="hidden xs:inline-block px-1.5 py-0.5 rounded-full text-[8px] font-mono font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20 whitespace-nowrap">
-                PRO V2.4
+                TOP 1 STUDIO 2026
               </span>
+              {systemStatus && (
+                <span 
+                  className={`hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[8px] font-mono font-semibold border ${
+                    systemStatus.geminiStatus === 'connected'
+                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                      : (systemStatus.geminiStatus === 'invalid_oauth_token' 
+                          ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                          : 'bg-blue-500/10 text-blue-400 border-blue-500/20')
+                  }`}
+                  title={systemStatus.message}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${systemStatus.geminiStatus === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></span>
+                  {systemStatus.geminiStatus === 'connected' ? 'Gemini 3.8 Flash' : 'AI Studio Engine'}
+                </span>
+              )}
             </div>
             <div className="text-[9px] text-slate-500 font-medium flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0 animate-pulse"></span>

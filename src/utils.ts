@@ -5,6 +5,17 @@
 export function pcmToWav(base64Pcm: string, sampleRate: number = 24000): string {
   try {
     const binaryString = atob(base64Pcm);
+    
+    // If the data already contains a RIFF header (standard Gemini 3.8 Flash Lite TTS unary output), do not add another header!
+    if (binaryString.length >= 12 && binaryString.slice(0, 4) === 'RIFF') {
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type: 'audio/wav' });
+      return URL.createObjectURL(blob);
+    }
+
     const len = binaryString.length;
     const buffer = new ArrayBuffer(44 + len);
     const view = new DataView(buffer);
