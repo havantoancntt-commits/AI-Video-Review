@@ -1,5 +1,6 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
@@ -13,9 +14,9 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
-// Set up JSON body parser with increased limit to handle video base64 uploads
-app.use(express.json({ limit: "300mb" }));
-app.use(express.urlencoded({ limit: "300mb", extended: true }));
+// Set up JSON body parser with increased limit to handle video uploads up to 1 GB
+app.use(express.json({ limit: "1024mb" }));
+app.use(express.urlencoded({ limit: "1024mb", extended: true }));
 
 // Helper function to lazily initialize the Gemini client so it does not crash if keys are missing
 let googleAi: GoogleGenAI | null = null;
@@ -31,7 +32,9 @@ function getGoogleAI(): GoogleGenAI | null {
     try {
       googleAi = new GoogleGenAI({
         apiKey: key.trim(),
+        apiVersion: "v1alpha",
         httpOptions: {
+          apiVersion: "v1alpha",
           headers: {
             'User-Agent': 'aistudio-build',
           }
@@ -824,10 +827,8 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
     // Perform ultimate phonetic preprocessing before TTS synthesis for maximum beauty (skip for English text)
     const phoneticOptimizedText = isEnglish ? cleanSpeechText : sanitizeTextForVietnameseTTS(cleanSpeechText);
 
-    // Explicit voice style prompt directive to permanently enforce Southern Vietnamese accent
-    const speechPromptText = isEnglish
-      ? phoneticOptimizedText
-      : `Say in an authentic, natural, sweet Southern Vietnamese (Saigon / Nam Bộ) accent, with friendly, warm, melodious Southern intonation: ${phoneticOptimizedText}`;
+    // Pure speech text without meta-prompts so the voiceover only narrates the exact intended script
+    const pureSpeechText = phoneticOptimizedText;
 
     let base64Audio: string | null = null;
     let delay = 1000;
@@ -841,7 +842,21 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
 
           const response = await ai.models.generateContent({
             model: ttsModel,
-            contents: [{ parts: [{ text: speechPromptText }] }],
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: pureSpeechText,
+                    speechMetadata: {
+                      style: isEnglish 
+                        ? "Natural, clear, professional voiceover narrator" 
+                        : "Authentic, sweet Southern Vietnamese (Saigon / Nam Bộ) accent, warm, friendly, melodious intonation",
+                    },
+                  },
+                ],
+              },
+            ],
             config: {
               responseModalities: ["AUDIO"],
               speechConfig: {
@@ -861,6 +876,7 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
           }
         } catch (apiError: any) {
           const errMsg = apiError?.message || String(apiError);
+          console.error(`[TTS-ERROR-TRACE] Lần ${i + 1}:`, errMsg, apiError?.status || '');
           const match = errMsg.match(/Please retry in (\d+(?:\.\d+)?)s/i);
           let waitSec = 0;
           if (match && match[1]) {

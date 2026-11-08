@@ -15,8 +15,15 @@
       rel="stylesheet" 
     />
   </head>
-  <body>
-    <div id="root"></div>
+  <body style="background-color: #050505; color: #f8fafc; margin: 0; min-height: 100vh; overflow-x: hidden;">
+    <div id="root">
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;background-color:#050505;color:#e2e8f0;font-family:system-ui,-apple-system,sans-serif;padding:20px;text-align:center;">
+        <div style="width:48px;height:48px;border:3px solid rgba(245,158,11,0.2);border-top-color:#f59e0b;border-radius:50%;animation:studioSpin 0.75s linear infinite;"></div>
+        <p style="margin-top:16px;font-size:13px;font-weight:700;letter-spacing:0.08em;color:#f59e0b;text-transform:uppercase;">Đang Khởi Động Review Studio AI...</p>
+        <span style="font-size:11px;color:#64748b;margin-top:4px;">Chuẩn bị giao diện làm việc thông minh 2026</span>
+        <style>@keyframes studioSpin { to { transform: rotate(360deg); } }</style>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

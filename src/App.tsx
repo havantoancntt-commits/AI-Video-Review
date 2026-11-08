@@ -109,7 +109,7 @@ async function safeParseJSON(response: Response, defaultError: string): Promise<
       throw new Error("Máy chủ ứng dụng đang trong quá trình khởi tạo hoặc cập nhật mã nguồn dự án. Vui lòng đợi từ 5-10 giây rồi thực hiện thao tác lại.");
     }
     if (text.includes("Payload Too Large") || text.includes("413") || response.status === 413) {
-      throw new Error("Kích thước video quá lớn để truyền tải trực tiếp qua API. Vui lòng nén video hoặc tải lên một tệp nhỏ hơn (dưới 300MB) để hệ thống xử lý tối ưu.");
+      throw new Error("Kích thước video quá lớn để truyền tải trực tiếp qua API. Vui lòng tải lên tệp dưới 1 GB để hệ thống xử lý tối ưu.");
     }
     if (text.includes("Worker threw exception") || text.includes("Error 1101") || text.includes("workers.dev") || text.includes("cloudflare")) {
       throw new Error("Máy chủ Cloudflare Worker chưa cấu hình biến môi trường bí mật GEMINI_API_KEY hoặc chưa cấu hình API routes. Hãy thêm GEMINI_API_KEY vào mục Settings > Variables and Secrets trên Cloudflare Dashboard.");
@@ -794,16 +794,24 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const savedTheme = localStorage.getItem('review_studio_theme') as 'dark' | 'light' | null;
-    if (savedTheme) {
-      setTheme(savedTheme);
+    try {
+      const savedTheme = localStorage.getItem('review_studio_theme') as 'dark' | 'light' | null;
+      if (savedTheme) {
+        setTheme(savedTheme);
+      }
+    } catch (e) {
+      // localStorage may be disabled in restricted iframe sandboxes
     }
   }, []);
 
   const toggleTheme = () => {
     const nextTheme = theme === 'dark' ? 'light' : 'dark';
     setTheme(nextTheme);
-    localStorage.setItem('review_studio_theme', nextTheme);
+    try {
+      localStorage.setItem('review_studio_theme', nextTheme);
+    } catch (e) {
+      // Ignore storage restrictions
+    }
   };
   
   // UHD Video Color & HDR Optimization States
@@ -1517,17 +1525,49 @@ export default function App() {
       // Clean name for hook, remove bracket annotations, keep it neat
       const cleanName = rawName.replace(/\(.*?\)/g, '').trim();
       const hooks = [
-        `Trời đất ơi, đừng vội mua ${cleanName} nếu cả nhà chưa xem hết clip này nha...`,
-        `Sự thật cực kỳ đắt giá về em ${cleanName} mà người bán không bao giờ nói cho bạn biết...`,
-        `Bình tĩnh! Có một cảnh báo cực kỳ quan trọng về thiết kế của ${cleanName} nè...`,
-        `Nhiều người tốn tiền oan uổng cho ${cleanName}, đây mới là trải nghiệm thực tế của mình...`,
-        `Bữa nay mình bóc phốt chân thực xem ${cleanName} có đáng đồng tiền bát gạo như lời đồn không nha...`,
-        `Nếu đang định sắm ${cleanName} thì dừng lại ba giây coi kỹ cái này giúp mình nheng...`
+        {
+          spoken: `Trời đất ơi, đừng vội mua ${cleanName} nếu cả nhà chưa xem hết clip này nha...`,
+          banner: `CẢNH BÁO: ĐỪNG VỘI MUA ${cleanName.toUpperCase()} NẾU CHƯA XEM HẾT CLIP!`
+        },
+        {
+          spoken: `Sự thật cực kỳ đắt giá về em ${cleanName} mà người bán không bao giờ nói cho bạn biết...`,
+          banner: `SỰ THẬT CỰC ĐẮT GIÁ VỀ ${cleanName.toUpperCase()} ĐÃ ĐƯỢC TIẾT LỘ!`
+        },
+        {
+          spoken: `Bình tĩnh! Có một cảnh báo cực kỳ quan trọng về thiết kế của ${cleanName} nè...`,
+          banner: `BÌNH TĨNH: CẢNH BÁO ĐẶC BIỆT VỀ ${cleanName.toUpperCase()}!`
+        },
+        {
+          spoken: `Nhiều người tốn tiền oan uổng cho ${cleanName}, đây mới là trải nghiệm thực tế của mình...`,
+          banner: `ĐỪNG TỐN TIỀN OAN UỔNG VÌ ${cleanName.toUpperCase()}, XEM NGAY!`
+        },
+        {
+          spoken: `Bữa nay mình bóc phốt chân thực xem ${cleanName} có đáng đồng tiền bát gạo như lời đồn không nha...`,
+          banner: `BÓC PHỐT CHÂN THỰC ${cleanName.toUpperCase()} CÓ THẬT SỰ TỐT KHÔNG?`
+        },
+        {
+          spoken: `Nếu đang định sắm ${cleanName} thì dừng lại ba giây coi kỹ cái này giúp mình nheng...`,
+          banner: `DỪNG LẠI 3 GIÂY NẾU BẠN ĐANG ĐỊNH MUA ${cleanName.toUpperCase()}!`
+        }
       ];
-      const randomHook = hooks[Math.floor(Math.random() * hooks.length)];
-      // Remove any existing Hook marker to avoid piling up
-      const cleanedText = modified.replace(/^\[SIÊU HOOK TRIỆU VIEW\]\s*.*?\.\.\.\s*/gi, '');
-      modified = `[SIÊU HOOK TRIỆU VIEW] ${randomHook} ${cleanedText}`;
+      const selected = hooks[Math.floor(Math.random() * hooks.length)];
+
+      // Cleanly strip any existing [SIÊU HOOK...] or [HOOK...] tag AND its opening hook text
+      let cleanedText = modified.replace(/^\[(?:SIÊU HOOK(?: TRIỆU VIEW)?|HOOK)[^\]]*\]\s*.*?(?:\.\.\.|[.?!])\s*/gis, '');
+
+      // If there was no tag, replace any introductory question/exclamation sentence to avoid stacking double hooks
+      if (cleanedText === modified) {
+        const firstSentenceMatch = modified.match(/^([^.?!…]+[.?!…]+(?:\.\.\.)?)\s*(.*)$/s);
+        if (firstSentenceMatch && /^(Có bao giờ|Bạn có|Đừng|Ai cũng|Nếu bạn|Trời đất|Sự thật|Cảnh báo|Bình tĩnh)/i.test(firstSentenceMatch[1].trim())) {
+          cleanedText = firstSentenceMatch[2].trim();
+        }
+      }
+
+      modified = `[SIÊU HOOK TRIỆU VIEW] ${selected.spoken} ${cleanedText.trim()}`;
+
+      // Synchronize the Hook Banner simultaneously so visual and voiceover never clash
+      setHookBannerText(selected.banner);
+      setShowHookBanner(true);
     } else if (type === 'broll') {
       // Check if already modified to avoid duplicating suggestions
       if (modified.includes('[Gợi ý B-Roll:')) {
@@ -1917,15 +1957,22 @@ export default function App() {
     
     // Create AudioContext if not existed
     if (!previewAudioCtxRef.current) {
-      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
-      previewAudioCtxRef.current = new AudioCtxClass();
+      try {
+        const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+        if (AudioCtxClass) {
+          previewAudioCtxRef.current = new AudioCtxClass();
+        }
+      } catch (e) {
+        console.warn("AudioContext initialization skipped or blocked:", e);
+      }
     }
     
     const ctx = previewAudioCtxRef.current;
+    if (!ctx) return;
     
     // Resume context in case it was suspended (browser autoplay policy)
     if (ctx.state === 'suspended') {
-      ctx.resume();
+      ctx.resume().catch(() => {});
     }
     
     if (!previewSourceNodeRef.current) {
@@ -2283,8 +2330,8 @@ export default function App() {
         done();
       };
       
-      // Safety timeout
-      setTimeout(done, 3000);
+      // Safety timeout (expanded to 8s for large videos up to 1 GB)
+      setTimeout(done, 8000);
     });
   };
 
@@ -2302,8 +2349,8 @@ export default function App() {
         continue;
       }
 
-      if (file.size > 300 * 1024 * 1024) {
-        setApiError(`Kích thước video "${file.name}" quá lớn (${formatBytes(file.size)}). Thuyết minh AI hỗ trợ tệp dưới 300MB.`);
+      if (file.size > 1024 * 1024 * 1024) {
+        setApiError(`Kích thước video "${file.name}" quá lớn (${formatBytes(file.size)}). Thuyết minh AI hỗ trợ tệp tối đa 1 GB.`);
         continue;
       }
       
@@ -2576,8 +2623,8 @@ export default function App() {
       return;
     }
 
-    if (uploadedFileSize > 300 * 1024 * 1024) {
-      setApiError(`Video hiện tại quá lớn (${formatBytes(uploadedFileSize)}). Vui lòng tải lên video đã được nén dưới 300MB để đảm bảo hệ thống truyền nhận và xử lý mượt mà.`);
+    if (uploadedFileSize > 1024 * 1024 * 1024) {
+      setApiError(`Video hiện tại quá lớn (${formatBytes(uploadedFileSize)}). Vui lòng tải lên video dưới 1 GB để đảm bảo hệ thống truyền nhận và xử lý mượt mà.`);
       return;
     }
 
@@ -3682,7 +3729,7 @@ export default function App() {
             ctx.shadowOffsetY = 0;
 
             const bannerWidth = Math.round(canvasWidth * 0.90);
-            const bannerY = Math.round(canvasHeight * 0.18);
+            const bannerY = Math.round(canvasHeight * 0.14);
             const centerX = Math.round(canvasWidth / 2);
             const hookFontSize = Math.round(canvasWidth * 0.046);
 
@@ -3910,7 +3957,7 @@ export default function App() {
                 ctx.font = `700 ${baseFontSize - 1}px ${activeFontObj.canvasFont}`;
               }
 
-              const textY = Math.round(canvasHeight * 0.73); // Elevated lower-third zone for safe phone UI padding (TikTok/Reels)
+              const textY = Math.round(canvasHeight * 0.76); // Safe lower-third zone for safe phone UI padding (TikTok/Reels)
               const maxWidth = Math.round(canvasWidth * 0.86);
               const lineHeight = Math.round(baseFontSize * 1.38);
 
@@ -5553,7 +5600,7 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                             Kéo thả hoặc click để chọn nhiều video
                           </p>
                           <p className="text-[10px] text-slate-500">
-                            Hệ thống tự động ghép nối và tối ưu hóa thông minh (Tối đa 300MB/file)
+                            Hệ thống tự động ghép nối và tối ưu hóa thông minh (Tối đa 1 GB/file)
                           </p>
                         </div>
                       </div>
@@ -6487,7 +6534,7 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
 
                 {/* Stunning High-Attention Viral Hook Title Overlay */}
                 {showHookBanner && hookBannerText && currentAudioTime <= hookBannerDuration && (
-                  <div className="absolute top-[18%] inset-x-2 flex flex-col items-center justify-center pointer-events-none z-30 text-center">
+                  <div className="absolute top-[13%] inset-x-2 flex flex-col items-center justify-center pointer-events-none z-30 text-center">
                     <motion.div
                       key={hookBannerText + hookBannerStyle}
                       initial={{ scale: 0.8, opacity: 0, y: -12 }}
@@ -6541,7 +6588,7 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
 
                 {/* Modern Dynamic Subtitle Overlay with gorgeous interactive customizer modes */}
                 {showSubtitles && activeSubtitleText && (
-                  <div className="absolute inset-x-0 bottom-[25%] flex flex-col items-center justify-center pointer-events-none px-3.5 z-25 text-center">
+                  <div className="absolute inset-x-0 bottom-[18%] flex flex-col items-center justify-center pointer-events-none px-3.5 z-25 text-center">
                     <motion.div
                       key={activeSubtitleText}
                       initial={{ scale: 0.9, opacity: 0, y: 4 }}
@@ -6630,8 +6677,10 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                                     key={idx}
                                     className={wordClass}
                                     style={{
-                                      transform: isCurrent ? 'scale(1.08)' : 'scale(1)',
+                                      transform: isCurrent ? 'scale(1.06)' : 'scale(1)',
                                       display: 'inline-block',
+                                      marginRight: idx < words.length - 1 ? '0.28em' : '0',
+                                      whiteSpace: 'nowrap',
                                       transitionProperty: 'color, opacity, text-shadow, filter, transform'
                                     }}
                                   >
@@ -8677,12 +8726,12 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                   {extractionProgress !== null ? (
                     <span>
                       Hệ thống đang trích xuất chuỗi hình ảnh đại diện (Keyframes) độ phân giải cao trực tiếp trên thiết bị của bạn. 
-                      Phương pháp này giúp <strong>nén dữ liệu lên tới 98.4%</strong>, cho phép gửi các tệp video siêu nặng (lên tới 300MB) mà vẫn mượt mà, siêu tốc!
+                      Phương pháp này giúp <strong>nén dữ liệu lên tới 98.4%</strong>, cho phép gửi các tệp video siêu nặng (lên tới 1 GB) mà vẫn mượt mà, siêu tốc!
                     </span>
                   ) : analysisStepIndex === 1 ? (
                     <span>
                       Nhận dạng quang học & cảm quan vật lý đang hoạt động. 
-                      Hệ thống <strong>Gemini 3.7 Flash</strong> phân tích thiết kế, chất liệu, tính năng sản phẩm từ chuỗi hình ảnh được nén tối ưu.
+                      Hệ thống <strong>Gemini 3.8 Flash</strong> phân tích thiết kế, chất liệu, tính năng sản phẩm từ chuỗi hình ảnh được nén tối ưu.
                     </span>
                   ) : (
                     <span>
@@ -8798,7 +8847,7 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                     <div className="p-4 rounded-2xl bg-white/[0.01] border border-white/5 hover:border-white/10 hover:bg-white/[0.02] transition-colors space-y-2">
                       <div className="text-amber-500 font-bold text-xs font-mono">02. NÉN DỮ LIỆU SIÊU VIỆT</div>
                       <p className="text-[11px] text-slate-400 leading-relaxed">
-                        Trích xuất 8 khung hình vàng phân phối đều trên dòng thời gian, giảm thiểu dữ liệu băng thông tối đa để gởi tệp dung lượng lên tới 300MB mà không bị sập.
+                        Trích xuất 8 khung hình vàng phân phối đều trên dòng thời gian, giảm thiểu dữ liệu băng thông tối đa để gởi tệp dung lượng lên tới 1 GB mà không bị sập.
                       </p>
                     </div>
                     <div className="p-4 rounded-2xl bg-white/[0.01] border border-white/5 hover:border-white/10 hover:bg-white/[0.02] transition-colors space-y-2">
@@ -9636,49 +9685,84 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                     );
                   })()}
 
-                  {/* DIRECT HOOK INJECTOR */}
+                  {/* DIRECT HOOK INJECTOR - ĐỒNG BỘ 100% GIỮA KHUNG HOOK VÀ LỜI LỒNG TIẾNG */}
                   <div className="space-y-2">
-                    <span className="text-[8px] text-slate-500 uppercase tracking-widest font-mono block">MÔ HÌNH CHÈN SIÊU HOOK THU HÚT 3S ĐẦU TIÊN TỚI KHÁN GIẢ</span>
+                    <div className="flex items-center justify-between">
+                      <span className="text-[8px] text-slate-500 uppercase tracking-widest font-mono block">MÔ HÌNH CHÈN SIÊU HOOK THU HÚT 3S ĐẦU TIÊN (ĐỒNG BỘ GIỌNG ĐỌC)</span>
+                      <span className="text-[7.5px] text-amber-400 font-mono font-bold bg-amber-500/10 px-1.5 py-0.2 rounded border border-amber-500/20">KHÔNG CHỒNG LẤN</span>
+                    </div>
                     <div className="grid grid-cols-2 gap-1.5">
-                      {[
-                        { 
-                          label: '🚨 Cảnh Báo Sốc', 
-                          text: `CẢNH BÁO: ĐỪNG VỘI DÙNG ${activeReview?.productName ? activeReview.productName.replace(/\(.*?\)/g, '').trim().toUpperCase() : 'SẢN PHẨM'} NẾU CHƯA COI HẾT CLIP NÀY!`,
-                          style: 'tiktok-red'
-                        },
-                        { 
-                          label: '💡 Sự Thật Lạ', 
-                          text: `SỰ THẬT CỰC ĐẮT GIÁ VỀ TRẢI NGHIỆM THỰC TẾ CỦA ${activeReview?.productName ? activeReview.productName.replace(/\(.*?\)/g, '').trim().toUpperCase() : 'SẢN PHẨM'}...`,
-                          style: 'tiktok-yellow'
-                        },
-                        { 
-                          label: '⚡ FOMO Cực Độ', 
-                          text: `ĐỪNG LÃNG PHÍ TIỀN CHO ${activeReview?.productName ? activeReview.productName.replace(/\(.*?\)/g, '').trim().toUpperCase() : 'SẢN PHẨM'}, ĐÂY MỚI LÀ SỰ THẬT!`,
-                          style: 'beast-glow'
-                        },
-                        { 
-                          label: '⭐ So Sánh Chất', 
-                          text: `TRẢI NGHIỆM 1 THÁNG VỚI ${activeReview?.productName ? activeReview.productName.replace(/\(.*?\)/g, '').trim().toUpperCase() : 'SẢN PHẨM'} SẼ LÀM BẠN SỐC!`,
-                          style: 'cyberpunk-neon'
-                        },
-                      ].map((item, idx) => (
-                        <button
-                          key={idx}
-                          type="button"
-                          onClick={() => {
-                            setHookBannerText(item.text);
-                            setHookBannerStyle(item.style as any);
-                            setShowHookBanner(true);
-                            if (videoRef.current) {
-                              videoRef.current.currentTime = 0;
-                            }
-                          }}
-                          className="py-2 px-2.5 rounded-xl bg-[#080808] border border-white/5 hover:border-amber-500/20 text-[9px] font-bold text-slate-300 hover:text-amber-400 transition-all duration-200 cursor-pointer flex flex-col items-center justify-center gap-1 hover:scale-[1.02] shadow-sm text-center"
-                        >
-                          <span className="text-[10px]">{item.label.split(' ')[0]}</span>
-                          <span>{item.label.split(' ').slice(1).join(' ')}</span>
-                        </button>
-                      ))}
+                      {(() => {
+                        const rawProd = activeReview?.productName || 'sản phẩm này';
+                        const prodClean = rawProd.replace(/\(.*?\)/g, '').trim();
+                        const prodUpper = prodClean.toUpperCase();
+
+                        const hookOptions = [
+                          { 
+                            label: '🚨 Cảnh Báo Sốc', 
+                            bannerText: `CẢNH BÁO: ĐỪNG VỘI MUA ${prodUpper} NẾU CHƯA COI HẾT CLIP NÀY!`,
+                            spokenHook: `Cảnh báo thật sự, đừng vội mua ${prodClean} nếu cả nhà chưa xem hết clip này nha...`,
+                            style: 'tiktok-red'
+                          },
+                          { 
+                            label: '💡 Sự Thật Lạ', 
+                            bannerText: `SỰ THẬT CỰC ĐẮT GIÁ VỀ TRẢI NGHIỆM THỰC TẾ CỦA ${prodUpper}!`,
+                            spokenHook: `Sự thật cực kỳ đắt giá về trải nghiệm thực tế của em ${prodClean} mà người bán không bao giờ nói cho bạn biết nè...`,
+                            style: 'tiktok-yellow'
+                          },
+                          { 
+                            label: '⚡ FOMO Cực Độ', 
+                            bannerText: `ĐỪNG LÃNG PHÍ TIỀN VÌ ${prodUpper}, ĐÂY MỚI LÀ SỰ THẬT!`,
+                            spokenHook: `Đừng lãng phí tiền bạc oan uổng cho ${prodClean}, đây mới chính là trải nghiệm thật sự của tụi mình...`,
+                            style: 'beast-glow'
+                          },
+                          { 
+                            label: '⭐ So Sánh Chất', 
+                            bannerText: `TRẢI NGHIỆM 1 THÁNG VỚI ${prodUpper} SẼ LÀM BẠN SỐC!`,
+                            spokenHook: `Sau đúng một tháng trải nghiệm thực tế với ${prodClean}, kết quả này chắc chắn sẽ làm mấy bạn bất ngờ luôn đó nha...`,
+                            style: 'cyberpunk-neon'
+                          },
+                        ];
+
+                        return hookOptions.map((item, idx) => (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => {
+                              // 1. Cập nhật nội dung và phong cách khung Hook Banner
+                              setHookBannerText(item.bannerText);
+                              setHookBannerStyle(item.style as any);
+                              setShowHookBanner(true);
+
+                              // 2. Đồng bộ trực tiếp vào kịch bản lồng tiếng, thay thế sạch sẽ câu mở đầu cũ tránh chồng lấn 2 hook
+                              const currentScript = editedScript || activeReview?.marketingScript || '';
+                              let cleanedScript = currentScript.replace(/^\[(?:SIÊU HOOK(?: TRIỆU VIEW)?|HOOK)[^\]]*\]\s*.*?(?:\.\.\.|[.?!])\s*/gis, '');
+                              
+                              if (cleanedScript === currentScript) {
+                                const firstSentenceMatch = currentScript.match(/^([^.?!…]+[.?!…]+(?:\.\.\.)?)\s*(.*)$/s);
+                                if (firstSentenceMatch && /^(Có bao giờ|Bạn có|Đừng|Ai cũng|Nếu bạn|Trời đất|Sự thật|Cảnh báo|Bình tĩnh|Sau đúng)/i.test(firstSentenceMatch[1].trim())) {
+                                  cleanedScript = firstSentenceMatch[2].trim();
+                                }
+                              }
+
+                              const newHarmonizedScript = `[SIÊU HOOK TRIỆU VIEW] ${item.spokenHook} ${cleanedScript.trim()}`;
+                              setEditedScript(newHarmonizedScript);
+
+                              if (videoRef.current) {
+                                videoRef.current.currentTime = 0;
+                              }
+                              if (audioRef.current) {
+                                audioRef.current.currentTime = 0;
+                              }
+                              playSynthesizedSFX('pop', 0.5);
+                            }}
+                            className="py-2 px-2.5 rounded-xl bg-[#080808] border border-white/5 hover:border-amber-500/20 text-[9px] font-bold text-slate-300 hover:text-amber-400 transition-all duration-200 cursor-pointer flex flex-col items-center justify-center gap-1 hover:scale-[1.02] shadow-sm text-center"
+                          >
+                            <span className="text-[10px]">{item.label.split(' ')[0]}</span>
+                            <span>{item.label.split(' ').slice(1).join(' ')}</span>
+                          </button>
+                        ));
+                      })()}
                     </div>
                   </div>
 
