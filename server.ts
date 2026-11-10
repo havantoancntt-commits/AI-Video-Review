@@ -12,7 +12,18 @@ dns.setDefaultResultOrder("ipv4first");
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+
+let portArg = 3000;
+const portIdx = process.argv.indexOf('--port');
+if (portIdx !== -1 && process.argv[portIdx + 1]) {
+  const parsed = parseInt(process.argv[portIdx + 1], 10);
+  if (!isNaN(parsed) && parsed > 0) portArg = parsed;
+}
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : (portArg || 3000);
+
+// Instant health check for AI Studio platform dev server supervisor
+app.get("/__health", (req, res) => res.status(200).send("OK"));
+app.get("/api/health", (req, res) => res.status(200).json({ status: "ok", timestamp: Date.now() }));
 
 // Set up JSON body parser with increased limit to handle video uploads up to 1 GB
 app.use(express.json({ limit: "1024mb" }));
@@ -1574,6 +1585,228 @@ Hãy trả về phản hồi theo định dạng JSON với schema sau:
   }
 });
 
+function serverPreserveCase(original: string, target: string): string {
+  if (!original || !target) return target;
+  if (original === original.toUpperCase() && original !== original.toLowerCase()) return target.toUpperCase();
+  const first = original.charAt(0);
+  if (first === first.toUpperCase() && first !== first.toLowerCase()) {
+    return target.charAt(0).toUpperCase() + target.slice(1);
+  }
+  return target;
+}
+
+function toServerUnicodeBoundaryRegex(regex: RegExp): RegExp {
+  let src = regex.source;
+  if (src.startsWith('^\\b')) {
+    src = '^(?<![\\p{L}\\p{N}])' + src.slice(4);
+  } else if (src.startsWith('\\b')) {
+    src = '(?<![\\p{L}\\p{N}])' + src.slice(2);
+  }
+  if (src.endsWith('\\b$')) {
+    src = src.slice(0, -4) + '(?![\\p{L}\\p{N}])$';
+  } else if (src.endsWith('\\b')) {
+    src = src.slice(0, -2) + '(?![\\p{L}\\p{N}])';
+  }
+  let flags = regex.flags;
+  if (!flags.includes('u')) flags += 'u';
+  if (!flags.includes('g')) flags += 'g';
+  if (!flags.includes('i')) flags += 'i';
+  return new RegExp(src, flags);
+}
+
+const SERVER_LOCAL_SPELL_RULES: Array<[RegExp, string, string]> = [
+  [/\bmđóm\s+iếng\b/gi, 'mỗi miếng', "Sửa lỗi nhận diện/dính phím 'mđóm iếng' -> 'mỗi miếng'"],
+  [/\bmđom\s+iếng\b/gi, 'mỗi miếng', "Sửa lỗi nhận diện/dính phím 'mđom iếng' -> 'mỗi miếng'"],
+  [/\bmđón\s+iếng\b/gi, 'mỗi miếng', "Sửa lỗi nhận diện/dính phím 'mđón iếng' -> 'mỗi miếng'"],
+  [/\bmđóm\s+miếng\b/gi, 'mỗi miếng', "Sửa lỗi nhận diện 'mđóm miếng' -> 'mỗi miếng'"],
+  [/\bmđóm\b/gi, 'món', "Sửa lỗi nhận diện âm thanh: 'món'"],
+  [/\bmđon\b/gi, 'món', "Sửa lỗi nhận diện âm thanh: 'món'"],
+  [/\bmđom\b/gi, 'món', "Sửa lỗi nhận diện âm thanh: 'món'"],
+  [/\biếng\s+(chuối|bánh|thịt|cá|trái|hoa|đậu|chả|gà|bò)/gi, 'miếng $1', "Sửa lỗi thiếu phụ âm đầu 'iếng' -> 'miếng'"],
+  [/\bliu\s+r\.+u\b/gi, 'liu riu', "Chuẩn chính tả: 'liu riu'"],
+  [/\bliu\s+riu\b/gi, 'liu riu', "Chuẩn chính tả: 'liu riu'"],
+  [/\br\.+u\b/gi, 'riu', "Sửa lỗi ký tự chấm dính 'r.u' -> 'riu'"],
+  [/\bchuối\s+nam\b/gi, 'chuối xiêm', "Chuẩn hóa tên chuối Nam Bộ: 'chuối xiêm'"],
+  [/\bchuốinam\b/gi, 'chuối xiêm', "Tách từ dính: 'chuối xiêm'"],
+  [/\bmiếngchuối\b/gi, 'miếng chuối', "Tách từ dính: 'miếng chuối'"],
+  [/\bchuốixiêm\b/gi, 'chuối xiêm', "Tách từ dính: 'chuối xiêm'"],
+  [/\bbánhchuối\b/gi, 'bánh chuối', "Tách từ dính: 'bánh chuối'"],
+  [/\b(chiên|vàng|ngon|rất|da)\s+zòn\b/gi, '$1 giòn', "Chuẩn chính tả: '$1 giòn'"],
+  [/\b(chiên|vàng|ngon|rất|da)\s+dòn\b/gi, '$1 giòn', "Chuẩn chính tả: '$1 giòn'"],
+  [/\bvàng\s+dòn\b/gi, 'vàng giòn', "Chuẩn chính tả: 'vàng giòn'"],
+  [/\bvàng\s+zòn\b/gi, 'vàng giòn', "Chuẩn chính tả: 'vàng giòn'"],
+  [/\bchiên\s+dòn\b/gi, 'chiên giòn', "Chuẩn chính tả: 'chiên giòn'"],
+  [/\bchiên\s+zòn\b/gi, 'chiên giòn', "Chuẩn chính tả: 'chiên giòn'"],
+  [/\bdòn\s+rụm\b/gi, 'giòn rụm', "Chuẩn chính tả: 'giòn rụm'"],
+  [/\bzòn\s+rụm\b/gi, 'giòn rụm', "Chuẩn chính tả: 'giòn rụm'"],
+  [/\bzòn\b/gi, 'giòn', "Chuẩn chính tả: 'giòn'"],
+  [/\bdòn\b/gi, 'giòn', "Chuẩn chính tả: 'giòn'"],
+  [/\bthơm\s+phứt\b/gi, 'thơm phức', "Chuẩn chính tả: 'thơm phức'"],
+  [/\bnóng\s+hỗi\b/gi, 'nóng hổi', "Chuẩn chính tả: 'nóng hổi'"],
+  [/\bdầu\s+mở\b/gi, 'dầu mỡ', "Chuẩn chính tả: 'dầu mỡ'"],
+  [/\bkhuấy\s+đều\b/gi, 'khuấy đều', "Chuẩn chính tả: 'khuấy đều'"],
+  [/\bquấy\s+đều\b/gi, 'khuấy đều', "Chuẩn hóa ẩm thực Nam Bộ: 'khuấy đều'"],
+  [/\bthơm\s+nức\s+mủi\b/gi, 'thơm nức mũi', "Chuẩn chính tả: 'thơm nức mũi'"],
+  [/\bướp\s+da\s+vị\b/gi, 'ướp gia vị', "Chuẩn chính tả: 'ướp gia vị'"],
+  [/\bngon\s+miệng\b/gi, 'ngon miệng', "Chuẩn chính tả: 'ngon miệng'"],
+  [/\bsản phẫm\b/gi, 'sản phẩm', "Chuẩn chính tả: 'sản phẩm'"],
+  [/\bsản phảm\b/gi, 'sản phẩm', "Chuẩn chính tả: 'sản phẩm'"],
+  [/\bmẩu mã\b/gi, 'mẫu mã', "Chuẩn chính tả: 'mẫu mã'"],
+  [/\bchia sẽ\b/gi, 'chia sẻ', "Chuẩn chính tả: 'chia sẻ'"],
+  [/\btrãi nghiệm\b/gi, 'trải nghiệm', "Chuẩn chính tả: 'trải nghiệm'"],
+  [/\bchính hảng\b/gi, 'chính hãng', "Chuẩn chính tả: 'chính hãng'"],
+  [/\bưu đải\b/gi, 'ưu đãi', "Chuẩn chính tả: 'ưu đãi'"],
+  [/\bdư giả\b/gi, 'dư dả', "Chuẩn chính tả: 'dư dả'"],
+  [/\brãnh rỗi\b/gi, 'rảnh rỗi', "Chuẩn chính tả: 'rảnh rỗi'"],
+  [/\bcãm nhận\b/gi, 'cảm nhận', "Chuẩn chính tả: 'cảm nhận'"],
+  [/\bdưởng ẩm\b/gi, 'dưỡng ẩm', "Chuẩn chính tả: 'dưỡng ẩm'"],
+  [/\bdể thương\b/gi, 'dễ thương', "Chuẩn chính tả: 'dễ thương'"],
+  [/\bhửu ích\b/gi, 'hữu ích', "Chuẩn chính tả: 'hữu ích'"],
+  [/\blổi lầm\b/gi, 'lỗi lầm', "Chuẩn chính tả: 'lỗi lầm'"],
+  [/\brẽ rề\b/gi, 'rẻ rề', "Chuẩn chính tả: 'rẻ rề'"],
+  [/\brực rở\b/gi, 'rực rỡ', "Chuẩn chính tả: 'rực rỡ'"],
+  [/\brạng rở\b/gi, 'rạng rỡ', "Chuẩn chính tả: 'rạng rỡ'"],
+  [/\bngở ngàng\b/gi, 'ngỡ ngàng', "Chuẩn chính tả: 'ngỡ ngàng'"],
+  [/\bvững trãi\b/gi, 'vững chãi', "Chuẩn chính tả: 'vững chãi'"],
+  [/\bmê mẫn\b/gi, 'mê mẩn', "Chuẩn chính tả: 'mê mẩn'"],
+  [/\bbền bĩ\b/gi, 'bền bỉ', "Chuẩn chính tả: 'bền bỉ'"],
+  [/\btỉ mĩ\b/gi, 'tỉ mỉ', "Chuẩn chính tả: 'tỉ mỉ'"],
+  [/\bhướng dẩn\b/gi, 'hướng dẫn', "Chuẩn chính tả: 'hướng dẫn'"],
+  [/\bnhược điễm\b/gi, 'nhược điểm', "Chuẩn chính tả: 'nhược điểm'"],
+  [/\bưu điễm\b/gi, 'ưu điểm', "Chuẩn chính tả: 'ưu điểm'"],
+  [/\bvội vả\b/gi, 'vội vã', "Chuẩn chính tả: 'vội vã'"],
+  [/\bđầy đũ\b/gi, 'đầy đủ', "Chuẩn chính tả: 'đầy đủ'"],
+  [/\bsẳn sàng\b/gi, 'sẵn sàng', "Chuẩn chính tả: 'sẵn sàng'"],
+  [/\bsữa rữa mặt\b/gi, 'sữa rửa mặt', "Chuẩn chính tả: 'sữa rửa mặt'"],
+  [/\bsửa rửa mặt\b/gi, 'sữa rửa mặt', "Chuẩn chính tả: 'sữa rửa mặt'"],
+  [/\bsữa tắm\b/gi, 'sữa tắm', "Chuẩn chính tả: 'sữa tắm'"],
+  [/\bsữa soạn\b/gi, 'sửa soạn', "Chuẩn chính tả: 'sửa soạn'"],
+  [/\bsửa chửa\b/gi, 'sửa chữa', "Chuẩn chính tả: 'sửa chữa'"],
+  [/\bsữa chữa\b/gi, 'sửa chữa', "Chuẩn chính tả: 'sửa chữa'"],
+  [/\bxịn xò\b/gi, 'xịn sò', "Chuẩn chính tả: 'xịn sò'"],
+  [/\bsắp sếp\b/gi, 'sắp xếp', "Chuẩn chính tả: 'sắp xếp'"],
+  [/\bxắp xếp\b/gi, 'sắp xếp', "Chuẩn chính tả: 'sắp xếp'"],
+  [/\bsuất sắc\b/gi, 'xuất sắc', "Chuẩn chính tả: 'xuất sắc'"],
+  [/\bxuất ăn\b/gi, 'suất ăn', "Chuẩn chính tả: 'suất ăn'"],
+  [/\bxuất vé\b/gi, 'suất vé', "Chuẩn chính tả: 'suất vé'"],
+  [/\bbổ xung\b/gi, 'bổ sung', "Chuẩn chính tả: 'bổ sung'"],
+  [/\bsơ xuất\b/gi, 'sơ suất', "Chuẩn chính tả: 'sơ suất'"],
+  [/\bxơ suất\b/gi, 'sơ suất', "Chuẩn chính tả: 'sơ suất'"],
+  [/\bchau chuốt\b/gi, 'trau chuốt', "Chuẩn chính tả: 'trau chuốt'"],
+  [/\btrau truốt\b/gi, 'trau chuốt', "Chuẩn chính tả: 'trau chuốt'"],
+  [/\bchuẩn đoán\b/gi, 'chẩn đoán', "Chuẩn chính tả: 'chẩn đoán'"],
+  [/\bchín mùi\b/gi, 'chín muồi', "Chuẩn chính tả: 'chín muồi'"],
+  [/\bthăm quan\b/gi, 'tham quan', "Chuẩn chính tả: 'tham quan'"],
+  [/\bbạc mạng\b/gi, 'bạt mạng', "Chuẩn chính tả: 'bạt mạng'"],
+  [/\bchung thực\b/gi, 'trung thực', "Chuẩn chính tả: 'trung thực'"],
+  [/\bcọ sát\b/gi, 'cọ xát', "Chuẩn chính tả: 'cọ xát'"],
+  [/\bsáng lạng\b/gi, 'xán lạn', "Chuẩn chính tả: 'xán lạn'"],
+  [/\bxáng lạn\b/gi, 'xán lạn', "Chuẩn chính tả: 'xán lạn'"],
+  [/\btựu chung\b/gi, 'tựu trung', "Chuẩn chính tả: 'tựu trung'"],
+  [/\bvô hình chung\b/gi, 'vô hình trung', "Chuẩn chính tả: 'vô hình trung'"],
+  [/\bđường xá\b/gi, 'đường sá', "Chuẩn chính tả: 'đường sá'"],
+  [/\bsuôn xẻ\b/gi, 'suôn sẻ', "Chuẩn chính tả: 'suôn sẻ'"],
+  [/\bsuông sẻ\b/gi, 'suôn sẻ', "Chuẩn chính tả: 'suôn sẻ'"],
+  [/\bxăm soi\b/gi, 'săm soi', "Chuẩn chính tả: 'săm soi'"],
+  [/\bsát sao\b/gi, 'sát sao', "Chuẩn chính tả: 'sát sao'"],
+  [/\bsử lý\b/gi, 'xử lý', "Chuẩn chính tả: 'xử lý'"],
+  [/\bxử dụng\b/gi, 'sử dụng', "Chuẩn chính tả: 'sử dụng'"],
+  [/\bsuất sứ\b/gi, 'xuất xứ', "Chuẩn chính tả: 'xuất xứ'"],
+  [/\btinh sảo\b/gi, 'tinh xảo', "Chuẩn chính tả: 'tinh xảo'"],
+  [/\bxành điệu\b/gi, 'sành điệu', "Chuẩn chính tả: 'sành điệu'"],
+  [/\bdấu giếm\b/gi, 'giấu giếm', "Chuẩn chính tả: 'giấu giếm'"],
+  [/\bgiành cho\b/gi, 'dành cho', "Chuẩn chính tả: 'dành cho'"],
+  [/\bgiành riêng\b/gi, 'dành riêng', "Chuẩn chính tả: 'dành riêng'"],
+  [/\bdành giật\b/gi, 'giành giật', "Chuẩn chính tả: 'giành giật'"],
+  [/\bdùm\b/gi, 'giùm', "Chuẩn chính tả: 'giùm'"],
+  [/\bdỏ hàng\b/gi, 'giỏ hàng', "Chuẩn chính tả: 'giỏ hàng'"],
+  [/\bzỏ hàng\b/gi, 'giỏ hàng', "Chuẩn chính tả: 'giỏ hàng'"],
+  [/\bdao hàng\b/gi, 'giao hàng', "Chuẩn chính tả: 'giao hàng'"],
+  [/\bdá rẻ\b/gi, 'giá rẻ', "Chuẩn chính tả: 'giá rẻ'"],
+  [/\bzá rẻ\b/gi, 'giá rẻ', "Chuẩn chính tả: 'giá rẻ'"],
+  [/\bdải pháp\b/gi, 'giải pháp', "Chuẩn chính tả: 'giải pháp'"],
+  [/\bdao diện\b/gi, 'giao diện', "Chuẩn chính tả: 'giao diện'"],
+  [/\bgiả cả\b/gi, 'giá cả', "Chuẩn chính tả: 'giá cả'"],
+  [/\btuyệt dời\b/gi, 'tuyệt vời', "Chuẩn chính tả: 'tuyệt vời'"],
+  [/\btuyệt zời\b/gi, 'tuyệt vời', "Chuẩn chính tả: 'tuyệt vời'"],
+  [/\bvừa dặn\b/gi, 'vừa vặn', "Chuẩn chính tả: 'vừa vặn'"],
+  [/\btrân thực\b/gi, 'chân thực', "Chuẩn chính tả: 'chân thực'"],
+  [/\bchân trọng\b/gi, 'trân trọng', "Chuẩn chính tả: 'trân trọng'"],
+  [/\btri tiết\b/gi, 'chi tiết', "Chuẩn chính tả: 'chi tiết'"],
+  [/\bchải nghiệm\b/gi, 'trải nghiệm', "Chuẩn chính tả: 'trải nghiệm'"],
+  [/\bchực quan\b/gi, 'trực quan', "Chuẩn chính tả: 'trực quan'"],
+  [/\btrắc trắn\b/gi, 'chắc chắn', "Chuẩn chính tả: 'chắc chắn'"],
+  [/\bmịn màn\b/gi, 'mịn màng', "Chuẩn chính tả: 'mịn màng'"],
+  [/\bthắm nhanh\b/gi, 'thấm nhanh', "Chuẩn chính tả: 'thấm nhanh'"],
+  [/\bchóng nước\b/gi, 'chống nước', "Chuẩn chính tả: 'chống nước'"],
+  [/\bđặc hàng\b/gi, 'đặt hàng', "Chuẩn chính tả: 'đặt hàng'"],
+  [/\bchất lượn\b/gi, 'chất lượng', "Chuẩn chính tả: 'chất lượng'"],
+  [/\bchất lựơng\b/gi, 'chất lượng', "Chuẩn chính tả: 'chất lượng'"],
+  [/\btrắn sáng\b/gi, 'trắng sáng', "Chuẩn chính tả: 'trắng sáng'"],
+  [/\btiếc kiệm\b/gi, 'tiết kiệm', "Chuẩn chính tả: 'tiết kiệm'"],
+  [/\bđúng đắng\b/gi, 'đúng đắn', "Chuẩn chính tả: 'đúng đắn'"],
+  [/\bđóng gối\b/gi, 'đóng gói', "Chuẩn chính tả: 'đóng gói'"],
+  [/\bsán mịn\b/gi, 'sáng mịn', "Chuẩn chính tả: 'sáng mịn'"],
+  [/\bbảo hảnh\b/gi, 'bảo hành', "Chuẩn chính tả: 'bảo hành'"],
+  [/\bduwocj\b/gi, 'được', "Sửa lỗi gõ Telex: 'được'"],
+  [/\bdduocj\b/gi, 'được', "Sửa lỗi gõ Telex: 'được'"],
+  [/\bnhieeuf\b/gi, 'nhiều', "Sửa lỗi gõ Telex: 'nhiều'"],
+  [/\bnguwowfi\b/gi, 'người', "Sửa lỗi gõ Telex: 'người'"],
+  [/\bkhonog\b/gi, 'không', "Sửa lỗi gõ Telex: 'không'"],
+  [/\bthoong\b/gi, 'thông', "Sửa lỗi gõ Telex: 'thông'"],
+  [/\btoots\b/gi, 'tốt', "Sửa lỗi gõ Telex: 'tốt'"],
+  [/\bmays\b/gi, 'máy', "Sửa lỗi gõ Telex: 'máy'"],
+  [/\bcuar\b/gi, 'của', "Sửa lỗi gõ Telex: 'của'"],
+  [/\bchiecs\b/gi, 'chiếc', "Sửa lỗi gõ Telex: 'chiếc'"],
+  [/\bnhé cả nhà\b/gi, 'nha cả nhà', "Chuẩn hóa Nam Bộ: 'nha cả nhà'"],
+  [/\bnhé mọi người\b/gi, 'nha cả nhà', "Chuẩn hóa Nam Bộ: 'nha cả nhà'"],
+  [/\bnhé\b/gi, 'nha', "Chuẩn hóa Nam Bộ: 'nha'"],
+  [/\bnhá\b/gi, 'nha', "Chuẩn hóa Nam Bộ: 'nha'"],
+  [/\bnhỉ\b/gi, 'nha', "Chuẩn hóa Nam Bộ: 'nha'"],
+  [/\bthật là\b/gi, 'thiệt là', "Chuẩn hóa Nam Bộ: 'thiệt là'"],
+  [/\bthật sự\b/gi, 'thiệt sự', "Chuẩn hóa Nam Bộ: 'thiệt sự'"],
+  [/\bthật luôn\b/gi, 'thiệt luôn', "Chuẩn hóa Nam Bộ: 'thiệt luôn'"],
+  [/\bxem ngay\b/gi, 'coi ngay', "Chuẩn hóa Nam Bộ: 'coi ngay'"],
+  [/\bxem thử\b/gi, 'coi thử', "Chuẩn hóa Nam Bộ: 'coi thử'"],
+  [/\bnhìn vào\b/gi, 'nhìn vô', "Chuẩn hóa Nam Bộ: 'nhìn vô'"],
+  [/\bcho vào\b/gi, 'cho vô', "Chuẩn hóa Nam Bộ: 'cho vô'"],
+  [/\bbát ăn\b/gi, 'chén ăn', "Chuẩn hóa Nam Bộ: 'chén ăn'"],
+  [/\bthìa\b/gi, 'muỗng', "Chuẩn hóa Nam Bộ: 'muỗng'"],
+  [/\bhoa quả\b/gi, 'trái cây', "Chuẩn hóa Nam Bộ: 'trái cây'"],
+  [/\bchúng mình\b/gi, 'tụi mình', "Chuẩn hóa Nam Bộ: 'tụi mình'"],
+  [/\bchúng tôi\b/gi, 'tụi mình', "Chuẩn hóa Nam Bộ: 'tụi mình'"],
+  [/\bthế này\b/gi, 'như vầy', "Chuẩn hóa Nam Bộ: 'như vầy'"]
+];
+
+// Pre-compiled unicode-aware rules cache for optimal zero-overhead performance
+const COMPILED_SERVER_SPELL_RULES = SERVER_LOCAL_SPELL_RULES.map(([pat, rep, reason]) => ({
+  pattern: toServerUnicodeBoundaryRegex(pat),
+  replacement: rep,
+  reason
+}));
+
+function applyServerSpellCorrections(text: string): string {
+  let t = (text || "").trim();
+  for (const rule of COMPILED_SERVER_SPELL_RULES) {
+    rule.pattern.lastIndex = 0;
+    if (rule.pattern.test(t)) {
+      rule.pattern.lastIndex = 0;
+      t = t.replace(rule.pattern, (m, ...args) => {
+        let rep = rule.replacement;
+        if (typeof rep === 'string' && rep.includes('$1') && args[0] !== undefined) {
+          rep = rep.replace('$1', String(args[0]));
+        }
+        if (typeof rep === 'string' && rep.includes('$2') && args[1] !== undefined) {
+          rep = rep.replace('$2', String(args[1]));
+        }
+        return serverPreserveCase(m, rep);
+      });
+      rule.pattern.lastIndex = 0;
+    }
+  }
+  return t;
+}
+
 // Dedicated Fast AI Subtitle Spelling & Grammar Polisher Endpoint
 app.post("/api/fix-subtitles-spelling", async (req, res): Promise<any> => {
   try {
@@ -1588,6 +1821,12 @@ app.post("/api/fix-subtitles-spelling", async (req, res): Promise<any> => {
       });
     }
 
+    // Pre-clean subtitles with Unicode rules before feeding to Gemini model
+    const preCleanedSubtitles = subtitles.map((s: any) => ({
+      ...s,
+      text: applyServerSpellCorrections(s.text || "")
+    }));
+
     const ai = getGoogleAI();
     const promptText = `
 Bạn là Trưởng Ban Ngôn ngữ học & Chuyên gia Giám định Phụ đề Video (Chief Vietnamese Linguist & Subtitle QA Master) cho TikTok Shop, Reels và YouTube Shorts.
@@ -1596,8 +1835,8 @@ Nhiệm vụ tối thượng: Rà soát và sửa triệt để 100% tất cả 
 THÔNG TIN ĐẦU VÀO:
 - Tên sản phẩm chính: "${productName}"
 - Ngôn ngữ: ${language === 'vi' ? 'Tiếng Việt' : 'Tiếng Anh'}
-- Danh sách ${subtitles.length} phân cảnh phụ đề cần tối ưu:
-${subtitles.map((s: any, idx: number) => `[Phân cảnh ${idx + 1}] (${s.start}s - ${s.end}s): "${s.text}"`).join('\n')}
+- Danh sách ${preCleanedSubtitles.length} phân cảnh phụ đề cần tối ưu:
+${preCleanedSubtitles.map((s: any, idx: number) => `[Phân cảnh ${idx + 1}] (${s.start}s - ${s.end}s): "${s.text}"`).join('\n')}
 
 HỆ THỐNG TIÊU CHUẨN CHÍNH TẢ & PHỤ ĐỀ BẮT BUỘC:
 1. ✍️ CHÍNH TẢ & TỪ ĐỒNG ÂM KHÁC NGHĨA:
@@ -1702,189 +1941,65 @@ Trả về phản hồi JSON theo schema:
       if (!ai) {
         throw new Error("GEMINI_CLIENT_NOT_AVAILABLE");
       }
-      const response = await generateWithRetry((model) =>
-        ai.models.generateContent({
-          model: model,
-          contents: [{ parts: [{ text: promptText }] }],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                fixedSubtitles: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      start: { type: Type.NUMBER },
-                      end: { type: Type.NUMBER },
-                      text: { type: Type.STRING },
-                      translation: { type: Type.STRING }
+      const response: any = await Promise.race([
+        generateWithRetry(
+          (model) =>
+            ai.models.generateContent({
+              model: model,
+              contents: [{ parts: [{ text: promptText }] }],
+              config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    fixedSubtitles: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          start: { type: Type.NUMBER },
+                          end: { type: Type.NUMBER },
+                          text: { type: Type.STRING },
+                          translation: { type: Type.STRING }
+                        },
+                        required: ["start", "end", "text"]
+                      }
                     },
-                    required: ["start", "end", "text"]
-                  }
-                },
-                fixedCount: { type: Type.NUMBER },
-                fixedDetails: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING }
-                },
-                summary: { type: Type.STRING }
-              },
-              required: ["fixedSubtitles", "fixedCount", "fixedDetails", "summary"]
-            }
-          }
-        })
-      );
+                    fixedCount: { type: Type.NUMBER },
+                    fixedDetails: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING }
+                    },
+                    summary: { type: Type.STRING }
+                  },
+                  required: ["fixedSubtitles", "fixedCount", "fixedDetails", "summary"]
+                }
+              }
+            }),
+          1,
+          500,
+          "gemini-3.8-flash",
+          true
+        ),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("AI_SUBTITLE_SPELL_TIMEOUT")), 3500))
+      ]);
 
       result = JSON.parse(response.text || '{}');
+      if (result && Array.isArray(result.fixedSubtitles)) {
+        result.fixedSubtitles = result.fixedSubtitles.map((sub: any) => {
+          let txt = applyServerSpellCorrections(sub.text || "");
+          txt = txt.replace(/[.,]+$/g, '').trim();
+          if (txt.length > 0) {
+            txt = txt.charAt(0).toUpperCase() + txt.slice(1);
+          }
+          return {
+            ...sub,
+            text: txt
+          };
+        });
+      }
     } catch (e: any) {
       console.warn("[SUBTITLE-SPELL-FALLBACK] Running local algorithmic spell corrector:", e.message);
-      
-      const localSpellRules: Array<[RegExp, string, string]> = [
-        [/\bmđóm\b/gi, 'món', "Sửa lỗi nhận diện âm thanh: 'món'"],
-        [/\bmđon\b/gi, 'món', "Sửa lỗi nhận diện âm thanh: 'món'"],
-        [/\bliu\s+r\.u\b/gi, 'liu riu', "Chuẩn chính tả: 'liu riu'"],
-        [/\bmiếngchuối\b/gi, 'miếng chuối', "Tách từ dính: 'miếng chuối'"],
-        [/\bchuốinam\b/gi, 'chuối nam', "Tách từ dính: 'chuối nam'"],
-        [/\bsản phẫm\b/gi, 'sản phẩm', "Chuẩn chính tả: 'sản phẩm'"],
-        [/\bsản phảm\b/gi, 'sản phẩm', "Chuẩn chính tả: 'sản phẩm'"],
-        [/\bmẩu mã\b/gi, 'mẫu mã', "Chuẩn chính tả: 'mẫu mã'"],
-        [/\bchia sẽ\b/gi, 'chia sẻ', "Chuẩn chính tả: 'chia sẻ'"],
-        [/\btrãi nghiệm\b/gi, 'trải nghiệm', "Chuẩn chính tả: 'trải nghiệm'"],
-        [/\bchính hảng\b/gi, 'chính hãng', "Chuẩn chính tả: 'chính hãng'"],
-        [/\bưu đải\b/gi, 'ưu đãi', "Chuẩn chính tả: 'ưu đãi'"],
-        [/\bdư giả\b/gi, 'dư dả', "Chuẩn chính tả: 'dư dả'"],
-        [/\brãnh rỗi\b/gi, 'rảnh rỗi', "Chuẩn chính tả: 'rảnh rỗi'"],
-        [/\bcãm nhận\b/gi, 'cảm nhận', "Chuẩn chính tả: 'cảm nhận'"],
-        [/\bdưởng ẩm\b/gi, 'dưỡng ẩm', "Chuẩn chính tả: 'dưỡng ẩm'"],
-        [/\bdể thương\b/gi, 'dễ thương', "Chuẩn chính tả: 'dễ thương'"],
-        [/\bhửu ích\b/gi, 'hữu ích', "Chuẩn chính tả: 'hữu ích'"],
-        [/\blổi lầm\b/gi, 'lỗi lầm', "Chuẩn chính tả: 'lỗi lầm'"],
-        [/\brẽ rề\b/gi, 'rẻ rề', "Chuẩn chính tả: 'rẻ rề'"],
-        [/\brực rở\b/gi, 'rực rỡ', "Chuẩn chính tả: 'rực rỡ'"],
-        [/\brạng rở\b/gi, 'rạng rỡ', "Chuẩn chính tả: 'rạng rỡ'"],
-        [/\bngở ngàng\b/gi, 'ngỡ ngàng', "Chuẩn chính tả: 'ngỡ ngàng'"],
-        [/\bvững trãi\b/gi, 'vững chãi', "Chuẩn chính tả: 'vững chãi'"],
-        [/\bmê mẫn\b/gi, 'mê mẩn', "Chuẩn chính tả: 'mê mẩn'"],
-        [/\bbền bĩ\b/gi, 'bền bỉ', "Chuẩn chính tả: 'bền bỉ'"],
-        [/\btỉ mĩ\b/gi, 'tỉ mỉ', "Chuẩn chính tả: 'tỉ mỉ'"],
-        [/\bhướng dẩn\b/gi, 'hướng dẫn', "Chuẩn chính tả: 'hướng dẫn'"],
-        [/\bnhược điễm\b/gi, 'nhược điểm', "Chuẩn chính tả: 'nhược điểm'"],
-        [/\bưu điễm\b/gi, 'ưu điểm', "Chuẩn chính tả: 'ưu điểm'"],
-        [/\bvội vả\b/gi, 'vội vã', "Chuẩn chính tả: 'vội vã'"],
-        [/\bđầy đũ\b/gi, 'đầy đủ', "Chuẩn chính tả: 'đầy đủ'"],
-        [/\bsẳn sàng\b/gi, 'sẵn sàng', "Chuẩn chính tả: 'sẵn sàng'"],
-        [/\bsữa rữa mặt\b/gi, 'sữa rửa mặt', "Chuẩn chính tả: 'sữa rửa mặt'"],
-        [/\bsửa rửa mặt\b/gi, 'sữa rửa mặt', "Chuẩn chính tả: 'sữa rửa mặt'"],
-        [/\bsửa tắm\b/gi, 'sữa tắm', "Chuẩn chính tả: 'sữa tắm'"],
-        [/\bsữa soạn\b/gi, 'sửa soạn', "Chuẩn chính tả: 'sửa soạn'"],
-        [/\bsửa chửa\b/gi, 'sửa chữa', "Chuẩn chính tả: 'sửa chữa'"],
-        [/\bsữa chữa\b/gi, 'sửa chữa', "Chuẩn chính tả: 'sửa chữa'"],
-        [/\bxịn xò\b/gi, 'xịn sò', "Chuẩn chính tả: 'xịn sò'"],
-        [/\bsắp sếp\b/gi, 'sắp xếp', "Chuẩn chính tả: 'sắp xếp'"],
-        [/\bxắp xếp\b/gi, 'sắp xếp', "Chuẩn chính tả: 'sắp xếp'"],
-        [/\bsuất sắc\b/gi, 'xuất sắc', "Chuẩn chính tả: 'xuất sắc'"],
-        [/\bxuất ăn\b/gi, 'suất ăn', "Chuẩn chính tả: 'suất ăn'"],
-        [/\bxuất vé\b/gi, 'suất vé', "Chuẩn chính tả: 'suất vé'"],
-        [/\bbổ xung\b/gi, 'bổ sung', "Chuẩn chính tả: 'bổ sung'"],
-        [/\bsơ xuất\b/gi, 'sơ suất', "Chuẩn chính tả: 'sơ suất'"],
-        [/\bxơ suất\b/gi, 'sơ suất', "Chuẩn chính tả: 'sơ suất'"],
-        [/\bchau chuốt\b/gi, 'trau chuốt', "Chuẩn chính tả: 'trau chuốt'"],
-        [/\btrau truốt\b/gi, 'trau chuốt', "Chuẩn chính tả: 'trau chuốt'"],
-        [/\bchuẩn đoán\b/gi, 'chẩn đoán', "Chuẩn chính tả: 'chẩn đoán'"],
-        [/\bchín mùi\b/gi, 'chín muồi', "Chuẩn chính tả: 'chín muồi'"],
-        [/\bthăm quan\b/gi, 'tham quan', "Chuẩn chính tả: 'tham quan'"],
-        [/\bbạc mạng\b/gi, 'bạt mạng', "Chuẩn chính tả: 'bạt mạng'"],
-        [/\bchung thực\b/gi, 'trung thực', "Chuẩn chính tả: 'trung thực'"],
-        [/\bcọ sát\b/gi, 'cọ xát', "Chuẩn chính tả: 'cọ xát'"],
-        [/\bsáng lạng\b/gi, 'xán lạn', "Chuẩn chính tả: 'xán lạn'"],
-        [/\bxáng lạn\b/gi, 'xán lạn', "Chuẩn chính tả: 'xán lạn'"],
-        [/\btựu chung\b/gi, 'tựu trung', "Chuẩn chính tả: 'tựu trung'"],
-        [/\bvô hình chung\b/gi, 'vô hình trung', "Chuẩn chính tả: 'vô hình trung'"],
-        [/\bđường xá\b/gi, 'đường sá', "Chuẩn chính tả: 'đường sá'"],
-        [/\bsuôn xẻ\b/gi, 'suôn sẻ', "Chuẩn chính tả: 'suôn sẻ'"],
-        [/\bsuông sẻ\b/gi, 'suôn sẻ', "Chuẩn chính tả: 'suôn sẻ'"],
-        [/\bxăm soi\b/gi, 'săm soi', "Chuẩn chính tả: 'săm soi'"],
-        [/\bsát sao\b/gi, 'sát sao', "Chuẩn chính tả: 'sát sao'"],
-        [/\bsử lý\b/gi, 'xử lý', "Chuẩn chính tả: 'xử lý'"],
-        [/\bxử dụng\b/gi, 'sử dụng', "Chuẩn chính tả: 'sử dụng'"],
-        [/\bsuất sứ\b/gi, 'xuất xứ', "Chuẩn chính tả: 'xuất xứ'"],
-        [/\btinh sảo\b/gi, 'tinh xảo', "Chuẩn chính tả: 'tinh xảo'"],
-        [/\bxành điệu\b/gi, 'sành điệu', "Chuẩn chính tả: 'sành điệu'"],
-        [/\bdấu giếm\b/gi, 'giấu giếm', "Chuẩn chính tả: 'giấu giếm'"],
-        [/\bgiành cho\b/gi, 'dành cho', "Chuẩn chính tả: 'dành cho'"],
-        [/\bgiành riêng\b/gi, 'dành riêng', "Chuẩn chính tả: 'dành riêng'"],
-        [/\bdành giật\b/gi, 'giành giật', "Chuẩn chính tả: 'giành giật'"],
-        [/\bdùm\b/gi, 'giùm', "Chuẩn chính tả: 'giùm'"],
-        [/\bdỏ hàng\b/gi, 'giỏ hàng', "Chuẩn chính tả: 'giỏ hàng'"],
-        [/\bzỏ hàng\b/gi, 'giỏ hàng', "Chuẩn chính tả: 'giỏ hàng'"],
-        [/\bdao hàng\b/gi, 'giao hàng', "Chuẩn chính tả: 'giao hàng'"],
-        [/\bdá rẻ\b/gi, 'giá rẻ', "Chuẩn chính tả: 'giá rẻ'"],
-        [/\bzá rẻ\b/gi, 'giá rẻ', "Chuẩn chính tả: 'giá rẻ'"],
-        [/\bdải pháp\b/gi, 'giải pháp', "Chuẩn chính tả: 'giải pháp'"],
-        [/\bdao diện\b/gi, 'giao diện', "Chuẩn chính tả: 'giao diện'"],
-        [/\bgiả cả\b/gi, 'giá cả', "Chuẩn chính tả: 'giá cả'"],
-        [/\btuyệt dời\b/gi, 'tuyệt vời', "Chuẩn chính tả: 'tuyệt vời'"],
-        [/\btuyệt zời\b/gi, 'tuyệt vời', "Chuẩn chính tả: 'tuyệt vời'"],
-        [/\bvừa dặn\b/gi, 'vừa vặn', "Chuẩn chính tả: 'vừa vặn'"],
-        [/\btrân thực\b/gi, 'chân thực', "Chuẩn chính tả: 'chân thực'"],
-        [/\bchân trọng\b/gi, 'trân trọng', "Chuẩn chính tả: 'trân trọng'"],
-        [/\btri tiết\b/gi, 'chi tiết', "Chuẩn chính tả: 'chi tiết'"],
-        [/\bchải nghiệm\b/gi, 'trải nghiệm', "Chuẩn chính tả: 'trải nghiệm'"],
-        [/\bchực quan\b/gi, 'trực quan', "Chuẩn chính tả: 'trực quan'"],
-        [/\btrắc trắn\b/gi, 'chắc chắn', "Chuẩn chính tả: 'chắc chắn'"],
-        [/\bmịn màn\b/gi, 'mịn màng', "Chuẩn chính tả: 'mịn màng'"],
-        [/\bthắm nhanh\b/gi, 'thấm nhanh', "Chuẩn chính tả: 'thấm nhanh'"],
-        [/\bchóng nước\b/gi, 'chống nước', "Chuẩn chính tả: 'chống nước'"],
-        [/\bđặc hàng\b/gi, 'đặt hàng', "Chuẩn chính tả: 'đặt hàng'"],
-        [/\bchất lượn\b/gi, 'chất lượng', "Chuẩn chính tả: 'chất lượng'"],
-        [/\bchất lựơng\b/gi, 'chất lượng', "Chuẩn chính tả: 'chất lượng'"],
-        [/\btrắn sáng\b/gi, 'trắng sáng', "Chuẩn chính tả: 'trắng sáng'"],
-        [/\btiếc kiệm\b/gi, 'tiết kiệm', "Chuẩn chính tả: 'tiết kiệm'"],
-        [/\bđúng đắng\b/gi, 'đúng đắn', "Chuẩn chính tả: 'đúng đắn'"],
-        [/\bđóng gối\b/gi, 'đóng gói', "Chuẩn chính tả: 'đóng gói'"],
-        [/\bsán mịn\b/gi, 'sáng mịn', "Chuẩn chính tả: 'sáng mịn'"],
-        [/\bbảo hảnh\b/gi, 'bảo hành', "Chuẩn chính tả: 'bảo hành'"],
-        [/\bduwocj\b/gi, 'được', "Sửa lỗi gõ Telex: 'được'"],
-        [/\bdduocj\b/gi, 'được', "Sửa lỗi gõ Telex: 'được'"],
-        [/\bnhieeuf\b/gi, 'nhiều', "Sửa lỗi gõ Telex: 'nhiều'"],
-        [/\bnguwowfi\b/gi, 'người', "Sửa lỗi gõ Telex: 'người'"],
-        [/\bkhonog\b/gi, 'không', "Sửa lỗi gõ Telex: 'không'"],
-        [/\bthoong\b/gi, 'thông', "Sửa lỗi gõ Telex: 'thông'"],
-        [/\btoots\b/gi, 'tốt', "Sửa lỗi gõ Telex: 'tốt'"],
-        [/\bmays\b/gi, 'máy', "Sửa lỗi gõ Telex: 'máy'"],
-        [/\bcuar\b/gi, 'của', "Sửa lỗi gõ Telex: 'của'"],
-        [/\bchiecs\b/gi, 'chiếc', "Sửa lỗi gõ Telex: 'chiếc'"],
-        [/\bnhé cả nhà\b/gi, 'nha cả nhà', "Chuẩn hóa Nam Bộ: 'nha cả nhà'"],
-        [/\bnhé mọi người\b/gi, 'nha cả nhà', "Chuẩn hóa Nam Bộ: 'nha cả nhà'"],
-        [/\bnhé\b/gi, 'nha', "Chuẩn hóa Nam Bộ: 'nha'"],
-        [/\bnhá\b/gi, 'nha', "Chuẩn hóa Nam Bộ: 'nha'"],
-        [/\bnhỉ\b/gi, 'nha', "Chuẩn hóa Nam Bộ: 'nha'"],
-        [/\bthật là\b/gi, 'thiệt là', "Chuẩn hóa Nam Bộ: 'thiệt là'"],
-        [/\bthật sự\b/gi, 'thiệt sự', "Chuẩn hóa Nam Bộ: 'thiệt sự'"],
-        [/\bthật luôn\b/gi, 'thiệt luôn', "Chuẩn hóa Nam Bộ: 'thiệt luôn'"],
-        [/\bxem ngay\b/gi, 'coi ngay', "Chuẩn hóa Nam Bộ: 'coi ngay'"],
-        [/\bxem thử\b/gi, 'coi thử', "Chuẩn hóa Nam Bộ: 'coi thử'"],
-        [/\bnhìn vào\b/gi, 'nhìn vô', "Chuẩn hóa Nam Bộ: 'nhìn vô'"],
-        [/\bcho vào\b/gi, 'cho vô', "Chuẩn hóa Nam Bộ: 'cho vô'"],
-        [/\bbát ăn\b/gi, 'chén ăn', "Chuẩn hóa Nam Bộ: 'chén ăn'"],
-        [/\bthìa\b/gi, 'muỗng', "Chuẩn hóa Nam Bộ: 'muỗng'"],
-        [/\bhoa quả\b/gi, 'trái cây', "Chuẩn hóa Nam Bộ: 'trái cây'"],
-        [/\bchúng mình\b/gi, 'tụi mình', "Chuẩn hóa Nam Bộ: 'tụi mình'"],
-        [/\bchúng tôi\b/gi, 'tụi mình', "Chuẩn hóa Nam Bộ: 'tụi mình'"],
-        [/\bthế này\b/gi, 'như vầy', "Chuẩn hóa Nam Bộ: 'như vầy'"]
-      ];
-
-      function serverPreserveCase(original: string, target: string): string {
-        if (!original || !target) return target;
-        if (original === original.toUpperCase() && original !== original.toLowerCase()) return target.toUpperCase();
-        const first = original.charAt(0);
-        if (first === first.toUpperCase() && first !== first.toLowerCase()) {
-          return target.charAt(0).toUpperCase() + target.slice(1);
-        }
-        return target;
-      }
 
       const fixedDetails: string[] = [];
       let count = 0;
@@ -1896,11 +2011,7 @@ Trả về phản hồi JSON theo schema:
           .trim();
         const originalTxt = txt;
 
-        for (const [pat, rep, reason] of localSpellRules) {
-          if (pat.test(txt)) {
-            txt = txt.replace(pat, (m) => serverPreserveCase(m, rep));
-          }
-        }
+        txt = applyServerSpellCorrections(txt);
 
         txt = txt.replace(/\s+([,.\?!;:\u2026])/g, '$1')
                  .replace(/([,;:])([^\s\d])/g, '$1 $2')
@@ -1966,8 +2077,12 @@ app.get("/api/system-status", (req, res) => {
 async function setupServerRouting() {
   if (process.env.NODE_ENV !== "production") {
     // Development Environment: Hook up Vite Dev Server Middleware
+    // Disable HMR websocket server to avoid port 24678 collisions in AI Studio preview
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { 
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -1979,10 +2094,31 @@ async function setupServerRouting() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[AI-STUDIO] Server is up and running on http://localhost:${PORT}`);
-  });
 }
 
-setupServerRouting();
+// Start listening immediately so port 3000 is open in <10ms for container supervisor
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[AI-STUDIO] Server is up and running on http://localhost:${PORT}`);
+});
+
+server.on("error", (err: any) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`[AI-STUDIO] Port ${PORT} already in use.`);
+  } else {
+    console.error("[AI-STUDIO] Server error:", err);
+  }
+});
+
+const gracefulShutdown = () => {
+  console.log("[AI-STUDIO] Shutting down gracefully...");
+  server.close(() => {
+    process.exit(0);
+  });
+};
+
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);
+
+setupServerRouting().catch((err) => {
+  console.error("[AI-STUDIO] Failed to initialize Vite middleware:", err);
+});

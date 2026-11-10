@@ -3961,8 +3961,9 @@ export default function App() {
               const maxWidth = Math.round(canvasWidth * 0.86);
               const lineHeight = Math.round(baseFontSize * 1.38);
 
-              // Subtitles multi-words wrapping logic with proper case formatting
-              const formattedSubText = subtitleCase === 'uppercase' ? currentSub.text.toUpperCase() : currentSub.text;
+              // Subtitles multi-words wrapping logic with proper case formatting and 100% Vietnamese spell validation
+              const cleanedRawText = correctVietnameseSpelling(currentSub.text || "").correctedText;
+              const formattedSubText = subtitleCase === 'uppercase' ? cleanedRawText.toUpperCase() : cleanedRawText;
               const words = formattedSubText.split(' ');
               let line = '';
               const lines: string[] = [];
@@ -3997,8 +3998,12 @@ export default function App() {
               }
 
               lines.forEach((lineText) => {
-                const lineMetrics = ctx.measureText(lineText);
-                const lineWidth = lineMetrics.width;
+                const lineWords = lineText.split(/\s+/).filter(Boolean);
+                const interWordSpace = Math.max(ctx.measureText(' ').width, Math.round(baseFontSize * 0.32));
+                const totalCalculatedLineWidth = lineWords.reduce((sum, w, wI) => {
+                  return sum + ctx.measureText(w).width + (wI < lineWords.length - 1 ? interWordSpace : 0);
+                }, 0);
+                const lineWidth = wordHighlightEnabled ? totalCalculatedLineWidth : ctx.measureText(lineText).width;
                 const lineX = Math.round(canvasWidth / 2);
 
                 if (subtitleStyle === 'capcut') {
@@ -4026,7 +4031,6 @@ export default function App() {
                 if (wordHighlightEnabled) {
                   ctx.textAlign = 'left';
                   let startX = lineX - lineWidth / 2;
-                  const lineWords = lineText.split(/\s+/);
 
                   lineWords.forEach((wordElement, wIdx) => {
                     const globalIdx = wordIdxCounter;
@@ -4034,9 +4038,8 @@ export default function App() {
                     const isElementCurrent = globalIdx === currentWordIndex;
                     
                     const cleanWord = wordElement;
-                    const trailingSpace = wIdx < lineWords.length - 1 ? ' ' : '';
                     const wordOnlyWidth = ctx.measureText(cleanWord).width;
-                    const spaceWidth = ctx.measureText(trailingSpace).width;
+                    const spaceWidth = wIdx < lineWords.length - 1 ? interWordSpace : 0;
                     const totalWordWidth = wordOnlyWidth + spaceWidth;
 
                     ctx.shadowColor = 'transparent';
@@ -4102,11 +4105,8 @@ export default function App() {
                     } else {
                       ctx.fillText(cleanWord, startX, currentY);
                     }
-
                     ctx.shadowColor = 'transparent';
                     ctx.shadowBlur = 0;
-                    ctx.fillStyle = '#ffffff';
-                    ctx.fillText(trailingSpace, startX + wordOnlyWidth, currentY);
 
                     startX += totalWordWidth;
                   });
@@ -4725,10 +4725,14 @@ export default function App() {
   // Derived state for live subtitle synchronizing preview
   const activeScriptText = editedScript || (activeReview?.marketingScript || '');
   
-  // Tự động phân bổ lại thời gian phụ đề song ngữ và đồng bộ tuyệt đối 100% với giọng lồng tiếng AI thực tế
+  // Tự động phân bổ lại thời gian phụ đề song ngữ và chuẩn hóa chính tả 100% tiếng Việt
   const subtitleSegments = useMemo(() => {
     if (customSubtitleSegments) {
-      return customSubtitleSegments;
+      return customSubtitleSegments.map(seg => ({
+        ...seg,
+        text: correctVietnameseSpelling(seg.text || "").correctedText,
+        translation: cleanSubtitleTranslation(subtitleTranslations[seg.text] || seg.translation || "")
+      }));
     }
     const autoSegments = getSegmentsFromScript(
       activeScriptText,
@@ -4736,6 +4740,7 @@ export default function App() {
     );
     return autoSegments.map(seg => ({
       ...seg,
+      text: correctVietnameseSpelling(seg.text || "").correctedText,
       translation: cleanSubtitleTranslation(subtitleTranslations[seg.text] || "")
     }));
   }, [activeScriptText, audioDuration, customSubtitleSegments, subtitleTranslations]);
@@ -4804,9 +4809,10 @@ export default function App() {
   const handleSaveInlineSubtitleEdit = (index: number, newText: string) => {
     const updated = [...subtitleSegments];
     if (updated[index]) {
+      const spell = correctVietnameseSpelling(newText.trim());
       updated[index] = {
         ...updated[index],
-        text: newText.trim()
+        text: spell.correctedText || newText.trim()
       };
       setCustomSubtitleSegments(updated);
       setEditingSegmentIdx(null);
@@ -7538,6 +7544,17 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                                                 text: e.target.value
                                               };
                                               setCustomSubtitleSegments(updated);
+                                            }}
+                                            onBlur={(e) => {
+                                              const spell = correctVietnameseSpelling(e.target.value);
+                                              if (spell.correctedText && spell.correctedText !== e.target.value) {
+                                                const updated = [...customSubtitleSegments];
+                                                updated[index] = {
+                                                  ...segment,
+                                                  text: spell.correctedText
+                                                };
+                                                setCustomSubtitleSegments(updated);
+                                              }
                                             }}
                                             className="w-full bg-[#0a0a0a] border border-white/5 hover:border-white/10 focus:border-amber-500/30 rounded p-1 text-[8.5px] text-slate-200 focus:outline-none transition-all my-1"
                                             placeholder="Nội dung phụ đề..."

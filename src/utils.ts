@@ -686,14 +686,22 @@ const VIETNAMESE_SPELL_RULES: Array<{ pattern: RegExp; replacement: string | ((m
   { pattern: /\brấtt\b/gi, replacement: 'rất', reason: "Sửa lỗi nhân đôi ký tự 'rấtt' -> 'rất'" },
   { pattern: /\bxịnn\b/gi, replacement: 'xịn', reason: "Sửa lỗi nhân đôi ký tự 'xịnn' -> 'xịn'" },
 
-  // Sửa lỗi gõ dính phím, lỗi OCR hoặc phiên âm món ăn & ẩm thực
+  // Sửa lỗi gõ dính phím, lỗi OCR hoặc phiên âm món ăn, ẩm thực & phụ đề ngắn
+  { pattern: /\bmđóm\s+iếng\b/gi, replacement: 'mỗi miếng', reason: "Sửa lỗi nhận diện/dính phím 'mđóm iếng' -> 'mỗi miếng'" },
+  { pattern: /\bmđom\s+iếng\b/gi, replacement: 'mỗi miếng', reason: "Sửa lỗi nhận diện/dính phím 'mđom iếng' -> 'mỗi miếng'" },
+  { pattern: /\bmđón\s+iếng\b/gi, replacement: 'mỗi miếng', reason: "Sửa lỗi nhận diện/dính phím 'mđón iếng' -> 'mỗi miếng'" },
+  { pattern: /\bmđóm\s+miếng\b/gi, replacement: 'mỗi miếng', reason: "Sửa lỗi nhận diện 'mđóm miếng' -> 'mỗi miếng'" },
   { pattern: /\bmđóm\b/gi, replacement: 'món', reason: "Sửa lỗi gõ/nhận diện sai 'mđóm' -> 'món'" },
   { pattern: /\bmđon\b/gi, replacement: 'món', reason: "Sửa lỗi nhận diện 'mđon' -> 'món'" },
   { pattern: /\bmđom\b/gi, replacement: 'món', reason: "Sửa lỗi nhận diện 'mđom' -> 'món'" },
-  { pattern: /\bliu r\.?u\b/gi, replacement: 'liu riu', reason: "Sửa chính tả nấu nướng 'liu riu'" },
+  { pattern: /\biếng\s+(chuối|bánh|thịt|cá|trái|hoa|đậu|chả|gà|bò)/gi, replacement: 'miếng $1', reason: "Sửa lỗi gõ thiếu phụ âm đầu 'iếng' -> 'miếng'" },
+  { pattern: /\bliu\s+r\.+u\b/gi, replacement: 'liu riu', reason: "Sửa chính tả nấu nướng 'liu riu'" },
+  { pattern: /\bliu\s+riu\b/gi, replacement: 'liu riu', reason: "Chuẩn hóa 'liu riu'" },
   { pattern: /\bliuriu\b/gi, replacement: 'liu riu', reason: "Tách từ 'liu riu'" },
+  { pattern: /\br\.+u\b/gi, replacement: 'riu', reason: "Sửa lỗi dính dấu chấm 'r.u' -> 'riu'" },
+  { pattern: /\bchuối\s+nam\b/gi, replacement: 'chuối xiêm', reason: "Chuẩn hóa tên chuối Nam Bộ: 'chuối xiêm'" },
+  { pattern: /\bchuốinam\b/gi, replacement: 'chuối xiêm', reason: "Tách từ dính phím 'chuối xiêm'" },
   { pattern: /\bmiếngchuối\b/gi, replacement: 'miếng chuối', reason: "Tách từ dính phím 'miếng chuối'" },
-  { pattern: /\bchuốinam\b/gi, replacement: 'chuối nam', reason: "Tách từ dính phím 'chuối nam'" },
   { pattern: /\bchuốixiêm\b/gi, replacement: 'chuối xiêm', reason: "Tách từ dính phím 'chuối xiêm'" },
   { pattern: /\bbánhchuối\b/gi, replacement: 'bánh chuối', reason: "Tách từ dính phím 'bánh chuối'" },
   { pattern: /\bmónăn\b/gi, replacement: 'món ăn', reason: "Tách từ dính phím 'món ăn'" },
@@ -701,6 +709,24 @@ const VIETNAMESE_SPELL_RULES: Array<{ pattern: RegExp; replacement: string | ((m
   { pattern: /\bbéongậy\b/gi, replacement: 'béo ngậy', reason: "Tách từ dính phím 'béo ngậy'" },
   { pattern: /\bgiònrụm\b/gi, replacement: 'giòn rụm', reason: "Tách từ dính phím 'giòn rụm'" },
   { pattern: /\bđậmđà\b/gi, replacement: 'đậm đà', reason: "Tách từ dính phím 'đậm đà'" },
+  { pattern: /\b(chiên|vàng|ngon|rất|da)\s+zòn\b/gi, replacement: '$1 giòn', reason: "Chuẩn chính tả: '$1 giòn'" },
+  { pattern: /\b(chiên|vàng|ngon|rất|da)\s+dòn\b/gi, replacement: '$1 giòn', reason: "Chuẩn chính tả: '$1 giòn'" },
+  { pattern: /\bvàng\s+dòn\b/gi, replacement: 'vàng giòn', reason: "Chuẩn chính tả: 'vàng giòn'" },
+  { pattern: /\bvàng\s+zòn\b/gi, replacement: 'vàng giòn', reason: "Chuẩn chính tả: 'vàng giòn'" },
+  { pattern: /\bchiên\s+dòn\b/gi, replacement: 'chiên giòn', reason: "Chuẩn chính tả: 'chiên giòn'" },
+  { pattern: /\bchiên\s+zòn\b/gi, replacement: 'chiên giòn', reason: "Chuẩn chính tả: 'chiên giòn'" },
+  { pattern: /\bdòn\s+rụm\b/gi, replacement: 'giòn rụm', reason: "Chuẩn chính tả: 'giòn rụm'" },
+  { pattern: /\bzòn\s+rụm\b/gi, replacement: 'giòn rụm', reason: "Chuẩn chính tả: 'giòn rụm'" },
+  { pattern: /\bzòn\b/gi, replacement: 'giòn', reason: "Chuẩn chính tả: 'giòn'" },
+  { pattern: /\bdòn\b/gi, replacement: 'giòn', reason: "Chuẩn chính tả: 'giòn'" },
+  { pattern: /\bthơm\s+phứt\b/gi, replacement: 'thơm phức', reason: "Chuẩn chính tả: 'thơm phức'" },
+  { pattern: /\bnóng\s+hỗi\b/gi, replacement: 'nóng hổi', reason: "Chuẩn chính tả: 'nóng hổi' (dấu hỏi)" },
+  { pattern: /\bdầu\s+mở\b/gi, replacement: 'dầu mỡ', reason: "Chuẩn chính tả: 'dầu mỡ' (dấu ngã)" },
+  { pattern: /\bkhuấy\s+đều\b/gi, replacement: 'khuấy đều', reason: "Chuẩn chính tả: 'khuấy đều'" },
+  { pattern: /\bquấy\s+đều\b/gi, replacement: 'khuấy đều', reason: "Chuẩn hóa ẩm thực Nam Bộ: 'khuấy đều'" },
+  { pattern: /\bthơm\s+nức\s+mủi\b/gi, replacement: 'thơm nức mũi', reason: "Chuẩn chính tả: 'thơm nức mũi' (dấu ngã)" },
+  { pattern: /\bướp\s+da\s+vị\b/gi, replacement: 'ướp gia vị', reason: "Chuẩn chính tả: 'ướp gia vị'" },
+  { pattern: /\bngon\s+miệng\b/gi, replacement: 'ngon miệng', reason: "Chuẩn chính tả: 'ngon miệng'" },
 
   // 6. Modern Standard Vietnamese Tone Placement (Quy chuẩn vị trí dấu thanh Bộ GD&ĐT)
   { pattern: /\bhoà\b/gi, replacement: 'hòa', reason: "Chuẩn hóa vị trí dấu thanh: 'hòa'" },
@@ -753,6 +779,35 @@ const VIETNAMESE_SPELL_RULES: Array<{ pattern: RegExp; replacement: string | ((m
 ];
 
 /**
+ * Helper to convert ASCII word boundaries to true Unicode Vietnamese character boundaries
+ */
+function toUnicodeBoundaryRegex(regex: RegExp): RegExp {
+  let src = regex.source;
+  if (src.startsWith('^\\b')) {
+    src = '^(?<![\\p{L}\\p{N}])' + src.slice(4);
+  } else if (src.startsWith('\\b')) {
+    src = '(?<![\\p{L}\\p{N}])' + src.slice(2);
+  }
+  if (src.endsWith('\\b$')) {
+    src = src.slice(0, -4) + '(?![\\p{L}\\p{N}])$';
+  } else if (src.endsWith('\\b')) {
+    src = src.slice(0, -2) + '(?![\\p{L}\\p{N}])';
+  }
+  let flags = regex.flags;
+  if (!flags.includes('u')) flags += 'u';
+  if (!flags.includes('g')) flags += 'g';
+  if (!flags.includes('i')) flags += 'i';
+  return new RegExp(src, flags);
+}
+
+// Pre-compiled unicode-aware rules cache for optimal zero-overhead performance
+const COMPILED_VIETNAMESE_SPELL_RULES = VIETNAMESE_SPELL_RULES.map(rule => ({
+  pattern: toUnicodeBoundaryRegex(rule.pattern),
+  replacement: rule.replacement,
+  reason: rule.reason
+}));
+
+/**
  * Intelligent Vietnamese Spell & Grammar Corrector
  * Fixes spelling, accents, typos, and typography while preserving capitalization structure.
  */
@@ -763,8 +818,10 @@ export function correctVietnameseSpelling(text: string): { correctedText: string
   let corrected = text.normalize('NFC');
   const fixes: SpellingCorrection[] = [];
 
-  for (const rule of VIETNAMESE_SPELL_RULES) {
+  for (const rule of COMPILED_VIETNAMESE_SPELL_RULES) {
+    rule.pattern.lastIndex = 0;
     if (rule.pattern.test(corrected)) {
+      rule.pattern.lastIndex = 0;
       const originalMatches = corrected.match(rule.pattern);
       if (originalMatches) {
         originalMatches.forEach(m => {
@@ -778,12 +835,21 @@ export function correctVietnameseSpelling(text: string): { correctedText: string
           });
         });
       }
+      rule.pattern.lastIndex = 0;
       corrected = corrected.replace(rule.pattern, (match, ...args) => {
         if (typeof rule.replacement === 'function') {
           return rule.replacement(match, ...args);
         }
-        return preserveCase(match, rule.replacement);
+        let rep = rule.replacement;
+        if (typeof rep === 'string' && rep.includes('$1') && args[0] !== undefined) {
+          rep = rep.replace('$1', String(args[0]));
+        }
+        if (typeof rep === 'string' && rep.includes('$2') && args[1] !== undefined) {
+          rep = rep.replace('$2', String(args[1]));
+        }
+        return preserveCase(match, rep);
       });
+      rule.pattern.lastIndex = 0;
     }
   }
 
