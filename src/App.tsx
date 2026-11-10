@@ -74,7 +74,8 @@ import {
   Radio as RadioIcon,
   FastForward,
   RotateCcw,
-  Activity
+  Activity,
+  AlertTriangle
 } from 'lucide-react';
 import { ReviewReport, TTS_VOICES, TTSVoiceOption, SavedReview, TrendingProduct, UploadedVideoSegment, SubtitleFontId, SUBTITLE_FONTS } from './types';
 import { 
@@ -86,7 +87,6 @@ import {
   pcmToWav, 
   formatBytes, 
   parseMarkdown, 
-  generateSilentWav, 
   exportToSRT, 
   exportToVTT, 
   playSynthesizedSFX,
@@ -96,7 +96,7 @@ import {
   StoryboardScene,
   correctVietnameseSpelling,
   auditAndFixSubtitlesSpelling,
-  getFallbackReviewReport
+  wrapSubtitleIntoLines
 } from './utils';
 import ysFixWebmDuration from 'fix-webm-duration';
 
@@ -1827,6 +1827,21 @@ export default function App() {
   const [mergeProgress, setMergeProgress] = useState<number>(0);
   const [mergedVideoUrl, setMergedVideoUrl] = useState<string>('');
   const [mergedVideoExt, setMergedVideoExt] = useState<string>('mp4');
+  const isExportCancelledRef = useRef<boolean>(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+
+  const cancelVideoExport = () => {
+    if (!isMerging) return;
+    isExportCancelledRef.current = true;
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (e) {}
+    }
+    setIsMerging(false);
+    setMergeProgress(0);
+    setApiError("Đã hủy quá trình xuất video theo yêu cầu của bạn.");
+  };
 
   // Mobile optimization tab state
   const [activeMobileTab, setActiveMobileTab] = useState<'inputs' | 'results' | 'studio'>('inputs');
@@ -2727,25 +2742,9 @@ export default function App() {
       setActiveMobileTab('results');
     } catch (err: any) {
       console.error("Lỗi gọi API phân tích video:", err);
-      // Auto-fallback so the user on Cloudflare Workers / external deploy is NEVER blocked
-      const fallbackData = getFallbackReviewReport(productName, productDesc);
-      const generatedId = `custom_${Date.now()}`;
-      const fallbackReport: ReviewReport = {
-        ...fallbackData,
-        id: generatedId,
-        videoMimeType: uploadedMimeType,
-        videoSize: uploadedFileSize,
-      };
-      setActiveReview(fallbackReport);
-      setResultSubTab('review');
-      setActiveMobileTab('results');
-
-      const isCloudflare = window.location.hostname.includes('workers.dev') || window.location.hostname.includes('pages.dev');
-      if (isCloudflare) {
-        setApiError(`💡 Hướng dẫn Cloudflare Deploy: Máy chủ ${window.location.hostname} chưa cấu hình biến môi trường GEMINI_API_KEY trong Cloudflare Dashboard (Settings > Variables and Secrets). Hệ thống đã tự động tạo Review & Kịch bản thông minh để bạn tiếp tục chỉnh sửa & xuất video bình thường!`);
-      } else {
-        setApiError(err.message ? `${err.message} (Hệ thống đã tự động chuyển sang chế độ tạo kịch bản thông minh cục bộ)` : 'Hệ thống đã tự động chuyển sang chế độ tạo kịch bản thông minh.');
-      }
+      // Strictly honest error handling: Never fabricate review data when Gemini fails
+      const errorMessage = err.message || 'Không thể hoàn thành phân tích video từ máy chủ Gemini AI. Vui lòng bấm "Phân tích Video ngay" để thử lại.';
+      setApiError(errorMessage);
     } finally {
       setIsAnalyzing(false);
       setExtractionProgress(null);
@@ -2993,19 +2992,17 @@ export default function App() {
           setIsGeneratingTTS(false);
           return;
         }
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `Lỗi máy chủ lồng tiếng (${response.status})`);
+      } else {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `Lỗi kết nối máy chủ lồng tiếng (${response.status})`);
       }
-
-      // Fallback if backend TTS is unavailable (e.g. on Cloudflare Workers without GEMINI_API_KEY)
-      const estimatedSec = Math.max(5, Math.ceil(textToSynthesize.split(/\s+/).length * 0.35));
-      const silentUrl = generateSilentWav(estimatedSec);
-      setAudioUrl(silentUrl);
-      setApiError("Lưu ý: Chưa thể tải giọng đọc AI trực tiếp từ máy chủ (do Cloudflare chưa cấu hình GEMINI_API_KEY). Hệ thống đã tạo mốc thời gian âm thanh dự phòng để đồng bộ video & phụ đề.");
     } catch (err: any) {
       console.error("Lỗi kết nối máy chủ lồng tiếng:", err);
-      const estimatedSec = Math.max(5, Math.ceil(textToSynthesize.split(/\s+/).length * 0.35));
-      const silentUrl = generateSilentWav(estimatedSec);
-      setAudioUrl(silentUrl);
-      setApiError("Đã tạo đường dẫn âm thanh đồng bộ dự phòng cho video.");
+      // Strictly honest: Never substitute real TTS with silent audio
+      setAudioUrl("");
+      setApiError(`Không thể tạo giọng đọc lồng tiếng: ${err.message || 'Lỗi kết nối máy chủ'}. Vui lòng thử lại sau giây lát.`);
     } finally {
       setIsGeneratingTTS(false);
     }
@@ -3156,6 +3153,7 @@ export default function App() {
     }
 
     try {
+      isExportCancelledRef.current = false;
       setIsMerging(true);
       setMergeProgress(0);
       setMergedVideoUrl('');
@@ -4379,15 +4377,20 @@ export default function App() {
       audioEl.muted = false;
       audioEl.volume = 1.0;
 
-      // Try high-quality standard video formats, prioritizing MP4 over WebM for native TikTok compatibility of the recorded container.
-      const mimeTypesToTry = [
+      // Multi-device codec cascade: On Android browsers, hardware-accelerated VP8/VP9 WebM is universally supported
+      const isAndroid = typeof navigator !== 'undefined' && /Android/i.test(navigator.userAgent);
+      const mimeTypesToTry = isAndroid ? [
+        'video/webm;codecs=vp8,opus',
+        'video/webm;codecs=vp9,opus',
+        'video/webm',
+        'video/mp4;codecs=avc1,mp4a.40.2',
+        'video/mp4'
+      ] : [
         'video/mp4;codecs=h264,aac',
         'video/mp4;codecs=h264,opus',
         'video/mp4;codecs=avc1,mp4a.40.2',
         'video/mp4;codecs=avc1',
         'video/mp4',
-        'video/webm;codecs=h264,opus',
-        'video/webm;codecs=h264',
         'video/webm;codecs=vp9,opus',
         'video/webm;codecs=vp8,opus',
         'video/webm'
@@ -4443,6 +4446,7 @@ export default function App() {
           });
         }
       }
+      mediaRecorderRef.current = mediaRecorder;
       const chunks: Blob[] = [];
 
       mediaRecorder.ondataavailable = (e) => {
@@ -4530,6 +4534,13 @@ export default function App() {
             console.error("Lỗi khôi phục trạng thái audio:", e);
           }
 
+          if (isExportCancelledRef.current) {
+            console.log("[EXPORT] Quá trình xuất video đã bị người dùng hủy.");
+            setIsMerging(false);
+            setMergeProgress(0);
+            return;
+          }
+
           const actualMime = mediaRecorder.mimeType || 'video/webm';
           const isMp4Real = actualMime.startsWith('video/mp4') || (actualMime.includes('mp4') && !actualMime.includes('webm'));
           const finalExtension = isMp4Real ? 'mp4' : 'webm';
@@ -4538,6 +4549,14 @@ export default function App() {
           setMergedVideoExt(finalExtension);
           
           const rawBlob = new Blob(chunks, { type: blobClass });
+
+          if (!rawBlob || rawBlob.size < 1024) {
+            console.error("Lỗi xuất video: File video tạo ra rỗng hoặc nhỏ hơn 1KB (size:", rawBlob?.size, ").");
+            setIsMerging(false);
+            setMergeProgress(0);
+            setApiError("Quá trình xuất video không thu thập được dữ liệu khung hình (file 0 byte). Vui lòng thử lại với cấu hình Bitrate Chuẩn hoặc định dạng WebM.");
+            return;
+          }
 
           const triggerDownload = (finalBlob: Blob) => {
             try {
@@ -8113,14 +8132,27 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
 
                         {/* If merging is active, display a gorgeous micro progress bar */}
                         {isMerging && (
-                          <div className="space-y-1">
+                          <div className="space-y-2 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20">
+                            <div className="flex items-center justify-between text-[10px]">
+                              <span className="text-amber-400 font-bold flex items-center gap-1.5">
+                                <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+                                Đang ghép video & âm thanh: {mergeProgress}%
+                              </span>
+                              <button
+                                type="button"
+                                onClick={cancelVideoExport}
+                                className="px-2 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30 text-[9px] font-bold cursor-pointer transition-colors"
+                              >
+                                Hủy xuất
+                              </button>
+                            </div>
                             <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden relative">
                               <div 
                                 className="h-full bg-gradient-to-r from-amber-500 to-amber-400 transition-all duration-300 rounded-full"
                                 style={{ width: `${mergeProgress}%` }}
                               ></div>
                             </div>
-                            <p className="text-[8px] text-slate-500 text-center leading-normal italic">
+                            <p className="text-[8px] text-slate-400 text-center leading-normal italic">
                               Hệ thống đang chạy đồng bộ hình ảnh và lồng tiếng trực tiếp trên trình duyệt. Vui lòng giữ tab này hoạt động!
                             </p>
                           </div>
@@ -8927,6 +8959,65 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                       &ldquo;{activeReview.summary}&rdquo;
                     </p>
                   </div>
+
+                  {/* Observational Truthfulness & Anti-Hallucination Integrity Card */}
+                  {(Boolean(activeReview.observedVisuals?.length) || Boolean(activeReview.unverifiedNotes?.length) || Boolean(activeReview.needsMoreData)) && (
+                    <div className="p-4 rounded-2xl bg-[#0a0a0a] border border-white/10 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-mono uppercase tracking-widest text-amber-400 font-bold flex items-center gap-1.5">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                          MINH BẠCH DỮ LIỆU THỰC TẾ (OBSERVATIONAL INTEGRITY)
+                        </span>
+                        <span className="text-[8px] bg-white/5 border border-white/10 text-slate-400 px-2 py-0.5 rounded font-mono">
+                          ANTI-HALLUCINATION V2
+                        </span>
+                      </div>
+
+                      {activeReview.needsMoreData && activeReview.dataGapMessage && (
+                        <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-300 flex items-start gap-2">
+                          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                          <div>
+                            <strong className="font-semibold block text-amber-200">Gợi ý bổ sung góc quay/thông tin:</strong>
+                            <span>{activeReview.dataGapMessage}</span>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                        {activeReview.observedVisuals && activeReview.observedVisuals.length > 0 && (
+                          <div className="p-3 rounded-xl bg-emerald-500/[0.04] border border-emerald-500/20 space-y-1.5">
+                            <span className="text-[10px] font-bold text-emerald-400 uppercase tracking-wide flex items-center gap-1">
+                              ✓ Mắt thấy trực quan qua khung hình video
+                            </span>
+                            <ul className="space-y-1 text-slate-300 text-[11px]">
+                              {activeReview.observedVisuals.map((vis, vIdx) => (
+                                <li key={vIdx} className="flex items-start gap-1.5">
+                                  <span className="text-emerald-500 mt-0.5">•</span>
+                                  <span>{vis}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                        {activeReview.unverifiedNotes && activeReview.unverifiedNotes.length > 0 && (
+                          <div className="p-3 rounded-xl bg-slate-500/[0.04] border border-slate-500/20 space-y-1.5">
+                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wide flex items-center gap-1">
+                              ⚠️ Cần người mua kiểm chứng thêm
+                            </span>
+                            <ul className="space-y-1 text-slate-400 text-[11px]">
+                              {activeReview.unverifiedNotes.map((note, nIdx) => (
+                                <li key={nIdx} className="flex items-start gap-1.5">
+                                  <span className="text-slate-500 mt-0.5">•</span>
+                                  <span>{note}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
 
                   {/* SMART SYNCHRONIZED REVIEW & SUBTITLE SUITE */}
                   <div className="space-y-6 animate-fadeIn">

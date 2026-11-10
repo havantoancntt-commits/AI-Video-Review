@@ -25,9 +25,83 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : (portArg || 300
 app.get("/__health", (req, res) => res.status(200).send("OK"));
 app.get("/api/health", (req, res) => res.status(200).json({ status: "ok", timestamp: Date.now() }));
 
+// Request Timeout Middleware (90 seconds safety cap for high-definition video processing)
+app.use((req, res, next) => {
+  res.setTimeout(90000, () => {
+    if (!res.headersSent) {
+      res.status(504).json({ error: "Thời gian xử lý yêu cầu vượt quá giới hạn an toàn (90 giây). Vui lòng thử lại với video dung lượng nhỏ hơn." });
+    }
+  });
+  next();
+});
+
 // Set up JSON body parser with increased limit to handle video uploads up to 1 GB
 app.use(express.json({ limit: "1024mb" }));
 app.use(express.urlencoded({ limit: "1024mb", extended: true }));
+
+// In-Memory Sliding Window Rate Limiter
+interface RateLimitRecord {
+  timestamps: number[];
+}
+const rateLimitMap = new Map<string, RateLimitRecord>();
+
+function createRateLimiter(maxRequests: number, windowMs: number) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || '127.0.0.1';
+    const key = `${req.path}:${ip}`;
+    const now = Date.now();
+    const record = rateLimitMap.get(key) || { timestamps: [] };
+    
+    // Filter out timestamps outside current sliding window
+    record.timestamps = record.timestamps.filter(ts => now - ts < windowMs);
+    
+    if (record.timestamps.length >= maxRequests) {
+      const waitSec = Math.ceil((record.timestamps[0] + windowMs - now) / 1000);
+      return res.status(429).json({
+        error: `Quá nhiều yêu cầu đến ${req.path}. Vui lòng chờ ${waitSec} giây trước khi gửi lại.`,
+        code: "RATE_LIMITED",
+        retryAfterSec: waitSec
+      });
+    }
+    
+    record.timestamps.push(now);
+    rateLimitMap.set(key, record);
+    next();
+  };
+}
+
+const aiEndpointLimiter = createRateLimiter(35, 60000); // 35 req/min for AI endpoints
+const generalEndpointLimiter = createRateLimiter(70, 60000); // 70 req/min for general endpoints
+
+// Security: Magic Number / File Signature Validator for Base64 Uploads
+function validateBase64FileSignature(base64Data: string, expectedTypes: string[]): { valid: boolean; detected?: string } {
+  if (!base64Data || base64Data.length < 16) return { valid: false };
+  try {
+    const headerSlice = base64Data.slice(0, 48);
+    const buf = Buffer.from(headerSlice, 'base64');
+    
+    // Check known magic signatures
+    const isJpeg = buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
+    const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47;
+    const isGif = buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46;
+    const isWebp = buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP';
+    const isMp4 = buf.length > 8 && buf.slice(4, 8).toString('ascii') === 'ftyp';
+    const isWebm = buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3;
+    
+    let detected = 'unknown';
+    if (isJpeg) detected = 'image/jpeg';
+    else if (isPng) detected = 'image/png';
+    else if (isGif) detected = 'image/gif';
+    else if (isWebp) detected = 'image/webp';
+    else if (isMp4) detected = 'video/mp4';
+    else if (isWebm) detected = 'video/webm';
+    
+    const valid = expectedTypes.some(t => detected.startsWith(t) || detected === t);
+    return { valid, detected };
+  } catch {
+    return { valid: false };
+  }
+}
 
 // Helper function to lazily initialize the Gemini client so it does not crash if keys are missing
 let googleAi: GoogleGenAI | null = null;
@@ -43,9 +117,7 @@ function getGoogleAI(): GoogleGenAI | null {
     try {
       googleAi = new GoogleGenAI({
         apiKey: key.trim(),
-        apiVersion: "v1alpha",
         httpOptions: {
-          apiVersion: "v1alpha",
           headers: {
             'User-Agent': 'aistudio-build',
           }
@@ -57,6 +129,105 @@ function getGoogleAI(): GoogleGenAI | null {
     }
   }
   return googleAi;
+}
+
+// System Status Live Probe Cache (30s TTL to prevent rate limit exhaustion)
+interface SystemProbeStatus {
+  geminiStatus: "CONNECTED" | "DEGRADED" | "UNAVAILABLE" | "MISCONFIGURED";
+  testedAt: number;
+  model: string;
+  ttsModel: string;
+  latencyMs: number;
+  message: string;
+}
+let statusCache: SystemProbeStatus | null = null;
+
+async function probeGeminiHealth(force = false): Promise<SystemProbeStatus> {
+  const key = process.env.GEMINI_API_KEY || "";
+  const hasKey = !!key && key !== "MY_GEMINI_API_KEY" && key.trim() !== "";
+  
+  if (!hasKey) {
+    return {
+      geminiStatus: "MISCONFIGURED",
+      testedAt: Date.now(),
+      model: "gemini-3.8-flash",
+      ttsModel: "gemini-3.8-flash-lite-tts",
+      latencyMs: 0,
+      message: "Chưa cấu hình GEMINI_API_KEY trong biến môi trường máy chủ."
+    };
+  }
+
+  // Use cached probe if fresh (< 30 seconds) unless force requested
+  if (!force && statusCache && (Date.now() - statusCache.testedAt < 30000)) {
+    return statusCache;
+  }
+
+  const ai = getGoogleAI();
+  if (!ai) {
+    statusCache = {
+      geminiStatus: "MISCONFIGURED",
+      testedAt: Date.now(),
+      model: "gemini-3.8-flash",
+      ttsModel: "gemini-3.8-flash-lite-tts",
+      latencyMs: 0,
+      message: "Khởi tạo GoogleGenAI SDK thất bại với API key hiện tại."
+    };
+    return statusCache;
+  }
+
+  const t0 = Date.now();
+  try {
+    // Perform an actual live health check probe
+    await Promise.race([
+      ai.models.generateContent({
+        model: "gemini-3.8-flash",
+        contents: "ping",
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("PROBE_TIMEOUT")), 4000))
+    ]);
+
+    const latencyMs = Date.now() - t0;
+    statusCache = {
+      geminiStatus: "CONNECTED",
+      testedAt: Date.now(),
+      model: "gemini-3.8-flash",
+      ttsModel: "gemini-3.8-flash-lite-tts",
+      latencyMs,
+      message: `Gemini 3.8 Flash Vision và Flash Lite TTS đã xác minh kết nối thực tế thành công (${latencyMs}ms).`
+    };
+    return statusCache;
+  } catch (err: any) {
+    const latencyMs = Date.now() - t0;
+    const msg = String(err.message || "");
+    
+    const isAuth = msg.includes("403") || msg.includes("PERMISSION_DENIED") || msg.includes("API key");
+    const isQuota = msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("429");
+    const isDegraded = msg.includes("503") || msg.includes("UNAVAILABLE") || msg.includes("high demand") || msg.includes("PROBE_TIMEOUT");
+
+    let geminiStatus: "CONNECTED" | "DEGRADED" | "UNAVAILABLE" | "MISCONFIGURED" = "UNAVAILABLE";
+    let statusMessage = "Không thể kết nối tới Google Gemini API.";
+
+    if (isAuth) {
+      geminiStatus = "MISCONFIGURED";
+      statusMessage = "API Key không hợp lệ hoặc thiếu quyền truy cập Google Generative Language.";
+    } else if (isDegraded) {
+      geminiStatus = "DEGRADED";
+      statusMessage = "Mô hình Gemini đang trải qua thời điểm nhu cầu cao (503 / Timeout). Đang sẵn sàng cơ chế chuyển kênh phụ.";
+    } else if (isQuota) {
+      geminiStatus = "UNAVAILABLE";
+      statusMessage = "Hạn ngạch (Quota) Gemini API đã chạm giới hạn mức sử dụng hiện tại.";
+    }
+
+    statusCache = {
+      geminiStatus,
+      testedAt: Date.now(),
+      model: "gemini-3.8-flash",
+      ttsModel: "gemini-3.8-flash-lite-tts",
+      latencyMs,
+      message: statusMessage
+    };
+    return statusCache;
+  }
 }
 
 // Resilient API Call Execution with Retry & Exponential Backoff for 503 unavailable spikes
@@ -228,12 +399,12 @@ Sản phẩm **${normName}** khẳng định vị thế dẫn đầu trong phân
 }
 
 // Endpoint: Analyze product video to generate detailed reviews and a voiceover script
-app.post("/api/analyze-video", async (req, res): Promise<any> => {
+app.post("/api/analyze-video", aiEndpointLimiter, async (req, res): Promise<any> => {
   try {
     const { 
       video, 
       mimeType, 
-      keyframes,
+      keyframes, 
       videoDuration,
       customPrompt, 
       productName, 
@@ -244,15 +415,49 @@ app.post("/api/analyze-video", async (req, res): Promise<any> => {
       language
     } = req.body;
 
-    const effectiveProductName = (productName || "Sản phẩm xu hướng tuyển chọn").trim();
+    const effectiveProductName = (productName || "Sản phẩm thực tế").trim();
+
+    // Security: Validate file signatures of video payload
+    if (video && typeof video === 'string') {
+      const sig = validateBase64FileSignature(video, ['video/mp4', 'video/webm']);
+      if (!sig.valid) {
+        return res.status(400).json({
+          error: "Định dạng tệp video không hợp lệ hoặc dữ liệu tệp bị lỗi (yêu cầu MP4 hoặc WebM hợp lệ).",
+          code: "INVALID_VIDEO_FORMAT"
+        });
+      }
+    }
+
+    // Security: Validate file signatures of keyframes
+    if (keyframes && Array.isArray(keyframes) && keyframes.length > 0) {
+      for (let i = 0; i < Math.min(keyframes.length, 6); i++) {
+        const kf = keyframes[i];
+        if (kf && kf.data) {
+          const sig = validateBase64FileSignature(kf.data, ['image/jpeg', 'image/png', 'image/webp']);
+          if (!sig.valid) {
+            return res.status(400).json({
+              error: `Khung hình số ${i + 1} không đúng định dạng hình ảnh hợp lệ (yêu cầu JPEG/PNG/WebP).`,
+              code: "INVALID_KEYFRAME_FORMAT"
+            });
+          }
+        }
+      }
+    }
+
     const ai = getGoogleAI();
+    if (!ai) {
+      return res.status(503).json({
+        error: "Chưa cấu hình GEMINI_API_KEY hoặc khóa xác thực không hợp lệ trên máy chủ.",
+        code: "MISCONFIGURED_API_KEY",
+        retryable: false
+      });
+    }
 
     // Prepare content parts
     const contents: any[] = [];
 
     // 1. Add video part or keyframes parts
     if (keyframes && Array.isArray(keyframes) && keyframes.length > 0) {
-      // Add keyframes sequentially (capped at 6 for ultra-fast processing)
       keyframes.slice(0, 6).forEach((kf: any) => {
         contents.push({
           inlineData: {
@@ -270,7 +475,7 @@ app.post("/api/analyze-video", async (req, res): Promise<any> => {
       });
     }
 
-    // 2. Add product images or single product image if uploaded for image recognition
+    // 2. Add product images if uploaded for reference
     if (productImages && Array.isArray(productImages) && productImages.length > 0) {
       productImages.slice(0, 4).forEach((img: any) => {
         if (img && img.data && img.mimeType) {
@@ -291,102 +496,54 @@ app.post("/api/analyze-video", async (req, res): Promise<any> => {
       });
     }
 
-    const roundedDuration = videoDuration && videoDuration > 0 ? Math.round(videoDuration) : 45; // Default to 45s if not specified
+    const roundedDuration = videoDuration && videoDuration > 0 ? Math.round(videoDuration) : 45;
     const minWords = Math.max(12, Math.round(roundedDuration * 2.1));
     const maxWords = Math.round(roundedDuration * 2.35);
 
     const isEn = language === 'en';
 
     const durationInstruction = isEn
-      ? `Since the uploaded original video is exactly ${roundedDuration} seconds long, the voiceover audio script (marketingScript) MUST be precisely calibrated in length to match this duration perfectly.
-Natural, clear, and engaging English speech typically flows at a speed of 2.2 to 2.5 words per second (around 130 to 150 words per minute).
-Therefore, the total word count for the spoken voiceover script (marketingScript) MUST be between ${minWords} and ${maxWords} words.
-Keep the speech concise, elegant, and perfectly timed to fit the video frame times!`
-      : `Vì video gốc tải lên dài đúng ${roundedDuration} giây, kịch bản thuyết minh lồng tiếng (marketingScript) BẮT BUỘC phải được căn chỉnh độ dài để tương thích khớp khít hoàn hảo với thời lượng này một cách thông minh và chuyên nghiệp nhất.
-Tốc độ đọc tiếng Việt tự nhiên truyền cảm là khoảng 2.15 đến 2.3 từ mỗi giây (tức là 130 từ mỗi phút).
-Do đó, tổng số từ lời lồng tiếng trong kịch bản (marketingScript) PHẢI từ ${minWords} đến ${maxWords} từ.
-Tuyệt đối không viết dông dài, lê thê vượt quá quỹ thời gian vàng của video gốc!`;
+      ? `The uploaded video is ${roundedDuration}s long. The spoken voiceover script (marketingScript) MUST be calibrated to between ${minWords} and ${maxWords} words to synchronize with this duration.`
+      : `Video gốc dài đúng ${roundedDuration} giây. Kịch bản thuyết minh lồng tiếng (marketingScript) BẮT BUỘC có độ dài từ ${minWords} đến ${maxWords} từ để khớp với thời lượng này.`;
 
-    let languageInstruction = "";
-    if (isEn) {
-      languageInstruction = `
-### 🌐 CRITICAL LANGUAGE REQUIREMENT: PURE ENGLISH OUTPUT
-- You MUST write the entire JSON response (including detailedReview, marketingScript, summary, pros, cons, productFeatures, uniqueSellingPoints, videoHighlights, reviewSuggestions, scriptSuggestions, ctaText, targetedAudience, etc.) in **fluent, world-class, premium English** instead of Vietnamese.
-- For detailedReview and marketingScript, use pristine, natural, and persuasive American/British commercial copy style.
-- Avoid using any Vietnamese words or phrases. All suggestions, highlights, and technical terms should be beautifully written in English.
-- Make the script (marketingScript) fully optimized for natural text-to-speech synthesis by English voices, containing only clear, pronounceable words without symbols, emojis, hashtags, or bracketed directions.
-`;
-    }
-
-    // 3. Create rich analytical prompt instructing Gemini to write a professional, high-concept copy
     const promptText = `
-Hãy đóng vai một chuyên gia đánh giá sản phẩm tối cao, một Giám đốc Sáng tạo kịch bản quảng cáo và nhà thôi miên ngôn từ bán hàng xuất sắc hàng đầu thế giới (Elite Advertising Creative Director & Master Copywriter).
+Bạn là Chuyên gia Đánh giá Sản phẩm & Biên kịch Video Quảng cáo Thương mại Sản phẩm Thực chiến (Senior Product Reviewer & Copywriter).
 
-Nhiệm vụ của bạn là phân tích dữ liệu đa phương tiện từ sản phẩm thực tế, thấu hiểu khát khao thầm kín hoặc nỗi đau sâu sắc của tệp khách hàng mục tiêu để viết ra bài review chi tiết ĐẲNG CẤP NHẤT và kịch bản thuyết minh lồng tiếng có tỷ lệ chuyển đổi cao vượt trội, xứng tầm chuyên nghiệp nhất thị trường Việt Nam.
+NHIỆM VỤ CỐT LÕI:
+Phân tích kỹ lưỡng các khung hình và video được cung cấp. Tạo báo cáo review khách quan, chân thực và kịch bản thuyết minh lồng tiếng có sức thuyết phục cao.
 
-Bạn được cung cấp các nguồn thông tin sau:
-${productName ? `- Tên sản phẩm tự nhập: "${productName}"` : "- Tên sản phẩm: Tự phân tích nhận dạng thông minh qua phương tiện thực tế."}
-${productDesc ? `- Mô tả thông tin sản phẩm: "${productDesc}"` : "- Mô tả sản phẩm: Tự phân tích đột phá công năng, chất liệu cao cấp từ hình ảnh thực tế."}
-- Ảnh chụp sản phẩm (các góc chụp cận cảnh, bề mặt, nhãn mác tinh xảo).
-- Video thực tế của sản phẩm (dùng để khớp nhịp chuyển động trực quan với dòng thoại thuyết minh).
+THÔNG TIN ĐẦU VÀO:
+- Tên sản phẩm người dùng cung cấp: "${productName || "(Chưa nhập - hãy nhận diện từ video/hình ảnh)"}"
+- Mô tả người dùng cung cấp: "${productDesc || "(Chưa nhập - hãy quan sát công năng thực tế từ video)"}"
+- Thời lượng video: ${roundedDuration} giây (${minWords} - ${maxWords} từ lồng tiếng).
+- Ngôn ngữ: ${isEn ? "Tiếng Anh" : "Tiếng Việt (Nam Bộ)"}.
 
----
+NGUYÊN TẮC TRUNG THỰC & CHUẨN XÁC BẮT BUỘC (ANTI-HALLUCINATION):
+1. KHÔNG được bịa đặt thông số kỹ thuật (ví dụ: dung lượng pin mAh, công suất W, chip xử lý) nếu không nhìn thấy rõ trên nhãn mác, bao bì hoặc màn hình hiển thị trong video.
+2. KHÔNG được suy đoán chất liệu (nhôm hàng không, titan, da thật) nếu video không chứng minh được. Hãy mô tả đúng bề mặt nhìn thấy (nhám mờ, bóng bẩy, kim loại, nhựa đầm chắc).
+3. KHÔNG tự bịa giá bán hoặc chương trình bảo hành nếu người dùng không cung cấp.
+4. KHÔNG tự động cho điểm số 4.9/5 hoặc điểm số giả. Đánh giá (rating) từ 1.0 đến 5.0 phải dựa trên độ hoàn thiện, tính hữu dụng quan sát được trong video.
+5. PHÂN BIỆT RÕ RÀNG:
+   - "observedVisuals": Những gì THỰC SỰ NHÌN THẤY trong video/khung hình (màu sắc, hình dạng, phụ kiện, thao tác tay, đèn báo).
+   - "userProvidedContext": Những gì người dùng khai báo hoặc kỳ vọng.
+   - "unverifiedNotes": Những điểm cần người mua kiểm chứng thêm (chưa có bằng chứng trong video).
+   - "needsMoreData": Đặt là true nếu video quá tối, mờ hoặc thiếu cận cảnh chi tiết.
 
-${isEn ? `### 👑 LUXURIOUS AND ENGAGING WRITING STYLE (Luxury Tone):
-- Avoid generic, cheap, or clickbaity phrases. Use sophisticated vocabulary celebrating a wise and premium lifestyle.
-- Use powerful expressions like: "impeccably crafted", "understated minimalist design language", "perfect balance of form and function", "creates absolute user satisfaction", "your ideal smart lifestyle companion", "astonishingly responsive feedback".` : `### 👑 CHUẨN MỰC THUẬT NGỮ THU HÚT - SANG SĨ ĐẲNG CẤP (Luxury Tone):
-- Tránh xa lối nói rập khuôn, thô thiển, rẻ tiền hay giật gân rẻ rúng (giật mình, giật sốt). Thay vào đó, hãy sử dụng ngôn từ "Sang, Xịn, Bản lĩnh, Tôn vinh trải nghiệm sống thượng lưu" của các Reviewer sành sỏi.
-- Sử dụng các cụm từ đắt giá như: "hoàn thiện tinh xảo", "ngôn ngữ thiết kế tối giản đầy kiêu hãnh", "giải pháp chạm tới giới hạn tinh tế", "sự cân bằng hoàn mỹ giữa công năng và thẩm mỹ", "kích hoạt sự hài lòng tuyệt đối", "người bạn đồng hành kiến tạo phong cách sống thông thái", "độ phản hồi mượt mà đến ngỡ ngàng".`}
+${isEn ? `### LANGUAGE REQUIREMENT: PURE ENGLISH
+- Write all fields in professional, engaging English.
+- The marketingScript must be natural and ready for TTS synthesis without brackets or emojis.` : `### VĂN PHONG TIẾNG VIỆT NAM BỘ CHUẨN MỰC:
+- Lời thuyết minh (marketingScript) sử dụng văn phong Nam Bộ ấm áp, gần gũi ('nha cả nhà', 'coi thử', 'nhìn vô', 'thiệt sự', 'xài bền').
+- KHÔNG dùng từ ngữ thô thiển hay giật gân rẻ tiền.
+- Lời thoại chỉ chứa văn bản đọc thuần túy, không có ký tự markdown hay chú thích thời gian.`}
 
----
-
-### 🧠 CÁC VŨ KHÍ TÂM LÝ HỌC BÁN HÀNG ĐỈNH CAO BẮT BUỘC ÁP DỤNG:
-1. **Mô hình PASO (Problem - Agitate - Solve - Outcome) Bản Kiệt Tác**:
-   - Khoét sâu vào "nỗi đau ngầm" (Hidden Frustrations), sự mệt mỏi và bực bội thầm lặng của người dùng (Ví dụ: sự lãng phí tiền bạc cho đồ ọp ẹp nhanh hỏng, sự tốn thời gian vô nghĩa). Khuếch đại bối cảnh tiêu cực đó để người dùng nhận thấy họ cần một sự giải thoát ngay lập tức.
-   - Đưa sản phẩm lên như một cứu cánh tối thượng, giải quyết dứt điểm vấn đề, đem lại cuộc sống thăng hoa, thoải mái và thỏa mãn tuyệt đối (Outcome).
-
-2. **Cấu trúc kịch bản truyền thanh (Voiceover marketing script)**:
-   - ${durationInstruction}
-   - ${isEn ? `**ELEGANT ENGLISH VOICE STYLE**: Ensure the voiceover script flows beautifully and sounds exceptionally professional, engaging, and premium for international audiences. Use natural conversational phrases, warm pacing, and strong benefits-driven narration.` : `**TÔNG GIỌNG ẤM ÁP, TỰ NHIÊN & SANG TRỌNG CHUẨN GIỌNG MIỀN NAM (SÀI GÒN / NAM BỘ)**:
-     * TUYỆT ĐỐI KHÔNG sử dụng văn phong, từ ngữ hay ngữ điệu đặc trưng Miền Bắc (Hà Nội). Toàn bộ kịch bản phải chuẩn rặt từ ngữ, cách phát âm và ngữ điệu Miền Nam (Sài Gòn / Nam Bộ) 100%.
-     * Các từ ngữ bắt buộc dùng theo Nam Bộ: dùng "ngàn" (không dùng "nghìn"), "chút xíu/một chút" (không dùng "một tẹo/một tí"), "thiệt sự/thiệt là" (không dùng "thật sự/thật là"), "coi" (không dùng "xem"), "nha/nhé/nè/nghen/nheng" (không dùng "nhỉ"), "xài" (không dùng "dùng/sử dụng").
-     * Bắt buộc tạo kịch bản với lời dẫn trôi chảy phong cách tự nhiên, ấm áp, nhịp điệu cuốn hút và giàu biểu cảm của người con miền Nam. Hãy ưu tiên dùng các cụm từ tinh tế, gần gũi nhưng cực kỳ thanh lịch đặc trưng của Nam Bộ như: 'Cả nhà ơi...', 'Mấy bạn ơi...', 'thiệt là...', 'đã lắm nha', 'đẹp lắm nè', 'đúng không nè', 'vừa mắt ghê', 'nhìn vô...', 'coi thử nha'. Hãy tạo cảm xúc lắng đọng, tin cậy tuyệt đối và luyến láy tự nhiên, tránh dùng những tiếng lóng suồng sã hoặc có cảm giác trẻ con (KHÔNG dùng 'mấy bồ ơi', 'đẹp xỉu', 'đã thèm ghê'). Nhịp điệu kịch bản phải uốn chuyển, có các khoảng nghỉ nhịp hợp lý để người lồng tiếng có thể hít thở tự nhiên và truyền tải trọn vẹn sự tinh tế của sản phẩm.`}
-   - Cấu trúc dòng chảy lời thoại:
-     * **3-5 giây đầu HOOK THU HÚT ĐỈNH CAO**: Nhập cuộc bằng một câu hỏi thông minh, khơi gợi nhu cầu, tự nhiên dạt dào thiện cảm (Ví dụ: "Có bao giờ bạn cảm thấy mệt mỏi vì...", "Mấy bạn ơi, bữa nay mình chia sẻ cho cả nhà một bảo bối cực kỳ thú vị nha...", "Nếu bạn đang tìm kiếm một giải pháp thực sự đẳng cấp cho...").
-     * **Thân kịch bản (Story & Benefit)**: Đan xen sâu sắc các công năng vượt bậc, trải nghiệm xúc cảm, sự yên tâm bền bỉ và giá trị thực tế của sản phẩm một cách chân thành nhất.
-     * **Phần kết CALL TO ACTION TINH TẾ & DỄ THƯƠNG**: Khơi dậy khao khát hành động nhã nhặn (Ví dụ: "Nếu bạn cũng muốn nâng cấp không gian sống của mình mượt mà hơn, hãy coi thử chiếc giỏ hàng nhỏ xinh màu vàng phía góc trái bên dưới nha! Bấm theo dõi kênh mình nheng!").
-   - **TTS Ready**: Lời thoại chỉ chứa chữ tiếng Việt chuẩn thuần túy, có chấm phẩy tự nhiên. KHÔNG chứa tiếng Anh viết tắt thô (phải ghi phiên âm hoặc hướng đọc mượt như lóng, sờ-ty-le), không chứa biểu tượng emoji, hashtags (#), không chú thích cảnh quay hay mốc thời gian.
-
-3. **Kịch bản phân cảnh video review đẳng cấp (detailedReview)**:
-   - Trả về dưới dạng Markdown có cấu trúc cực kỳ chuyên nghiệp và sang trọng, khớp khít hoàn chỉnh theo đúng chỉ dẫn cấu trúc và phân đoạn thời lượng ở phần ${roundedDuration} giây phía trên.
-   - Tránh việc viết quá dài lê thê so với thời lượng video gốc. Hãy căn chỉnh chính xác số chữ lồng tiếng trong từng phân cảnh của kịch bản phân cảnh chi tiết (detailedReview) để khớp hoàn toàn với thời lượng tương ứng.
-   - Mỗi phân cảnh BẮT BUỘC phải viết rõ ràng các đề mục sau:
-     * **🎬 Góc máy & B-Roll**: Mô tả trực quan chuyển động máy quay (cận cảnh, super close-up, góc nghiêng sành điệu) hoặc hành động tay lướt chạm sướng tai sướng mắt.
-     * **🎙️ Lời lồng tiếng (Giọng Nam Bộ sành điệu, ấm áp, nịnh tai)**: Dòng thoại thuyết minh tương ứng khớp khít khung hình, sành điệu cực kỳ tự nhiên, trôi chảy, sử dụng các từ ngữ Nam Bộ thanh lịch ('Cả nhà ơi...', 'thiệt là...', 'đã lắm nha', 'đúng không nè').
-     * **⏱️ Thời lượng ước tính**: Mốc giây chuyển cảnh tương xứng.
-
-4. **✨ PHÂN TÍCH VIDEO NÂNG CAO & NHẬN DIỆN SẢN PHẨM**:
-   - Nhận diện các tính năng vật lý, kiểu dáng từ video thực tế. Hãy điền các trường sau một cách ngắn gọn, súc tích nhất:
-     * **productFeatures**: Nhận diện 3-4 tính năng cốt lõi từ video.
-     * **uniqueSellingPoints**: 3 điểm độc đáo ưu thế bán hàng.
-     * **videoHighlights**: Các khoảnh khắc nổi trội đắt giá kèm mốc giây cụ thể.
-     * **reviewSuggestions**: Đề xuất ngắn gọn để bài đăng thu hút hơn.
-     * **scriptSuggestions**: Chỉ dẫn sắc thái lồng tiếng Nam Bộ ngắn gọn.
-
-${languageInstruction}
-
-Yêu cầu cụ thể từ người dùng: "${customPrompt || "Hãy review chân thực, đẳng cấp và thu hút trọn vẹn"}"
+${durationInstruction}
+Yêu cầu bổ sung từ người dùng: "${customPrompt || "Hãy review chân thực, chi tiết và làm nổi bật giá trị sản phẩm."}"
     `;
 
-    // Add prompt text as last content
     contents.push({ text: promptText });
 
-    let reviewData;
-    try {
-      if (!ai) {
-        throw new Error("GEMINI_CLIENT_NOT_AVAILABLE");
-      }
-      const response = await generateWithRetry((model) => 
+    const response = await generateWithRetry(
+      (model) => 
         ai.models.generateContent({
           model: model,
           contents: contents,
@@ -395,79 +552,103 @@ Yêu cầu cụ thể từ người dùng: "${customPrompt || "Hãy review chân
             responseSchema: {
               type: Type.OBJECT,
               properties: {
-                productName: { type: Type.STRING, description: "Tên thương mại chi tiết đầy đẳng cấp của sản phẩm" },
-                category: { type: Type.STRING, description: "Phân loại sản phẩm" },
-                rating: { type: Type.NUMBER, description: "Điểm đánh giá chuyên gia từ 1.0 đến 5.0" },
-                summary: { type: Type.STRING, description: "Bản tóm tắt ngắn gọn 1-2 câu cực sang trọng về giá trị sản phẩm" },
+                productName: { type: Type.STRING, description: "Tên thương mại chi tiết của sản phẩm nhận diện được" },
+                category: { type: Type.STRING, description: "Phân loại danh mục sản phẩm" },
+                rating: { type: Type.NUMBER, description: "Điểm đánh giá thực tế từ 1.0 đến 5.0 dựa trên quan sát" },
+                summary: { type: Type.STRING, description: "Bản tóm tắt ngắn gọn 1-2 câu về giá trị sản phẩm" },
                 pros: {
                   type: Type.ARRAY,
                   items: { type: Type.STRING },
-                  description: "Danh sách 3-5 ưu điểm cực kỳ nổi bật đột phá"
+                  description: "Danh sách 3-5 ưu điểm quan sát thấy từ sản phẩm thực tế"
                 },
                 cons: {
                   type: Type.ARRAY,
                   items: { type: Type.STRING },
-                  description: "Danh sách 1-2 điểm hạn chế được diễn đạt tinh tế khách quan"
+                  description: "Danh sách 1-2 điểm hạn chế hoặc lưu ý khách quan"
                 },
-                detailedReview: { type: Type.STRING, description: "Bài review chuyên sâu chuẩn SEO vĩ mô bằng tiếng Việt dài dồi dào, Markdown cực kỳ sắc nét" },
-                marketingScript: { type: Type.STRING, description: "Kịch bản thuyết minh lồng tiếng tiếng Việt hoàn chỉnh dài đầy đặn, khớp hoàn toàn với thời lượng video hoặc hướng đọc cuốn rũ (chỉ chứa văn bản chữ mượt mà)" },
-                ctaText: { type: Type.STRING, description: "Lời kêu gọi hành động đầy sức nặng" },
-                targetedAudience: { type: Type.STRING, description: "Tệp khách hàng mục tiêu cao cấp nhất phù hợp" },
+                detailedReview: { type: Type.STRING, description: "Bài review phân cảnh chi tiết định dạng Markdown chuẩn" },
+                marketingScript: { type: Type.STRING, description: "Kịch bản thuyết minh lồng tiếng khớp thời lượng video" },
+                ctaText: { type: Type.STRING, description: "Lời kêu gọi hành động tinh tế" },
+                targetedAudience: { type: Type.STRING, description: "Tệp khách hàng mục tiêu phù hợp" },
                 productFeatures: {
                   type: Type.ARRAY,
                   items: { type: Type.STRING },
-                  description: "Danh sách 3-5 tính năng/công năng cấu tạo nhận diện trực tiếp từ sản phẩm và video"
+                  description: "Danh sách tính năng quan sát trực tiếp từ video"
                 },
                 uniqueSellingPoints: {
                   type: Type.ARRAY,
                   items: { type: Type.STRING },
-                  description: "Danh sách 3 điểm độc đáo/ưu hữu độc quyền bảo chứng doanh số"
+                  description: "Các điểm ưu thế nổi bật"
                 },
                 videoHighlights: {
                   type: Type.ARRAY,
                   items: { type: Type.STRING },
-                  description: "Danh sách các khoảnh khắc trực quan đắt giá nhìn thấy từ keyframes/video kèm mốc giây cụ thể"
+                  description: "Các khoảnh khắc nổi bật kèm mốc giây cụ thể"
                 },
                 reviewSuggestions: {
                   type: Type.ARRAY,
                   items: { type: Type.STRING },
-                  description: "Danh sách đề xuất, gợi ý sâu sắc để đưa thêm vào nội dung bài review"
+                  description: "Đề xuất cải thiện nội dung video"
                 },
                 scriptSuggestions: {
                   type: Type.ARRAY,
                   items: { type: Type.STRING },
-                  description: "Danh sách chỉ dẫn cách narrator Nam Bộ nên diễn giọng, nhịp nghỉ tại góc quay để tối ưu tỉ lệ giữ chân"
-                }
+                  description: "Chỉ dẫn cách diễn đạt ngữ điệu khi đọc"
+                },
+                observedVisuals: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: "Chi tiết hình ảnh cụ thể nhìn thấy trực tiếp trong video"
+                },
+                userProvidedContext: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: "Thông tin lấy từ mô tả của người dùng"
+                },
+                unverifiedNotes: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: "Các điểm chưa có bằng chứng xác minh trực quan trong video"
+                },
+                needsMoreData: { type: Type.BOOLEAN, description: "Video có bị thiếu góc quay quan trọng hay không" },
+                dataGapMessage: { type: Type.STRING, description: "Gợi ý bổ sung nếu video cần thêm chi tiết" }
               },
               required: [
                 "productName", "category", "rating", "summary", "pros", "cons", "detailedReview", "marketingScript", "ctaText", "targetedAudience",
-                "productFeatures", "uniqueSellingPoints", "videoHighlights", "reviewSuggestions", "scriptSuggestions"
+                "productFeatures", "uniqueSellingPoints", "videoHighlights", "reviewSuggestions", "scriptSuggestions",
+                "observedVisuals", "unverifiedNotes"
               ]
             }
           }
-        })
-      );
+        }),
+      2,
+      1200,
+      "gemini-3.8-flash",
+      true
+    );
 
-      const resultText = response.text;
-      if (!resultText) {
-        throw new Error("Không nhận dạng được phản hồi phân tích từ mô hình AI.");
-      }
-      reviewData = JSON.parse(resultText);
-    } catch (apiError: any) {
-      console.log("[VIDEO-ANALYZE-FALLBACK] Gemini API is currently offline or busy. Activating smart local review generator.");
-      // Generate highly targeted custom fallback review content so the experience is uninterrupted
-      reviewData = getFallbackReviewReport(effectiveProductName, productDesc);
-      // Tag it so the frontend optionally knows, but fits schema perfectly
-      reviewData.apiWarning = "Hệ thống AI đang quá tải tạm thời. Chế độ đồng bộ thiết kế cục bộ đã được kích hoạt thành công!";
+    const resultText = response.text;
+    if (!resultText) {
+      throw new Error("Mô hình AI phản hồi rỗng.");
     }
-
-    res.json(reviewData);
+    const reviewData = JSON.parse(resultText);
+    return res.json(reviewData);
 
   } catch (error: any) {
-    console.error("Lỗi phân tích video:", error);
-    const fallbackReport = getFallbackReviewReport(req.body?.productName, req.body?.productDesc);
-    fallbackReport.apiWarning = "Đã kích hoạt kịch bản mẫu thông minh tự động.";
-    res.json(fallbackReport);
+    console.error("[VIDEO-ANALYZE-ERROR] Phân tích video thất bại:", error);
+    const isQuota = error.status === 429 || String(error.message).includes("quota") || String(error.message).includes("RESOURCE_EXHAUSTED");
+    const isUnavailable = error.status === 503 || String(error.message).includes("503") || String(error.message).includes("UNAVAILABLE");
+
+    return res.status(isQuota ? 429 : (isUnavailable ? 503 : 502)).json({
+      success: false,
+      error: isQuota 
+        ? "Hạn ngạch Google Gemini API tạm thời chạm mức giới hạn. Vui lòng thử lại sau vài giây."
+        : (isUnavailable 
+            ? "Mô hình phân tích video Gemini đang có nhu cầu cao tạm thời. Vui lòng bấm Thử lại."
+            : `Không thể hoàn thành phân tích video: ${error.message || "Lỗi giao tiếp AI"}`),
+      code: isQuota ? "QUOTA_EXHAUSTED" : (isUnavailable ? "SERVICE_UNAVAILABLE" : "ANALYSIS_FAILED"),
+      retryable: true
+    });
   }
 });
 
@@ -794,24 +975,13 @@ function sanitizeTextForVietnameseTTS(text: string): string {
   return clean.trim();
 }
 
-// Helper: Generate fallback clean silent PCM audio wave (24kHz mono 16-bit) matching script length
-function generateFallbackAudioPcm(text: string): string {
-  const durationSec = Math.max(8, Math.min(60, Math.ceil(text.length / 12)));
-  const sampleRate = 24000;
-  const numSamples = durationSec * sampleRate;
-  // Silent PCM buffer (zero amplitude) to prevent any harsh synthetic tone
-  const buffer = Buffer.alloc(numSamples * 2, 0);
-
-  return buffer.toString('base64');
-}
-
 // Endpoint: Generate High-quality TTS Voiceover for marketing review script
-app.post("/api/generate-tts", async (req, res): Promise<any> => {
+app.post("/api/generate-tts", aiEndpointLimiter, async (req, res): Promise<any> => {
   try {
     const { text, voiceName } = req.body;
 
-    if (!text) {
-      return res.status(400).json({ error: "Không có văn bản kịch bản để tạo giọng đọc." });
+    if (!text || typeof text !== 'string' || text.trim() === '') {
+      return res.status(400).json({ error: "Không có văn bản kịch bản hợp lệ để tạo giọng đọc.", code: "EMPTY_TEXT" });
     }
 
     const selectedVoice = voiceName || "Kore";
@@ -826,32 +996,41 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
     // Clean all technical brackets and annotations so the voice is 100% pure and professional narration
     const cleanSpeechText = cleanTextForSpeech(text);
 
-    // Invalidate old cache and prefix with v18_permanent_saigon_tts to guarantee 100% pure Southern voice setup
+    // Check memory cache
     const cacheKey = `v18_permanent_saigon_tts:${selectedVoice}:${cleanSpeechText.trim()}`;
     if (ttsMemoryCache.has(cacheKey)) {
-      console.info(`[TTS-CACHE-HIT] Phản hồi tức thì giọng đọc Nam Bộ cực sạch cho ${selectedVoice}`);
-      return res.json({ audioBase64: ttsMemoryCache.get(cacheKey) });
+      const cached = ttsMemoryCache.get(cacheKey)!;
+      if (cached && cached.length > 100) {
+        console.info(`[TTS-CACHE-HIT] Phản hồi tức thì giọng đọc Nam Bộ cực sạch cho ${selectedVoice}`);
+        return res.json({ success: true, audioBase64: cached });
+      }
     }
 
     const ai = getGoogleAI();
+    if (!ai) {
+      return res.status(503).json({
+        success: false,
+        error: "Chưa cấu hình GEMINI_API_KEY để kích hoạt tính năng lồng tiếng AI.",
+        code: "MISCONFIGURED_API_KEY",
+        retryable: false
+      });
+    }
 
-    // Perform ultimate phonetic preprocessing before TTS synthesis for maximum beauty (skip for English text)
+    // Perform ultimate phonetic preprocessing before TTS synthesis for maximum beauty
     const phoneticOptimizedText = isEnglish ? cleanSpeechText : sanitizeTextForVietnameseTTS(cleanSpeechText);
-
-    // Pure speech text without meta-prompts so the voiceover only narrates the exact intended script
     const pureSpeechText = phoneticOptimizedText;
 
     let base64Audio: string | null = null;
     let delay = 1000;
-    const maxRetries = 3;
+    const maxRetries = 2;
     const ttsModel = "gemini-3.8-flash-lite-tts";
 
-    if (ai) {
-      for (let i = 0; i < maxRetries; i++) {
-        try {
-          console.info(`[TTS-GEMINI-STUDIO] Khởi tạo lồng tiếng Nam Bộ Google AI Studio (Model: ${ttsModel}, Giọng: ${voiceForGemini}, Lần thử: ${i + 1}/${maxRetries})...`);
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        console.info(`[TTS-GEMINI-STUDIO] Khởi tạo lồng tiếng Nam Bộ Google AI Studio (Model: ${ttsModel}, Giọng: ${voiceForGemini}, Lần thử: ${i + 1}/${maxRetries})...`);
 
-          const response = await ai.models.generateContent({
+        const response: any = await Promise.race([
+          ai.models.generateContent({
             model: ttsModel,
             contents: [
               {
@@ -872,54 +1051,58 @@ app.post("/api/generate-tts", async (req, res): Promise<any> => {
               responseModalities: ["AUDIO"],
               speechConfig: {
                 voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: voiceForGemini }, // e.g. Puck, Charon, Kore, Fenrir, Aoede
+                  prebuiltVoiceConfig: { voiceName: voiceForGemini },
                 },
               },
             },
-          });
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("TTS_TIMEOUT")), 12000))
+        ]);
 
-          const data = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-          if (data && data.length > 0) {
-            base64Audio = data;
-            console.info(`[TTS-GEMINI-STUDIO] Thành công! Tạo giọng Nam Bộ Google AI Studio hoàn tất (${data.length} bytes base64).`);
-            ttsMemoryCache.set(cacheKey, base64Audio);
-            break;
-          }
-        } catch (apiError: any) {
-          const errMsg = apiError?.message || String(apiError);
-          console.error(`[TTS-ERROR-TRACE] Lần ${i + 1}:`, errMsg, apiError?.status || '');
-          const match = errMsg.match(/Please retry in (\d+(?:\.\d+)?)s/i);
-          let waitSec = 0;
-          if (match && match[1]) {
-            waitSec = Math.ceil(parseFloat(match[1]));
-          }
+        const data = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (data && data.length > 100) {
+          base64Audio = data;
+          console.info(`[TTS-GEMINI-STUDIO] Thành công! Tạo giọng Nam Bộ Google AI Studio hoàn tất (${data.length} bytes base64).`);
+          ttsMemoryCache.set(cacheKey, base64Audio);
+          break;
+        }
+      } catch (apiError: any) {
+        const errMsg = apiError?.message || String(apiError);
+        console.error(`[TTS-ERROR-TRACE] Lần ${i + 1}:`, errMsg, apiError?.status || '');
+        const match = errMsg.match(/Please retry in (\d+(?:\.\d+)?)s/i);
+        let waitSec = 0;
+        if (match && match[1]) {
+          waitSec = Math.ceil(parseFloat(match[1]));
+        }
 
-          console.info(`[TTS-GEMINI-STUDIO] Server bận tạm thời. Đang thử lại nhịp nhàng (Lần ${i + 1}/${maxRetries})...`);
-
-          if (i < maxRetries - 1) {
-            let waitMs = waitSec > 0 ? (Math.min(waitSec, 6) * 1000 + 400) : delay;
-            await new Promise((resolve) => setTimeout(resolve, waitMs));
-            delay = Math.min(delay * 1.5, 3000);
-          }
+        if (i < maxRetries - 1) {
+          let waitMs = waitSec > 0 ? (Math.min(waitSec, 4) * 1000 + 400) : delay;
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          delay = Math.min(delay * 1.5, 2500);
         }
       }
     }
 
-    let isFallback = false;
     if (!base64Audio) {
-      console.info("[TTS-FALLBACK] Kênh Google AI Studio TTS tạm thời cao điểm. Khởi tạo bản âm thanh chuẩn hóa tự động...");
-      base64Audio = generateFallbackAudioPcm(phoneticOptimizedText);
-      isFallback = true;
+      console.warn("[TTS-UNAVAILABLE] Không thể tạo âm thanh giọng đọc từ Gemini TTS.");
+      return res.status(503).json({
+        success: false,
+        error: "Hệ thống Google Gemini Flash Lite TTS đang quá tải tạm thời hoặc gặp sự cố kết nối. Vui lòng bấm Thử lại lồng tiếng.",
+        code: "TTS_UNAVAILABLE",
+        retryable: true
+      });
     }
 
-    return res.json({ audioBase64: base64Audio, isFallback });
+    return res.json({ success: true, audioBase64: base64Audio });
 
   } catch (error: any) {
     console.error("Lỗi tạo giọng nói TTS:", error);
-    // Fallback on unexpected server error to prevent app crashes
-    const fallbackText = req.body?.text || "Xin chào sản phẩm chất lượng tốt.";
-    const fallbackBase64 = generateFallbackAudioPcm(fallbackText);
-    return res.json({ audioBase64: fallbackBase64, isFallback: true });
+    return res.status(500).json({
+      success: false,
+      error: `Lỗi máy chủ khi tạo giọng đọc: ${error.message || "Lỗi không xác định"}`,
+      code: "TTS_SERVER_ERROR",
+      retryable: true
+    });
   }
 });
 
@@ -2053,23 +2236,20 @@ Trả về phản hồi JSON theo schema:
   }
 });
 
-// System Status & Health Check for Cloudflare / AI Studio verification
-app.get("/api/system-status", (req, res) => {
-  const key = process.env.GEMINI_API_KEY || "";
-  const hasKey = !!key && key !== "MY_GEMINI_API_KEY" && key.trim() !== "";
-  const isLikelyValid = hasKey && (key.startsWith("AIzaSy") || key.length > 25);
-  const isSuspiciousOAuth = hasKey && key.startsWith("AQ.");
+// System Status & Health Check for Production-Grade Verification
+app.get("/api/system-status", generalEndpointLimiter, async (req, res) => {
+  const probe = await probeGeminiHealth(req.query.force === 'true');
 
   res.json({
     status: "ok",
-    version: "2026.4.0-ultra",
-    engine: "Google AI Studio Studio Master Pro",
-    geminiStatus: isLikelyValid ? "connected" : (isSuspiciousOAuth ? "invalid_oauth_token" : (hasKey ? "connected" : "local_intelligent_mode")),
-    defaultModel: "gemini-3.8-flash",
-    ttsModel: "gemini-3.8-flash-lite-tts",
-    message: isSuspiciousOAuth 
-      ? "API Key hiện tại có tiền tố 'AQ.' (đây là OAuth token tạm thời). Để kích hoạt AI trực tiếp, hãy lấy API Key chuẩn (bắt đầu bằng 'AIzaSy...') từ aistudio.google.com/apikey."
-      : (isLikelyValid ? "Gemini 3.8 Flash Vision và Flash Lite TTS đã kết nối hoàn hảo." : "Hệ thống đang chạy chế độ AI Siêu Tốc Cục Bộ (Local Intelligent Mode).")
+    version: "2026.4.0-production-grade",
+    engine: "AI-Video-Review Production Engine",
+    geminiStatus: probe.geminiStatus, // CONNECTED | DEGRADED | UNAVAILABLE | MISCONFIGURED
+    defaultModel: probe.model,
+    ttsModel: probe.ttsModel,
+    latencyMs: probe.latencyMs,
+    testedAt: probe.testedAt,
+    message: probe.message
   });
 });
 

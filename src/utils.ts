@@ -64,44 +64,32 @@ export function pcmToWav(base64Pcm: string, sampleRate: number = 24000): string 
 }
 
 /**
- * Helper to programmatically generate a silent standard 16-bit Mono WAV audio file
- * of any arbitrary duration (seconds) so that the audio element controls / timeline updates
- * tick normally for subtitles and video syncing even on fallback mode!
+ * Break long subtitle text into clean, balanced lines for mobile vertical screens (9:16).
+ * Avoids text clipping or stretching beyond video bounds.
  */
-export function generateSilentWav(durationSeconds: number, sampleRate: number = 24000): string {
-  try {
-    const roundedDuration = Math.max(1, Math.min(180, Math.ceil(durationSeconds)));
-    const numSamples = roundedDuration * sampleRate;
-    const len = numSamples * 2; // 16-bit Mono
-    const buffer = new ArrayBuffer(44 + len);
-    const view = new DataView(buffer);
-    
-    // RIFF identifier
-    writeString(view, 0, 'RIFF');
-    view.setUint32(4, 36 + len, true);
-    writeString(view, 8, 'WAVE');
-    
-    // format chunk identifier
-    writeString(view, 12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true); // Linear PCM
-    view.setUint16(22, 1, true); // Mono
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true); // Byte rate
-    view.setUint16(32, 2, true); // Block align
-    view.setUint16(34, 16, true); // 16-bit
-    
-    // data chunk identifier
-    writeString(view, 36, 'data');
-    view.setUint32(40, len, true);
-    
-    // Leave the data part as all zeroes (silence)
-    const blob = new Blob([buffer], { type: 'audio/wav' });
-    return URL.createObjectURL(blob);
-  } catch (err) {
-    console.error("Lỗi tạo âm thanh im lặng dự phòng:", err);
-    return "";
+export function wrapSubtitleIntoLines(text: string, maxCharsPerLine: number = 32): string[] {
+  if (!text) return [];
+  const trimmed = text.trim();
+  if (trimmed.length <= maxCharsPerLine) return [trimmed];
+
+  const words = trimmed.split(/\s+/);
+  const lines: string[] = [];
+  let currentLine = '';
+
+  for (const word of words) {
+    if (!currentLine) {
+      currentLine = word;
+    } else if ((currentLine + ' ' + word).length <= maxCharsPerLine) {
+      currentLine += ' ' + word;
+    } else {
+      lines.push(currentLine);
+      currentLine = word;
+    }
   }
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+  return lines;
 }
 
 function writeString(view: DataView, offset: number, value: string) {
@@ -923,95 +911,4 @@ export function auditAndFixSubtitlesSpelling(subtitles: Array<{ text: string; st
   };
 }
 
-/**
- * Intelligent client-side fallback review report generator
- * Activated automatically when backend API is offline or deploying to pure frontend hosting
- */
-export function getFallbackReviewReport(nameInput?: string, descInput?: string): any {
-  const normName = (nameInput || "Sản phẩm xu hướng cao cấp").trim();
-  const normDesc = (descInput || "Sản phẩm hoàn thiện cao cấp, thiết kế mượt mà, định hình lại thói quen hằng ngày của bạn.").trim();
 
-  return {
-    productName: normName,
-    category: "Gia dụng & Tiện ích thông minh",
-    rating: 4.9,
-    summary: `Trải nghiệm tiện nghi tinh tế vượt bậc đến từ cấu hình hoàn thiện đỉnh cao của ${normName} — mảnh ghép hoàn hảo định hình phong cách sống hiện đại và thông thái.`,
-    pros: [
-      "Hoàn thiện tinh xảo từ chất liệu cao cấp bền bỉ, mang lại cảm giác cầm nắm đầm chắc và sang trọng.",
-      "Thiết kế công thái học thông minh tối ưu hóa tối đa công năng thực chiến, giải quyết triệt để sự bất tiện.",
-      "Vận hành êm ái, bền bỉ vượt trội và tiết kiệm đáng kể thời gian trong mọi sinh hoạt hàng ngày."
-    ],
-    cons: [
-      "Số lượng ưu đãi kèm quà tặng có hạn do nhu cầu đặt hàng tăng đột biến từ cộng đồng sáng tạo nội dung.",
-      "Màu sắc hot trend thường xuyên rơi vào tình trạng cháy hàng nhanh chóng."
-    ],
-    detailedReview: `### 🌟 TỔNG QUAN ĐỘT PHÁ & ẤN TƯỢNG BAN ĐẦU
-Sản phẩm **${normName}** khẳng định vị thế dẫn đầu trong phân khúc nhờ triết lý thiết kế tối giản nhưng toát lên vẻ đẹp kiêu hãnh. Từng đường nét bo cong, bề mặt hoàn thiện nhám mờ cao cấp không chỉ chống bám vân tay mà còn mang đến cảm giác xúc giác vô cùng tinh tế.
-
----
-
-### 🎬 KỊCH BẢN PHÂN CẢNH CHI TIẾT (STUDIO MASTER PRODUCTION)
-
-#### 🎥 Phân cảnh 1: Hook Mở Màn & Phá Vỡ Nhận Thức (00:00 - 00:05)
-*   **Góc máy & B-Roll**: Quay cận cảnh (Super Macro Close-Up) đặc tả bề mặt tinh xảo lấp lánh phản chiếu ánh sáng, chuyển cảnh chớp nhoáng đối chiếu sự bất tiện của đồ cũ ọp ẹp.
-*   **Lời bình thuyết minh (Giọng Nam Bộ ấm áp, cuốn hút)**: *"Cả nhà ơi, có bao giờ mọi người tốn tiền oan uổng vì mấy món đồ xài dăm bữa nửa tháng là hư chưa? Coi ngay chiếc ${normName} này nha, bảo đảm mê mẩn từ cái nhìn đầu tiên luôn nè!"*
-*   **Hiệu ứng âm thanh (SFX)**: 💨 *Whoosh chuyển cảnh chớp nhoáng + 🔔 Chime sáng bừng.*
-*   **Kỹ thuật tâm lý**: *Zeigarnik Effect + Problem Agitation (Khơi gợi nỗi bực dọc thầm kín).*
-
-#### 🎥 Phân cảnh 2: Trải Nghiệm Xúc Giác & Thẩm Mỹ Sang Trọng (00:05 - 00:15)
-*   **Góc máy & B-Roll**: Bàn tay lướt nhẹ mở hộp tinh tế, tay cầm nắm sản phẩm xoay 45 độ phô diễn độ hoàn thiện sắc nét không một chi tiết thừa.
-*   **Lời bình thuyết minh (Giọng Nam Bộ ấm áp, cuốn hút)**: *"Thiết kế tối giản sang xịn ghê chưa cả nhà? Bề mặt nhám mờ cầm đầm tay dã man luôn á, nhìn vô là thấy toát lên phong thái thông minh thời thượng liền nha!"*
-*   **Hiệu ứng âm thanh (SFX)**: 📸 *Camera Shutter + Âm thanh gõ nhẹ bề mặt đanh chắc.*
-*   **Kỹ thuật tâm lý**: *Endowment Effect (Đưa người xem cảm giác đã sở hữu món đồ).*
-
-#### 🎥 Phân cảnh 3: Trình Diễn Công Năng Thực Chiến & Hiệu Suất Đỉnh Cao (00:15 - 00:30)
-*   **Góc máy & B-Roll**: Biểu diễn thao tác vận hành một chạm mượt mà. Thiết bị giải quyết công việc trơn tru tức thì, tôn vinh lực đẩy và độ êm ái vượt trội.
-*   **Lời bình thuyết minh (Giọng Nam Bộ ấm áp, cuốn hút)**: *"Mà đâu chỉ đẹp mã thôi đâu nha, công năng của em nó mới thiệt sự là đỉnh chóp á! Bấm nhẹ một phát là vận hành êm ru mượt mà gấp 3 lần bình thường, tiện lợi quá chừng luôn hà!"*
-*   **Hiệu ứng âm thanh (SFX)**: ⚡ *Impact Bass Drop nhẹ nhàng tôn vinh sức mạnh.*
-*   **Kỹ thuật tâm lý**: *Sensory Hypnosis & Feature-Benefit Transformation.*
-
-#### 🎥 Phân cảnh 4: Kêu Gọi Hành Động Quyết Đoán & Chốt Đơn (00:30 - Kết thúc)
-*   **Góc máy & B-Roll**: Sản phẩm đặt kiêu hãnh trong không gian sống hiện đại. Bàn tay nhẹ nhàng chỉ về biểu tượng giỏ hàng vàng nhỏ xinh góc trái bên dưới.
-*   **Lời bình thuyết minh (Giọng Nam Bộ ấm áp, cuốn hút)**: *"Đầu tư một lần mà xài xứng đáng cả đời nhen! Cả nhà nhanh tay nhấp vô chiếc giỏ hàng màu vàng nhỏ xinh góc trái bên dưới để rinh liền ưu đãi khủng hôm nay nha!"*
-*   **Hiệu ứng âm thanh (SFX)**: 🛎️ *Chuông vàng giỏ hàng Cash Register.*
-*   **Kỹ thuật tâm lý**: *FOMO Scarcity + Duyên dáng kêu gọi hành động.*
-
----
-
-### 📊 BẢNG ĐÁNH GIÁ TIÊU CHUẨN CHUYÊN GIA (CHỈ SỐ 5 SAO)
-*   ⭐ **Thiết kế & Độ hoàn thiện**: 4.9/5.0 — *Vật liệu cao cấp, đường nét sắc sảo.*
-*   ⚡ **Công năng thực chiến**: 4.8/5.0 — *Hiệu suất ổn định, giải quyết triệt để nhu cầu.*
-*   🛡️ **Độ bền & Tin cậy**: 4.9/5.0 — *Cấu trúc chắc chắn, chịu lực tối ưu.*
-*   💰 **Tỷ lệ Giá trị / Chi phí**: 5.0/5.0 — *Đầu tư xứng đáng từng đồng.*`,
-    marketingScript: `Có bao giờ bạn rơi vào tình huống khó chịu khi mua những sản phẩm giá rẻ ọp ẹp rồi phải vứt xó không? Đừng bao giờ tốn tiền oan uổng như vậy nữa nha, vì chiếc siêu phẩm ${normName} này xuất hiện chính là giải pháp tối ưu giúp bạn giải quyết dứt điểm rắc rối đó. Được thiết kế cực kỳ thông minh, tỉ mỉ và chắc tay bằng chất liệu bền bỉ cao cấp, sản phẩm mang lại khả năng ứng dụng vô cùng mượt mà cùng hiệu suất đáng kinh ngạc trong mọi sinh hoạt hàng ngày. Từng chi tiết nhỏ nhất đều được tinh tế mài giũa để tôn vinh trải nghiệm sống tiện nghi hiện đại của chính bạn. Đây chính là món bảo bối hoàn mỹ kiến tạo lối sống thời thượng mà ai cũng phải dõi mắt nhìn theo. Ưu đãi sập sàn cực lớn và những phần quà đặc quyền dành riêng cho bạn đang được bố trí sẵn trong chiếc giỏ hàng màu vàng nhỏ xinh đẹp phía dưới rồi nè, hãy nhanh tay click ngay hôm nay để nhận ưu đãi trước khi cháy hàng nha!`,
-    ctaText: "Nhấp chọn giỏ hàng màu vàng phía góc trái bên dưới để rinh ngay ưu đãi khủng hôm nay!",
-    targetedAudience: "Những ai yêu thích phong cách sống hiện đại tiện ích, đặc biệt quan tâm tới chất lượng hoàn thiện cao cấp và hiệu quả thực tế hàng ngày.",
-    productFeatures: [
-      "Bộ cấu trúc thông minh tối ưu hóa hiệu suất vận hành nhanh chóng và ổn định",
-      "Vật liệu hoàn thiện cao cấp chống trầy xước, thân thiện môi trường và an toàn tuyệt đối",
-      "Khả năng ứng dụng linh hoạt, kết nối và sạc nhanh tiện lợi thời thượng",
-      "Thiết kế công thái học chống trượt tay, tăng độ bám chắc chắn khi sử dụng"
-    ],
-    uniqueSellingPoints: [
-      "Giải quyết triệt để sự bất tiện của các sản phẩm đời cũ kém chất lượng",
-      "Ngôn ngữ thiết kế tối giản sang trọng tôn vinh không gian sống hiện đại",
-      "Độ bền vượt bậc với chế độ hậu mãi và bảo hành an tâm tuyệt đối"
-    ],
-    videoHighlights: [
-      "00:03 - Khoảnh khắc cận cảnh bề mặt hoàn thiện cao cấp không tì vết",
-      "00:12 - Cận cảnh thao tác trên tay mượt mà đầm chắc",
-      "00:22 - Trình diễn công năng thực tế vận hành êm ái vượt trội",
-      "00:35 - Điểm chạm kết thúc sang trọng định vị sản phẩm"
-    ],
-    reviewSuggestions: [
-      "Nhấn mạnh độ đầm tay và trải nghiệm thực tế ngay từ 3 giây đầu tiên",
-      "Tận dụng ánh sáng tự nhiên hoặc đèn mềm để tôn vinh bề mặt cao cấp của sản phẩm",
-      "Ghim bình luận giải đáp thắc mắc về nguồn gốc xuất xứ và chính sách bảo hành chính hãng"
-    ],
-    scriptSuggestions: [
-      "Đọc mở đầu với chất giọng hào hứng, tự nhiên khơi gợi tò mò của người bạn thân thiết",
-      "Hạ tông giọng ấm áp khi miêu tả chất liệu và trải nghiệm chạm",
-      "Tăng nhịp điệu dứt khoát và tươi vui ở câu kết kêu gọi nhấp giỏ hàng"
-    ]
-  };
-}

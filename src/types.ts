@@ -22,6 +22,13 @@ export interface ReviewReport {
   reviewSuggestions?: string[];
   scriptSuggestions?: string[];
   apiWarning?: string;
+
+  // Production-grade Observational Accuracy Fields
+  observedVisuals?: string[];
+  userProvidedContext?: string[];
+  unverifiedNotes?: string[];
+  needsMoreData?: boolean;
+  dataGapMessage?: string;
 }
 
 export interface TTSVoiceOption {
