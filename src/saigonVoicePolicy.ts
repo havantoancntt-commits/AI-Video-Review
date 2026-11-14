@@ -288,3 +288,238 @@ export function resolveVoiceConfiguration(requestedVoiceId?: string, languageHin
     saigonSpec: matched,
   };
 }
+
+/**
+ * Verified compliant Southern Saigon TTS models supporting SAIGON_AUDIO_DIRECTIVE + approved prebuilt voices.
+ */
+export const SAIGON_COMPLIANT_TTS_MODELS: readonly string[] = [
+  SAIGON_TTS_MODELS.VIETNAMESE,
+  SAIGON_TTS_MODELS.ENGLISH,
+];
+
+function toUnicodeSpeechBoundaryRegex(rawPattern: RegExp): RegExp {
+  let src = rawPattern.source;
+  if (src.startsWith('^\\b')) {
+    src = '^(?<![\\p{L}\\p{N}])' + src.slice(4);
+  } else if (src.startsWith('\\b')) {
+    src = '(?<![\\p{L}\\p{N}])' + src.slice(2);
+  }
+  if (src.endsWith('\\b$')) {
+    src = src.slice(0, -4) + '(?![\\p{L}\\p{N}])$';
+  } else if (src.endsWith('\\b')) {
+    src = src.slice(0, -2) + '(?![\\p{L}\\p{N}])';
+  }
+  let flags = rawPattern.flags;
+  if (!flags.includes('u')) flags += 'u';
+  if (!flags.includes('g')) flags += 'g';
+  if (!flags.includes('i')) flags += 'i';
+  return new RegExp(src, flags);
+}
+
+function preserveSpeechCase(original: string, replacement: string): string {
+  if (!original || !replacement) return replacement;
+  if (original === original.toUpperCase() && original !== original.toLowerCase()) {
+    return replacement.toUpperCase();
+  }
+  const firstChar = original.charAt(0);
+  if (firstChar === firstChar.toUpperCase() && firstChar !== firstChar.toLowerCase()) {
+    return replacement.charAt(0).toUpperCase() + replacement.slice(1);
+  }
+  return replacement;
+}
+
+const NORTH_TO_SOUTH_LEXICON_RAW: Array<[RegExp, string]> = [
+  // 1. Đại từ xưng hô & Đối tượng
+  [/\bchúng tôi\b/gi, 'tụi mình'],
+  [/\bchúng mình\b/gi, 'tụi mình'],
+  [/\bbọn mình\b/gi, 'tụi mình'],
+  [/\bchúng ta\b/gi, 'tụi mình'],
+  [/\bmọi người ơi\b/gi, 'cả nhà ơi'],
+  [/\bmọi người nhé\b/gi, 'cả nhà nha'],
+  [/\bmọi người nghen\b/gi, 'cả nhà nghen'],
+  [/\bmọi người\b/gi, 'cả nhà'],
+  [/\bcác bạn ơi\b/gi, 'mấy bạn ơi'],
+  [/\bcác bạn nhé\b/gi, 'mấy bạn nha'],
+  [/\bcác bạn\b/gi, 'mấy bạn'],
+  [/\bcác bác ơi\b/gi, 'cả nhà ơi'],
+  [/\bcác bác\b/gi, 'mấy bạn'],
+  [/\bchị em ơi\b/gi, 'mấy chị ơi'],
+  [/\banh em ơi\b/gi, 'mấy anh ơi'],
+  [/\bbố mẹ\b/gi, 'ba má'],
+  [/\bmẹ\b/gi, 'má'],
+
+  // 2. Đuôi câu, Hư từ & Ngữ điệu Miền Bắc (ưu tiên cụm dài trước, dùng Unicode boundary chuẩn)
+  [/\bnhé cả nhà\b/gi, 'nha cả nhà'],
+  [/\bnhé mọi người\b/gi, 'nha cả nhà'],
+  [/\bnhé các bạn\b/gi, 'nha mấy bạn'],
+  [/\bnhé bạn\b/gi, 'nha bạn'],
+  [/\bđâu nhé\b/gi, 'đâu nha'],
+  [/\bđược nhé\b/gi, 'được nha'],
+  [/\bnày nhé\b/gi, 'này nha'],
+  [/\bnữa nhé\b/gi, 'nữa nha'],
+  [/\bluôn nhé\b/gi, 'luôn nha'],
+  [/\bnhé\b/gi, 'nha'],
+  [/\bnhá cả nhà\b/gi, 'nha cả nhà'],
+  [/\bnhá\b/gi, 'nha'],
+  [/\bnhỉ cả nhà\b/gi, 'nha cả nhà'],
+  [/\bnhỉ bạn\b/gi, 'nha bạn'],
+  [/\bnhỉ\b/gi, 'nha'],
+  [/\bđấy nhé\b/gi, 'đó nha'],
+  [/\bđấy ạ\b/gi, 'đó nha'],
+  [/\bđấy chứ\b/gi, 'đó chớ'],
+  [/\bđấy\b/gi, 'đó'],
+  [/\bthế này này\b/gi, 'như vầy nè'],
+  [/\bthế này nhé\b/gi, 'như vầy nha'],
+  [/\bthế này nha\b/gi, 'như vầy nha'],
+  [/\bthế này nè\b/gi, 'như vầy nè'],
+  [/\bthế này\b/gi, 'như vầy'],
+  [/\bthế kia\b/gi, 'như vậy'],
+  [/\bnhư thế\b/gi, 'như vậy'],
+  [/\bthế nên\b/gi, 'cho nên'],
+  [/\bthế là\b/gi, 'thành ra'],
+  [/\bthế à\b/gi, 'vậy hả'],
+  [/\bthế á\b/gi, 'vậy hả'],
+  [/\bthế hả\b/gi, 'vậy nè'],
+  [/\bthế nhé\b/gi, 'vậy nha'],
+  [/\bthế nha\b/gi, 'vậy nha'],
+  [/\bthế ạ\b/gi, 'vậy nha'],
+  [/\bvậy nhé\b/gi, 'vậy nha'],
+  [/\bsao thế\b/gi, 'sao vậy'],
+  [/\bấy nhỉ\b/gi, 'đó nha'],
+  [/\blắm luôn ấy\b/gi, 'lắm luôn á'],
+  [/\blắm ấy\b/gi, 'lắm á'],
+  [/\bvậy ấy\b/gi, 'vậy á'],
+  [/\bkhi ấy\b/gi, 'khi đó'],
+  [/\blúc ấy\b/gi, 'lúc đó'],
+  [/\bhồi ấy\b/gi, 'hồi đó'],
+  [/\bđúng rồi đấy\b/gi, 'đúng rồi đó nha'],
+  [/\bchuẩn rồi đấy\b/gi, 'chuẩn rồi đó nha'],
+
+  // 3. Từ ngữ phủ định, nghi vấn & câu hỏi
+  [/\bchẳng\b/gi, 'hông'],
+  [/\bchả\b/gi, 'hông'],
+  [/\bkhông đấy\b/gi, 'hông đó'],
+  [/\bkhông nhé\b/gi, 'hông nha'],
+  [/\bkhông nhỉ\b/gi, 'hông nha'],
+  [/\bđược không ạ\b/gi, 'được hông nè'],
+  [/\bđược không\b/gi, 'được hông'],
+  [/\bphải không ạ\b/gi, 'phải hông nè'],
+  [/\bphải không\b/gi, 'phải hông'],
+  [/\bđúng không ạ\b/gi, 'đúng hông nè'],
+  [/\bđúng không nè\b/gi, 'đúng hông nè'],
+  [/\bđúng không\b/gi, 'đúng hông'],
+  [/\bcó đúng không\b/gi, 'đúng hông nè'],
+
+  // 4. Kính ngữ & Thán từ
+  [/\bvâng ạ\b/gi, 'dạ'],
+  [/\bvâng\b/gi, 'dạ'],
+  [/\bdạ ạ\b/gi, 'dạ'],
+  [/\bcảm ơn ạ\b/gi, 'cảm ơn nha'],
+  [/\bạ\b/gi, 'nha'],
+  [/\brất là\b/gi, 'cực kỳ'],
+  [/\bquá là\b/gi, 'quá chừng'],
+  [/\bquá đi\b/gi, 'quá chừng'],
+  [/\bquá trời luôn\b/gi, 'quá chừng luôn'],
+
+  // 5. Động từ & Hành động đời sống (tránh phá từ ghép như "bảo hành", "đảm bảo", "tiêu dùng")
+  [/\bnghìn\b/gi, 'ngàn'],
+  [/\bxem thử\b/gi, 'coi thử'],
+  [/\bxem clip\b/gi, 'coi clip'],
+  [/\bxem video\b/gi, 'coi clip'],
+  [/\bxem ngay\b/gi, 'coi ngay'],
+  [/\bxem hết\b/gi, 'coi hết'],
+  [/\bxem xong\b/gi, 'coi xong'],
+  [/\bxem kỹ\b/gi, 'coi kỹ'],
+  [/\bxem\b/gi, 'coi'],
+  [/\bnhìn vào\b/gi, 'nhìn vô'],
+  [/\bbước vào\b/gi, 'bước vô'],
+  [/\bcho vào\b/gi, 'cho vô'],
+  [/\bbỏ vào\b/gi, 'bỏ vô'],
+  [/\bcất vào\b/gi, 'cất vô'],
+  [/\bđi vào\b/gi, 'đi vô'],
+  [/\bvào đâu\b/gi, 'vô đâu'],
+  [/\bvào trong\b/gi, 'vô trong'],
+  [/\bvào bếp\b/gi, 'vô bếp'],
+  [/\bvào nhà\b/gi, 'vô nhà'],
+  [/\bbảo là\b/gi, 'nói là'],
+  [/\bsử dụng\b/gi, 'xài'],
+  [/\bdùng thử\b/gi, 'xài thử'],
+  [/\bnên dùng\b/gi, 'nên xài'],
+  [/\bdễ dùng\b/gi, 'dễ xài'],
+  [/\bhay dùng\b/gi, 'hay xài'],
+  [/\bbị ngã\b/gi, 'bị té'],
+  [/\bdễ ngã\b/gi, 'dễ té'],
+  [/\bchuẩn chỉ\b/gi, 'chuẩn chỉnh'],
+
+  // 6. Tính từ, Trạng từ & Nhận xét
+  [/\bthật là\b/gi, 'thiệt là'],
+  [/\bthật sự\b/gi, 'thiệt sự'],
+  [/\bthật ra\b/gi, 'thiệt ra'],
+  [/\bthật luôn\b/gi, 'thiệt luôn'],
+  [/\bthật đấy\b/gi, 'thiệt đó nha'],
+  [/\bthật nha\b/gi, 'thiệt nha'],
+  [/\bthật tuyệt\b/gi, 'thiệt tuyệt'],
+  [/\bthật tốt\b/gi, 'thiệt tốt'],
+  [/\bmột tí\b/gi, 'chút xíu'],
+  [/\bmột tẹo\b/gi, 'chút xíu'],
+  [/\btẹo\b/gi, 'chút xíu'],
+  [/\btí xíu\b/gi, 'chút xíu'],
+  [/\bđắt đỏ\b/gi, 'mắc tiền'],
+  [/\bđắt quá\b/gi, 'mắc quá'],
+  [/\bđắt lắm\b/gi, 'mắc lắm'],
+  [/\brẻ bèo\b/gi, 'rẻ rề'],
+
+  // 7. Danh từ đời sống & Đồ vật (tránh từ đồng âm như "tất cả", "kết quả", "màn hình", "cái ô" đơn lẻ)
+  [/\bngõ hẻm\b/gi, 'hẻm'],
+  [/\bngõ\b/gi, 'hẻm'],
+  [/\bcây ô\b/gi, 'cây dù'],
+  [/\bô che\b/gi, 'dù che'],
+  [/\bthìa\b/gi, 'muỗng'],
+  [/\bbát ăn cơm\b/gi, 'chén ăn cơm'],
+  [/\bbát đũa\b/gi, 'chén đũa'],
+  [/\bbát ăn\b/gi, 'chén ăn'],
+  [/\bcái bát\b/gi, 'cái chén'],
+  [/\bbát\b/gi, 'chén'],
+  [/\bquả táo\b/gi, 'trái táo'],
+  [/\bhoa quả\b/gi, 'trái cây'],
+  [/\bđôi tất\b/gi, 'đôi vớ'],
+  [/\btất chân\b/gi, 'vớ chân'],
+  [/\bđi tất\b/gi, 'mang vớ'],
+  [/\bmang tất\b/gi, 'mang vớ'],
+  [/\bchăn màn\b/gi, 'mền mùng'],
+  [/\bđắp chăn\b/gi, 'đắp mền'],
+  [/\bcái chăn\b/gi, 'cái mền'],
+  [/\bchăn ga\b/gi, 'mền ga'],
+  [/\bchăn ấm\b/gi, 'mền ấm'],
+  [/\bmàn tuyn\b/gi, 'mùng'],
+  [/\bbọc lót\b/gi, 'bọc đệm'],
+];
+
+const COMPILED_SAIGON_LEXICON: Array<[RegExp, string]> = NORTH_TO_SOUTH_LEXICON_RAW.map(
+  ([pattern, replacement]) => [toUnicodeSpeechBoundaryRegex(pattern), replacement]
+);
+
+/**
+ * Chuẩn hóa văn bản tiếng Việt sang từ vựng tự nhiên miền Nam / Sài Gòn bằng ranh giới Unicode chuẩn (`\p{L}\p{N}`),
+ * tuyệt đối không làm hỏng từ có dấu thanh như "Hôm nay", "luôn", "bạn", "tạo", "kết quả", "tất cả", "màn hình".
+ */
+export function adaptVietnameseTextForSaigonSpeech(text: string, adaptSouthern: boolean = true): string {
+  if (!text) return '';
+  let clean = text
+    .normalize('NFC')
+    .replace(/[*#_~`•\-+]/g, ' ')
+    .replace(/(\d+)\s*%/g, '$1 phần trăm')
+    .replace(/(?<![\p{L}\p{N}])(\d+)\s*k(?![\p{L}\p{N}])/giu, '$1 ngàn')
+    .replace(/(?<![\p{L}\p{N}])(\d+)\s*(đ|VND|đồng)(?![\p{L}\p{N}])/giu, '$1 đồng');
+
+  if (adaptSouthern) {
+    for (const [pattern, replacement] of COMPILED_SAIGON_LEXICON) {
+      pattern.lastIndex = 0;
+      clean = clean.replace(pattern, (match) => preserveSpeechCase(match, replacement));
+      pattern.lastIndex = 0;
+    }
+  }
+
+  return clean.replace(/\s+/g, ' ').trim();
+}
+

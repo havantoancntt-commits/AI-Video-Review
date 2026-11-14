@@ -303,6 +303,22 @@ export function saveSampleWavFile(voiceId: string, modelName: string, wavBuffer:
   };
 }
 
+let lastSuccessfulTtsAt = 0;
+const modelCooldownUntilMap = new Map<string, number>();
+
+export function getLastSuccessfulTtsAt(): number {
+  return lastSuccessfulTtsAt;
+}
+
+function parseRetryAfterSec(errMsg: string): number {
+  const retryMatch = errMsg.match(/Please retry in (\d+(?:\.\d+)?)s/i);
+  if (retryMatch) {
+    const parsed = Math.ceil(parseFloat(retryMatch[1]));
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+  return 10;
+}
+
 export async function synthesizeGeminiTtsStrict(params: {
   aiBeta: GoogleGenAI;
   text: string;
@@ -326,148 +342,188 @@ export async function synthesizeGeminiTtsStrict(params: {
     ttsModelOverride,
     cacheMap,
     timeoutMs = 45000,
-    maxRetries = 3,
+    maxRetries = 2,
   } = params;
 
   const resolved = resolveVoiceConfiguration(requestedVoiceId, languageHint);
-  // Use flagship Voice Design model (gemini-3.8-flash-tts) for Vietnamese so Southern Saigon phonetic persona cues are strictly adhered to;
-  // allow English or explicit override to use lite model if desired.
-  const ttsModel =
-    ttsModelOverride === VOICE_DESIGN_TTS_MODEL || ttsModelOverride === PRIMARY_TTS_LITE_MODEL
-      ? ttsModelOverride
-      : resolved.isEnglish
-      ? PRIMARY_TTS_LITE_MODEL
-      : VOICE_DESIGN_TTS_MODEL;
 
-  const cacheKey = buildTtsCacheKey({
-    voiceId: resolved.voiceId,
-    language: resolved.language,
-    accent: resolved.accent,
-    voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
-    ttsModelVersion: ttsModel,
-    scriptText: text,
-  });
+  // Build ordered list of compliant models (NEVER falls back to Northern or non-Saigon engines)
+  const hasExplicitOverride =
+    ttsModelOverride === VOICE_DESIGN_TTS_MODEL || ttsModelOverride === PRIMARY_TTS_LITE_MODEL;
+  const baseOrder = hasExplicitOverride
+    ? [ttsModelOverride]
+    : resolved.isEnglish
+    ? [PRIMARY_TTS_LITE_MODEL, VOICE_DESIGN_TTS_MODEL]
+    : [VOICE_DESIGN_TTS_MODEL, PRIMARY_TTS_LITE_MODEL];
 
-  // Strict provenance-verified cache lookup
-  const cachedEntry = cacheMap.get(cacheKey);
-  if (
-    cachedEntry &&
-    cachedEntry.audioBase64.length > 100 &&
-    cachedEntry.provenance.voiceId === resolved.voiceId &&
-    cachedEntry.provenance.language === resolved.language &&
-    cachedEntry.provenance.voiceConfigVersion === SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION &&
-    cachedEntry.provenance.ttsModelVersion === ttsModel
-  ) {
-    const wavBuffer = ensureWavBuffer(Buffer.from(cachedEntry.audioBase64, 'base64'));
-    const metrics = inspectWavAudioMetrics(wavBuffer);
-    if (!metrics.isSilent && metrics.isValidRiffWav) {
-      return {
-        audioBase64: wavBuffer.toString('base64'),
-        wavBuffer,
-        metrics,
-        provenance: {
-          ...cachedEntry.provenance,
-          cacheHit: true,
-        },
-      };
+  // 1. Strict provenance-verified cache lookup across all compliant candidate models first (zero quota consumed!)
+  for (const candidateModel of baseOrder) {
+    const candidateCacheKey = buildTtsCacheKey({
+      voiceId: resolved.voiceId,
+      language: resolved.language,
+      accent: resolved.accent,
+      voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
+      ttsModelVersion: candidateModel,
+      scriptText: text,
+    });
+    const cachedEntry = cacheMap.get(candidateCacheKey);
+    if (
+      cachedEntry &&
+      cachedEntry.audioBase64.length > 100 &&
+      cachedEntry.provenance.voiceId === resolved.voiceId &&
+      cachedEntry.provenance.language === resolved.language &&
+      cachedEntry.provenance.voiceConfigVersion === SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION &&
+      cachedEntry.provenance.ttsModelVersion === candidateModel
+    ) {
+      const wavBuffer = ensureWavBuffer(Buffer.from(cachedEntry.audioBase64, 'base64'));
+      const metrics = inspectWavAudioMetrics(wavBuffer);
+      if (!metrics.isSilent && metrics.isValidRiffWav) {
+        return {
+          audioBase64: wavBuffer.toString('base64'),
+          wavBuffer,
+          metrics,
+          provenance: {
+            ...cachedEntry.provenance,
+            cacheHit: true,
+          },
+        };
+      }
+      cacheMap.delete(candidateCacheKey);
     }
-    cacheMap.delete(cacheKey);
   }
 
+  // 2. Order candidates so models NOT currently in quota cooldown are tried first
+  const now = Date.now();
+  const orderedModels = [...baseOrder].sort((a, b) => {
+    const aCooling = (modelCooldownUntilMap.get(a) || 0) > now ? 1 : 0;
+    const bCooling = (modelCooldownUntilMap.get(b) || 0) > now ? 1 : 0;
+    return aCooling - bCooling;
+  });
+
   let lastError: any = null;
-  let delayMs = 1000;
+  let minObservedRetrySec = 10;
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      console.info(
-        `[SAIGON-TTS] Model=${ttsModel} | Voice=${resolved.voiceId} (${resolved.geminiVoiceName}) | Lang=${resolved.language} | Policy=${SAIGON_VOICE_POLICY.ACCENT_POLICY} | Attempt=${attempt}/${maxRetries}`
-      );
+  for (const ttsModel of orderedModels) {
+    const cacheKey = buildTtsCacheKey({
+      voiceId: resolved.voiceId,
+      language: resolved.language,
+      accent: resolved.accent,
+      voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
+      ttsModelVersion: ttsModel,
+      scriptText: text,
+    });
 
-      // Build explicit audio request with strict Southern Saigon persona metadata for Vietnamese.
-      // Retries MUST keep the EXACT same verified voice & accent — zero fallback to Northern/OS voices!
-      const response: any = await Promise.race([
-        aiBeta.models.generateContent({
-          model: ttsModel,
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  text,
-                  speechMetadata: {
-                    style: resolved.speechStylePrompt,
+    let delayMs = 900;
+    let waitedShortQuota = false;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.info(
+          `[SAIGON-TTS] Model=${ttsModel} | Voice=${resolved.voiceId} (${resolved.geminiVoiceName}) | Lang=${resolved.language} | Policy=${SAIGON_VOICE_POLICY.ACCENT_POLICY} | Attempt=${attempt}/${maxRetries}`
+        );
+
+        // Build explicit audio request with strict Southern Saigon persona metadata for Vietnamese.
+        // Retries & compliant sibling model switches MUST keep the EXACT same verified voice & accent — zero fallback to Northern/OS voices!
+        const response: any = await Promise.race([
+          aiBeta.models.generateContent({
+            model: ttsModel,
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    text,
+                    speechMetadata: {
+                      style: resolved.speechStylePrompt,
+                    },
                   },
+                ],
+              },
+            ],
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: resolved.geminiVoiceName },
                 },
-              ],
-            },
-          ],
-          config: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: resolved.geminiVoiceName },
               },
             },
-          },
-        }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('TTS_TIMEOUT')), timeoutMs)),
-      ]);
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('TTS_TIMEOUT')), timeoutMs)),
+        ]);
 
-      const parts = response?.candidates?.[0]?.content?.parts || [];
-      const audioPart = parts.find((p: any) => p?.inlineData?.data && p.inlineData.data.length > 100);
-      const rawData = audioPart?.inlineData?.data;
+        const parts = response?.candidates?.[0]?.content?.parts || [];
+        const audioPart = parts.find((p: any) => p?.inlineData?.data && p.inlineData.data.length > 100);
+        const rawData = audioPart?.inlineData?.data;
 
-      if (!rawData || typeof rawData !== 'string') {
-        throw new Error('EMPTY_AUDIO_RESPONSE');
-      }
+        if (!rawData || typeof rawData !== 'string') {
+          throw new Error('EMPTY_AUDIO_RESPONSE');
+        }
 
-      const rawBuf = Buffer.from(rawData, 'base64');
-      const wavBuffer = ensureWavBuffer(rawBuf, 24000);
-      const metrics = inspectWavAudioMetrics(wavBuffer);
+        const rawBuf = Buffer.from(rawData, 'base64');
+        const wavBuffer = ensureWavBuffer(rawBuf, 24000);
+        const metrics = inspectWavAudioMetrics(wavBuffer);
 
-      if (!metrics.isValidRiffWav || metrics.isSilent) {
-        throw new Error(`SILENT_OR_CORRUPT_WAV (peak=${metrics.peakAmplitude}, rmsDb=${metrics.rmsDb})`);
-      }
+        if (!metrics.isValidRiffWav || metrics.isSilent) {
+          throw new Error(`SILENT_OR_CORRUPT_WAV (peak=${metrics.peakAmplitude}, rmsDb=${metrics.rmsDb})`);
+        }
 
-      const finalBase64 = wavBuffer.toString('base64');
-      const provenance: TtsAudioProvenance = {
-        voiceId: resolved.voiceId,
-        geminiVoiceName: resolved.geminiVoiceName,
-        language: resolved.language,
-        accent: resolved.accent,
-        regionalVariant: resolved.regionalVariant,
-        accentPolicy: resolved.isEnglish ? 'ENGLISH_STANDARD' : SAIGON_VOICE_POLICY.ACCENT_POLICY,
-        voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
-        ttsModelVersion: ttsModel,
-        scriptHash: computeDeterministicScriptHash(text),
-        cacheKey,
-        cacheHit: false,
-        synthesizedAt: Date.now(),
-        durationSec: metrics.durationSec,
-        rmsDb: metrics.rmsDb,
-        isSilent: metrics.isSilent,
-      };
+        // Clear cooldown & record recent live TTS success to spare redundant health probes
+        modelCooldownUntilMap.delete(ttsModel);
+        lastSuccessfulTtsAt = Date.now();
 
-      cacheMap.set(cacheKey, { audioBase64: finalBase64, provenance });
-      return { audioBase64: finalBase64, wavBuffer, metrics, provenance };
-    } catch (err: any) {
-      lastError = err;
-      const errMsg = String(err?.message || err);
-      console.error(`[SAIGON-TTS-ERR] Voice=${resolved.voiceId} Attempt=${attempt}:`, errMsg);
+        const finalBase64 = wavBuffer.toString('base64');
+        const provenance: TtsAudioProvenance = {
+          voiceId: resolved.voiceId,
+          geminiVoiceName: resolved.geminiVoiceName,
+          language: resolved.language,
+          accent: resolved.accent,
+          regionalVariant: resolved.regionalVariant,
+          accentPolicy: resolved.isEnglish ? 'ENGLISH_STANDARD' : SAIGON_VOICE_POLICY.ACCENT_POLICY,
+          voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
+          ttsModelVersion: ttsModel,
+          scriptHash: computeDeterministicScriptHash(text),
+          cacheKey,
+          cacheHit: false,
+          synthesizedAt: lastSuccessfulTtsAt,
+          durationSec: metrics.durationSec,
+          rmsDb: metrics.rmsDb,
+          isSilent: metrics.isSilent,
+        };
 
-      const isQuota =
-        err?.status === 429 ||
-        errMsg.includes('RESOURCE_EXHAUSTED') ||
-        errMsg.toLowerCase().includes('quota');
-      if (isQuota) {
-        break; // Do not hammer quota-exhausted API
-      }
+        cacheMap.set(cacheKey, { audioBase64: finalBase64, provenance });
+        return { audioBase64: finalBase64, wavBuffer, metrics, provenance };
+      } catch (err: any) {
+        lastError = err;
+        const errMsg = String(err?.message || err);
+        console.warn(`[SAIGON-TTS-WARN] Model=${ttsModel} Voice=${resolved.voiceId} Attempt=${attempt}:`, errMsg);
 
-      if (attempt < maxRetries) {
-        const retryMatch = errMsg.match(/Please retry in (\d+(?:\.\d+)?)s/i);
-        const waitMs = retryMatch ? Math.min(4000, Math.ceil(parseFloat(retryMatch[1])) * 1000 + 300) : delayMs;
-        await new Promise((r) => setTimeout(r, waitMs));
-        delayMs = Math.min(delayMs * 1.8, 3500);
+        const isQuota =
+          err?.status === 429 ||
+          errMsg.includes('RESOURCE_EXHAUSTED') ||
+          errMsg.toLowerCase().includes('quota');
+
+        if (isQuota) {
+          const retrySec = parseRetryAfterSec(errMsg);
+          minObservedRetrySec = Math.min(minObservedRetrySec, retrySec);
+          modelCooldownUntilMap.set(ttsModel, Date.now() + Math.min(60, Math.max(5, retrySec)) * 1000);
+
+          // If quota reset is very short (<= 4.5s) and we haven't waited once on this model yet, wait briefly then retry once
+          if (!waitedShortQuota && retrySec <= 4 && attempt < maxRetries) {
+            waitedShortQuota = true;
+            await new Promise((r) => setTimeout(r, retrySec * 1000 + 300));
+            continue;
+          }
+          // Otherwise immediately try the next compliant Southern Saigon model (with exact same voice & SAIGON_AUDIO_DIRECTIVE)
+          break;
+        }
+
+        if (attempt < maxRetries) {
+          const retrySec = parseRetryAfterSec(errMsg);
+          const waitMs = Math.min(4000, Math.max(delayMs, retrySec <= 4 ? retrySec * 1000 + 250 : delayMs));
+          await new Promise((r) => setTimeout(r, waitMs));
+          delayMs = Math.min(delayMs * 1.8, 3000);
+        }
       }
     }
   }
@@ -487,6 +543,7 @@ export async function synthesizeGeminiTtsStrict(params: {
   wrapped.httpStatus = isQuota ? 429 : isTimeout ? 504 : 503;
   wrapped.code = isQuota ? 'TTS_QUOTA_EXCEEDED' : isTimeout ? 'TTS_TIMEOUT' : 'TTS_UNAVAILABLE';
   wrapped.retryable = true;
+  wrapped.retryAfterSeconds = Math.min(30, Math.max(5, minObservedRetrySec));
   throw wrapped;
 }
 

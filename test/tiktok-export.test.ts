@@ -16,6 +16,9 @@ import {
   selectOptimalRecorderCodec,
   getTikTokExportBitrateBps,
   computeTikTokCanvasDimensions,
+  computeUploadChunkPlan,
+  SINGLE_UPLOAD_SAFE_MAX_BYTES,
+  DEFAULT_UPLOAD_CHUNK_BYTES,
 } from '../src/tiktokExportEngine';
 
 function runFfmpegSync(args: string[]): void {
@@ -301,6 +304,17 @@ export async function runTikTokExportTests() {
     assert.deepEqual(computeTikTokCanvasDimensions('1080p'), { width: 1080, height: 1920 });
     assert.deepEqual(computeTikTokCanvasDimensions('4k'), { width: 1080, height: 1920 });
     assert.deepEqual(computeTikTokCanvasDimensions('720p'), { width: 720, height: 1280 });
+
+    // Chunked streaming upload plan must guarantee every HTTP request stays well under Cloud Run's 32MB ceiling
+    assert.ok(SINGLE_UPLOAD_SAFE_MAX_BYTES < 32 * 1024 * 1024);
+    assert.ok(DEFAULT_UPLOAD_CHUNK_BYTES <= 8 * 1024 * 1024);
+    const plan50mb = computeUploadChunkPlan(50 * 1024 * 1024 + 12345);
+    assert.ok(plan50mb.length >= 10, '50MB+ export must split into safe multi-chunk streaming slices');
+    assert.equal(plan50mb[0].start, 0);
+    assert.equal(plan50mb[plan50mb.length - 1].end, 50 * 1024 * 1024 + 12345);
+    for (const s of plan50mb) {
+      assert.ok(s.size > 0 && s.size <= DEFAULT_UPLOAD_CHUNK_BYTES, 'Every chunk must respect max chunk size');
+    }
 
     // Large / high-bitrate source (>20Mbps bursts) cleanly encoded within tier ceiling
     const highBrInput = path.join(tmpDir, 'input_high_bitrate.mp4');

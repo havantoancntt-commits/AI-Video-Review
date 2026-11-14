@@ -7,6 +7,7 @@ import {
   SAIGON_AUDIO_DIRECTIVE,
   SAIGON_VOICE_SPECS,
   SAIGON_SAMPLE_SCRIPT,
+  adaptVietnameseTextForSaigonSpeech,
   buildTtsCacheKey,
   isCacheKeyValidForPolicy,
   resolveVoiceConfiguration,
@@ -103,7 +104,7 @@ export function runTtsAudioTests() {
     computeDeterministicScriptHash('Dạ chào cả nhà nhé.')
   );
 
-  // 4. Northern Phonetic / Lexical Scrubbing in Saigon TTS Mode
+  // 4. Northern Phonetic / Lexical Scrubbing in Saigon TTS Mode + Unicode Boundary Safety
   const northernInput = 'Vâng, các bạn hãy xem thử cái bát và thìa thế này nhé!';
   const saigonAdapted = correctVietnameseSpelling(northernInput, { adaptSouthernDialect: true }).correctedText.toLowerCase();
   assert.ok(saigonAdapted.includes('dạ'), 'Should map vâng -> dạ');
@@ -111,6 +112,23 @@ export function runTtsAudioTests() {
   assert.ok(saigonAdapted.includes('chén'), 'Should map bát -> chén');
   assert.ok(saigonAdapted.includes('muỗng'), 'Should map thìa -> muỗng');
   assert.ok(saigonAdapted.includes('như vầy nha'), 'Should map thế này nhé -> như vầy nha');
+
+  const unicodeRegressionInput =
+    'Hôm nay bạn tạo kết quả tất cả màn hình bảo hành thế giới, cảm ơn các bạn luôn đồng hành nhé!';
+  const unicodeSanitized = adaptVietnameseTextForSaigonSpeech(unicodeRegressionInput, true);
+  assert.ok(unicodeSanitized.includes('Hôm nay'), `Must NOT corrupt "Hôm nay" -> got: ${unicodeSanitized}`);
+  assert.ok(unicodeSanitized.includes('bạn tạo'), `Must NOT corrupt "bạn tạo" -> got: ${unicodeSanitized}`);
+  assert.ok(unicodeSanitized.includes('kết quả'), `Must NOT corrupt "kết quả" -> got: ${unicodeSanitized}`);
+  assert.ok(unicodeSanitized.includes('tất cả'), `Must NOT corrupt "tất cả" -> got: ${unicodeSanitized}`);
+  assert.ok(unicodeSanitized.includes('màn hình'), `Must NOT corrupt "màn hình" -> got: ${unicodeSanitized}`);
+  assert.ok(unicodeSanitized.includes('bảo hành'), `Must NOT corrupt "bảo hành" -> got: ${unicodeSanitized}`);
+  assert.ok(unicodeSanitized.includes('thế giới'), `Must NOT corrupt "thế giới" -> got: ${unicodeSanitized}`);
+  assert.ok(unicodeSanitized.includes('luôn đồng hành nha'), `Must preserve "luôn" and convert "nhé" -> "nha": ${unicodeSanitized}`);
+
+  const fullSanitizedSample = adaptVietnameseTextForSaigonSpeech(SAIGON_SAMPLE_SCRIPT, true);
+  assert.ok(fullSanitizedSample.includes('Hôm nay'), 'Benchmark script must keep Hôm nay intact');
+  assert.ok(fullSanitizedSample.includes('luôn đồng hành'), 'Benchmark script must keep luôn đồng hành intact');
+  assert.ok(!fullSanitizedSample.includes('Hdùm') && !fullSanitizedSample.includes('ludùn'), 'Must never produce ASCII \\b vowel artifacts');
 
   // 5. Real WAV Synthesis & Silent-Audio Rejection Check
   const sampleRate = 24000;

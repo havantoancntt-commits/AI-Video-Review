@@ -17,6 +17,7 @@ import {
   PRIMARY_TTS_LITE_MODEL,
   VOICE_DESIGN_TTS_MODEL,
   TTS_SAMPLES_DIR,
+  getLastSuccessfulTtsAt,
   synthesizeGeminiTtsStrict,
   auditWavDialectWithGemini,
   saveSampleWavFile,
@@ -26,6 +27,7 @@ import {
   SAIGON_TEST_SENTENCES,
   SAIGON_SAMPLE_SCRIPT,
   TtsAudioProvenance,
+  adaptVietnameseTextForSaigonSpeech,
   resolveVoiceConfiguration,
 } from "./src/saigonVoicePolicy";
 
@@ -264,8 +266,8 @@ async function probeGeminiHealth(force = false): Promise<SystemProbeStatus> {
     };
   }
 
-  // Use cached probe if fresh (< 30 seconds) unless force requested
-  if (!force && statusCache && (Date.now() - statusCache.testedAt < 30000)) {
+  // Use cached probe if fresh (< 5 minutes) unless force requested so page loads do not burn Free-Tier quota
+  if (!force && statusCache && (Date.now() - statusCache.testedAt < 300000)) {
     return statusCache;
   }
 
@@ -294,6 +296,8 @@ async function probeGeminiHealth(force = false): Promise<SystemProbeStatus> {
 
   const t0 = Date.now();
   const tinyGif = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+  const recentTtsAgeMs = Date.now() - getLastSuccessfulTtsAt();
+  const skipRedundantTtsProbe = !force && recentTtsAgeMs < 300000;
 
   const [textProbe, visionProbe, ttsProbe] = await Promise.all([
     probeSingleService(() =>
@@ -315,34 +319,40 @@ async function probeGeminiHealth(force = false): Promise<SystemProbeStatus> {
       PRIMARY_TEXT_VISION_MODEL,
       8000
     ),
-    probeSingleService(() => {
-      const probeVoice = resolveVoiceConfiguration(SAIGON_VOICE_POLICY.DEFAULT_VOICE, "vi");
-      return aiBeta.models.generateContent({
-        model: PRIMARY_TTS_MODEL,
-        contents: [
-          {
-            role: "user",
-            parts: [
+    skipRedundantTtsProbe
+      ? Promise.resolve<ServiceHealthResult>({
+          status: "CONNECTED",
+          latencyMs: 1,
+          model: PRIMARY_TTS_MODEL,
+        })
+      : probeSingleService(() => {
+          const probeVoice = resolveVoiceConfiguration(SAIGON_VOICE_POLICY.DEFAULT_VOICE, "vi");
+          return aiBeta.models.generateContent({
+            model: PRIMARY_TTS_MODEL,
+            contents: [
               {
-                text: "Dạ chào cả nhà nha.",
-                speechMetadata: { style: probeVoice.speechStylePrompt },
+                role: "user",
+                parts: [
+                  {
+                    text: "Dạ chào cả nhà nha.",
+                    speechMetadata: { style: probeVoice.speechStylePrompt },
+                  },
+                ],
               },
             ],
-          },
-        ],
-        config: {
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: probeVoice.geminiVoiceName },
+            config: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: probeVoice.geminiVoiceName },
+                },
+              },
             },
-          },
+          });
         },
-      });
-    },
-      PRIMARY_TTS_MODEL,
-      8000
-    )
+          PRIMARY_TTS_MODEL,
+          8000
+        )
   ]);
 
   const totalLatency = Date.now() - t0;
@@ -892,178 +902,7 @@ function cleanTextForSpeech(text: string): string {
 }
 
 function sanitizeTextForVietnameseTTS(text: string, adaptSouthern: boolean = true): string {
-  if (!text) return "";
-  let clean = text;
-
-  // Loại bỏ các ký tự đặc biệt của markdown (*, #, _, ~) để tránh gây nhiễu nhịp đọc của AI
-  clean = clean.replace(/[*#_~`•\-+]/g, ' ');
-
-  // Quy đổi các ký hiệu tiền tệ và phần trăm thông dụng sang chữ quốc ngữ để AI đọc trơn tru và tự nhiên nhất
-  clean = clean.replace(/(\d+)\s*%/g, '$1 phần trăm');
-  clean = clean.replace(/(\d+)\s*k\b/gi, '$1 ngàn');
-  clean = clean.replace(/(\d+)\s*(đ|VND|đồng)/gi, '$1 đồng');
-
-  // Chỉ chuyển hóa sang phương ngữ Nam Bộ / Sài Gòn khi người dùng bật hoặc chọn giọng miền Nam
-  const northToSouthMap: [RegExp, string][] = [
-    // 1. Đại từ xưng hô & Đối tượng
-    [/\bchúng tôi\b/gi, 'tụi mình'],
-    [/\bchúng mình\b/gi, 'tụi mình'],
-    [/\bbọn mình\b/gi, 'tụi mình'],
-    [/\bchúng ta\b/gi, 'tụi mình'],
-    [/\bmọi người ơi\b/gi, 'cả nhà ơi'],
-    [/\bmọi người nhé\b/gi, 'cả nhà nha'],
-    [/\bmọi người nghen\b/gi, 'cả nhà nghen'],
-    [/\bmọi người\b/gi, 'cả nhà'],
-    [/\bcác bạn ơi\b/gi, 'mấy bạn ơi'],
-    [/\bcác bạn nhé\b/gi, 'mấy bạn nha'],
-    [/\bcác bạn\b/gi, 'mấy bạn'],
-    [/\bcác bác ơi\b/gi, 'cả nhà ơi'],
-    [/\bcác bác\b/gi, 'mấy bạn'],
-    [/\bchị em ơi\b/gi, 'mấy chị ơi'],
-    [/\banh em ơi\b/gi, 'mấy anh ơi'],
-    [/\bbố mẹ\b/gi, 'ba má'],
-    [/\bbố\b/gi, 'ba'],
-    [/\bmẹ\b/gi, 'má'],
-    [/\bông bà\b/gi, 'ông bà'],
-
-    // 2. Đuôi câu, Hư từ & Ngữ điệu Miền Bắc
-    [/\bnhé cả nhà\b/gi, 'nha cả nhà'],
-    [/\bnhé mọi người\b/gi, 'nha cả nhà'],
-    [/\bnhé các bạn\b/gi, 'nha mấy bạn'],
-    [/\bnhé bạn\b/gi, 'nha bạn'],
-    [/\bđâu nhé\b/gi, 'đâu nha'],
-    [/\bđược nhé\b/gi, 'được nha'],
-    [/\bnày nhé\b/gi, 'này nha'],
-    [/\bnữa nhé\b/gi, 'nữa nha'],
-    [/\bluôn nhé\b/gi, 'luôn nha'],
-    [/\bnhé\b/gi, 'nha'],
-    [/\bnhá cả nhà\b/gi, 'nha cả nhà'],
-    [/\bnhá\b/gi, 'nha'],
-    [/\bnhỉ cả nhà\b/gi, 'nha cả nhà'],
-    [/\bnhỉ bạn\b/gi, 'nha bạn'],
-    [/\bnhỉ\b/gi, 'nha'],
-    [/\bđấy nhé\b/gi, 'đó nha'],
-    [/\bđấy ạ\b/gi, 'đó nha'],
-    [/\bđấy chứ\b/gi, 'đó chớ'],
-    [/\bđấy\b/gi, 'đó'],
-    [/\bthế này này\b/gi, 'như vầy nè'],
-    [/\bthế này nhé\b/gi, 'như vầy nha'],
-    [/\bthế này nha\b/gi, 'như vầy nha'],
-    [/\bthế này\b/gi, 'như vầy'],
-    [/\bthế kia\b/gi, 'như vậy'],
-    [/\bthế nên\b/gi, 'cho nên'],
-    [/\bthế là\b/gi, 'thành ra'],
-    [/\bthế à\b/gi, 'vậy hả'],
-    [/\bthế á\b/gi, 'vậy hả'],
-    [/\bthế hả\b/gi, 'vậy nè'],
-    [/\bthế\b/gi, 'vậy'],
-    [/\bvậy nhé\b/gi, 'vậy nha'],
-    [/\bsao thế\b/gi, 'sao vậy'],
-    [/\bấy nhỉ\b/gi, 'đó nha'],
-    [/\blắm luôn ấy\b/gi, 'lắm luôn á'],
-    [/\blắm ấy\b/gi, 'lắm á'],
-    [/\bấy\b/gi, 'đó'],
-    [/\bđúng rồi đấy\b/gi, 'đúng rồi đó nha'],
-    [/\bchuẩn rồi đấy\b/gi, 'chuẩn rồi đó nha'],
-
-    // 3. Từ ngữ phủ định, nghi vấn & câu hỏi
-    [/\bchẳng\b/gi, 'hông'],
-    [/\bchả\b/gi, 'hông'],
-    [/\bkhông đấy\b/gi, 'hông đó'],
-    [/\bkhông nhé\b/gi, 'hông nha'],
-    [/\bkhông nhỉ\b/gi, 'hông nha'],
-    [/\bđược không ạ\b/gi, 'được hông nè'],
-    [/\bđược không\b/gi, 'được hông'],
-    [/\bphải không ạ\b/gi, 'phải hông nè'],
-    [/\bphải không\b/gi, 'phải hông'],
-    [/\bđúng không ạ\b/gi, 'đúng hông nè'],
-    [/\bđúng không nè\b/gi, 'đúng hông nè'],
-    [/\bđúng không\b/gi, 'đúng hông'],
-    [/\bcó đúng không\b/gi, 'đúng hông nè'],
-
-    // 4. Kính ngữ & Thán từ
-    [/\bvâng ạ\b/gi, 'dạ'],
-    [/\bvâng\b/gi, 'dạ'],
-    [/\bạ\b/gi, 'nha'],
-    [/\brất là\b/gi, 'cực kỳ'],
-    [/\bquá là\b/gi, 'quá chừng'],
-    [/\bquá đi\b/gi, 'quá chừng'],
-    [/\bquá trời luôn\b/gi, 'quá chừng luôn'],
-
-    // 5. Động từ & Hành động đời sống
-    [/\bnghìn\b/gi, 'ngàn'],
-    [/\bxem thử\b/gi, 'coi thử'],
-    [/\bxem clip\b/gi, 'coi clip'],
-    [/\bxem video\b/gi, 'coi clip'],
-    [/\bxem ngay\b/gi, 'coi ngay'],
-    [/\bxem hết\b/gi, 'coi hết'],
-    [/\bxem xong\b/gi, 'coi xong'],
-    [/\bxem\b/gi, 'coi'],
-    [/\bnhìn vào\b/gi, 'nhìn vô'],
-    [/\bvào đâu\b/gi, 'vô đâu'],
-    [/\bvào trong\b/gi, 'vô trong'],
-    [/\bvào\b/gi, 'vô'],
-    [/\bbảo là\b/gi, 'nói là'],
-    [/\bbảo\b/gi, 'nói'],
-    [/\bxử lý\b/gi, 'giải quyết'],
-    [/\bsẽ thấy\b/gi, 'sẽ coi thấy'],
-    [/\bsử dụng\b/gi, 'xài'],
-    [/\bdùng thử\b/gi, 'xài thử'],
-    [/\bdùng\b/gi, 'xài'],
-    [/\bngã\b/gi, 'té'],
-    [/\bchuẩn chỉ\b/gi, 'chuẩn chỉnh'],
-
-    // 6. Tính từ, Trạng từ & Nhận xét
-    [/\bthật là\b/gi, 'thiệt là'],
-    [/\bthật sự\b/gi, 'thiệt sự'],
-    [/\bthật ra\b/gi, 'thiệt ra'],
-    [/\bthật luôn\b/gi, 'thiệt luôn'],
-    [/\bthật đấy\b/gi, 'thiệt đó nha'],
-    [/\bthật nha\b/gi, 'thiệt nha'],
-    [/\bthật\b/gi, 'thiệt'],
-    [/\bmột tí\b/gi, 'chút xíu'],
-    [/\bmột tẹo\b/gi, 'chút xíu'],
-    [/\btẹo\b/gi, 'chút xíu'],
-    [/\btí xíu\b/gi, 'chút xíu'],
-    [/\bđắt đỏ\b/gi, 'mắc tiền'],
-    [/\bđắt quá\b/gi, 'mắc quá'],
-    [/\bđắt\b/gi, 'mắc'],
-    [/\brẻ bèo\b/gi, 'rẻ rề'],
-
-    // 7. Danh từ đời sống & Đồ vật
-    [/\bngõ hẻm\b/gi, 'hẻm'],
-    [/\bngõ\b/gi, 'hẻm'],
-    [/\bcây ô\b/gi, 'cây dù'],
-    [/\bô che\b/gi, 'dù che'],
-    [/\bô\b/gi, 'dù'],
-    [/\bthìa\b/gi, 'muỗng'],
-    [/\bbát ăn cơm\b/gi, 'chén ăn cơm'],
-    [/\bbát đũa\b/gi, 'chén đũa'],
-    [/\bbát\b/gi, 'chén'],
-    [/\bquả táo\b/gi, 'trái táo'],
-    [/\bhoa quả\b/gi, 'trái cây'],
-    [/\bquả\b/gi, 'trái'],
-    [/\bđôi tất\b/gi, 'đôi vớ'],
-    [/\btất chân\b/gi, 'vớ chân'],
-    [/\btất\b/gi, 'vớ'],
-    [/\bchăn màn\b/gi, 'mền mùng'],
-    [/\bchăn\b/gi, 'mền'],
-    [/\bmàn tuyn\b/gi, 'mùng'],
-    [/\bmàn\b/gi, 'mùng'],
-    [/\bbọc lót\b/gi, 'bọc đệm'],
-    [/\bbốc thăm\b/gi, 'bốc thăm']
-  ];
-
-  if (adaptSouthern) {
-    for (const [pattern, replacement] of northToSouthMap) {
-      clean = clean.replace(pattern, replacement);
-    }
-  }
-
-  // Loại bỏ các khoảng trắng thừa
-  clean = clean.replace(/\s+/g, ' ');
-
-  return clean.trim();
+  return adaptVietnameseTextForSaigonSpeech(text, adaptSouthern);
 }
 
 // Expose verified sample WAV files for live human listening & QA verification
@@ -1123,13 +962,14 @@ app.post("/api/generate-tts", aiEndpointLimiter, async (req, res): Promise<any> 
       policy: SAIGON_VOICE_POLICY,
     });
   } catch (error: any) {
-    console.error("[SAIGON-TTS-ENDPOINT-ERR]", error);
     const status = error?.httpStatus || 503;
+    console.warn(`[SAIGON-TTS-ENDPOINT] Status=${status} Code=${error?.code || 'TTS_UNAVAILABLE'}:`, error?.message || error);
     return res.status(status).json({
       success: false,
       error: error?.message || "Không thể tạo giọng đọc Sài Gòn từ Gemini TTS.",
       code: error?.code || "TTS_UNAVAILABLE",
       retryable: error?.retryable !== false,
+      retryAfterSeconds: error?.retryAfterSeconds,
       policy: SAIGON_VOICE_POLICY,
     });
   }
@@ -1236,6 +1076,7 @@ app.post("/api/tts/preview", aiEndpointLimiter, async (req, res): Promise<any> =
       error: error?.message || "Không thể tạo mẫu âm thanh nghe thử.",
       code: error?.code || "PREVIEW_FAILED",
       retryable: true,
+      retryAfterSeconds: error?.retryAfterSeconds,
     });
   }
 });
@@ -2367,7 +2208,33 @@ Trả về phản hồi JSON theo schema:
 
 // Multipart/form-data Disk Storage for TikTok Video Transcoding (zero RAM/Base64 bloat)
 const transcodeUploadDir = path.join(TRANSCODE_TMP_ROOT, "uploads");
+const transcodeChunkRoot = path.join(TRANSCODE_TMP_ROOT, "chunk_uploads");
 fs.mkdirSync(transcodeUploadDir, { recursive: true });
+fs.mkdirSync(transcodeChunkRoot, { recursive: true });
+
+interface ChunkUploadSession {
+  uploadId: string;
+  sessionDir: string;
+  ext: string;
+  qualityTier: ReturnType<typeof normalizeQualityTier>;
+  baseFileName: string;
+  totalSize: number;
+  totalChunks: number;
+  receivedIndices: Set<number>;
+  createdAt: number;
+}
+const chunkUploadSessions = new Map<string, ChunkUploadSession>();
+
+const chunkCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [id, sess] of chunkUploadSessions.entries()) {
+    if (now - sess.createdAt > 30 * 60 * 1000) {
+      try { fs.rmSync(sess.sessionDir, { recursive: true, force: true }); } catch {}
+      chunkUploadSessions.delete(id);
+    }
+  }
+}, 60 * 1000);
+chunkCleanupTimer.unref?.();
 
 const transcodeUpload = multer({
   storage: multer.diskStorage({
@@ -2399,7 +2266,158 @@ function validateMagicFileHeaderOnDisk(filePath: string): boolean {
   }
 }
 
-// Endpoint: Upload recorded WebM/MP4 via multipart streaming and start TikTok H.264/AAC MP4 transcode job
+// Endpoint: Initialize chunked binary streaming upload (bypasses Cloud Run 32MB single-request ceiling cleanly)
+app.post("/api/transcode/upload/init", (req, res) => {
+  const caps = checkFfmpegCapabilities();
+  if (!caps.ffmpegAvailable || !caps.ffprobeAvailable || !caps.encoders.h264 || !caps.encoders.aac) {
+    return res.status(503).json({
+      error: "Máy chủ chưa sẵn sàng bộ chuyển mã FFmpeg (libx264 / aac / ffprobe).",
+      code: "TRANSCODER_UNAVAILABLE",
+    });
+  }
+
+  const { sourceExt, qualityTier, baseFileName, totalSize, totalChunks } = req.body || {};
+  const sizeNum = Number(totalSize);
+  const chunksNum = Number(totalChunks);
+
+  if (!isFinite(sizeNum) || sizeNum < 1024) {
+    return res.status(400).json({ error: "Dung lượng tệp video nguồn quá nhỏ hoặc không hợp lệ.", code: "INVALID_SIZE" });
+  }
+  if (sizeNum > 500 * 1024 * 1024) {
+    return res.status(413).json({ error: "Dung lượng video vượt quá giới hạn tối đa 500MB.", code: "FILE_TOO_LARGE" });
+  }
+  if (!Number.isInteger(chunksNum) || chunksNum < 1 || chunksNum > 2000) {
+    return res.status(400).json({ error: "Số lượng phân đoạn tải lên (totalChunks) không hợp lệ.", code: "INVALID_CHUNKS" });
+  }
+
+  const cleanExt = `.${String(sourceExt || "webm").replace(/[^a-zA-Z0-9]/g, "").toLowerCase() || "webm"}`;
+  const uploadId = crypto.randomUUID();
+  const sessionDir = path.join(transcodeChunkRoot, uploadId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+
+  const session: ChunkUploadSession = {
+    uploadId,
+    sessionDir,
+    ext: cleanExt,
+    qualityTier: normalizeQualityTier(qualityTier),
+    baseFileName: typeof baseFileName === "string" ? baseFileName : "tiktok_review",
+    totalSize: sizeNum,
+    totalChunks: chunksNum,
+    receivedIndices: new Set<number>(),
+    createdAt: Date.now(),
+  };
+  chunkUploadSessions.set(uploadId, session);
+
+  return res.status(201).json({
+    uploadId,
+    maxChunkBytes: 8 * 1024 * 1024,
+  });
+});
+
+// Endpoint: Receive a binary video chunk (<= 12MB per HTTP request -> safely below Cloud Run 32MB limit)
+app.post(
+  "/api/transcode/upload/chunk/:uploadId/:chunkIndex",
+  express.raw({ type: "application/octet-stream", limit: "12mb" }),
+  (req, res) => {
+    const { uploadId, chunkIndex } = req.params;
+    const session = chunkUploadSessions.get(uploadId);
+    if (!session) {
+      return res.status(404).json({ error: "Phiên tải lên không tồn tại hoặc đã hết hạn.", code: "SESSION_NOT_FOUND" });
+    }
+
+    const idx = parseInt(chunkIndex, 10);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= session.totalChunks) {
+      return res.status(400).json({ error: "Chỉ số phân đoạn (chunkIndex) không hợp lệ.", code: "INVALID_CHUNK_INDEX" });
+    }
+
+    const buf = req.body;
+    if (!Buffer.isBuffer(buf) || buf.length === 0) {
+      return res.status(400).json({ error: "Dữ liệu phân đoạn rỗng hoặc sai định dạng nhị phân.", code: "EMPTY_CHUNK" });
+    }
+
+    const partPath = path.join(session.sessionDir, `part_${String(idx).padStart(6, "0")}`);
+    fs.writeFileSync(partPath, buf);
+    session.receivedIndices.add(idx);
+
+    return res.status(200).json({
+      uploadId,
+      chunkIndex: idx,
+      receivedCount: session.receivedIndices.size,
+      totalChunks: session.totalChunks,
+    });
+  }
+);
+
+// Endpoint: Assemble uploaded chunks on disk without buffering whole video in RAM and enqueue TikTok FFmpeg transcode
+app.post("/api/transcode/upload/complete/:uploadId", (req, res) => {
+  const { uploadId } = req.params;
+  const session = chunkUploadSessions.get(uploadId);
+  if (!session) {
+    return res.status(404).json({ error: "Phiên tải lên không tồn tại hoặc đã hết hạn.", code: "SESSION_NOT_FOUND" });
+  }
+
+  for (let i = 0; i < session.totalChunks; i++) {
+    const partPath = path.join(session.sessionDir, `part_${String(i).padStart(6, "0")}`);
+    if (!fs.existsSync(partPath)) {
+      return res.status(400).json({
+        error: `Thiếu phân đoạn dữ liệu số ${i + 1}/${session.totalChunks}. Vui lòng thử xuất lại.`,
+        code: "MISSING_CHUNK",
+      });
+    }
+  }
+
+  const finalInputPath = path.join(transcodeUploadDir, `upload_${Date.now()}_${uploadId}${session.ext}`);
+  try {
+    const outFd = fs.openSync(finalInputPath, "w");
+    try {
+      for (let i = 0; i < session.totalChunks; i++) {
+        const partPath = path.join(session.sessionDir, `part_${String(i).padStart(6, "0")}`);
+        const chunkBuf = fs.readFileSync(partPath);
+        fs.writeSync(outFd, chunkBuf, 0, chunkBuf.length);
+      }
+    } finally {
+      fs.closeSync(outFd);
+    }
+
+    const finalStat = fs.statSync(finalInputPath);
+    if (finalStat.size < 1024 || !validateMagicFileHeaderOnDisk(finalInputPath)) {
+      try { fs.unlinkSync(finalInputPath); } catch {}
+      return res.status(400).json({
+        error: "Tệp video sau khi ghép phân đoạn không đúng định dạng WebM/MP4 hợp lệ.",
+        code: "INVALID_VIDEO_CONTAINER",
+      });
+    }
+
+    const job = transcodeJobManager.createJob({
+      inputPath: finalInputPath,
+      qualityTier: session.qualityTier,
+      baseFileName: session.baseFileName,
+    });
+    return res.status(202).json(job);
+  } catch (err: any) {
+    try { fs.unlinkSync(finalInputPath); } catch {}
+    return res.status(500).json({
+      error: `Không thể ghép phân đoạn video: ${err?.message || "Lỗi đĩa tạm"}`,
+      code: "CHUNK_ASSEMBLE_ERROR",
+    });
+  } finally {
+    try { fs.rmSync(session.sessionDir, { recursive: true, force: true }); } catch {}
+    chunkUploadSessions.delete(uploadId);
+  }
+});
+
+// Endpoint: Cancel/clean up chunked upload session
+app.delete("/api/transcode/upload/:uploadId", (req, res) => {
+  const session = chunkUploadSessions.get(req.params.uploadId);
+  if (session) {
+    try { fs.rmSync(session.sessionDir, { recursive: true, force: true }); } catch {}
+    chunkUploadSessions.delete(req.params.uploadId);
+    return res.json({ deleted: true });
+  }
+  return res.json({ deleted: false });
+});
+
+// Endpoint: Upload recorded WebM/MP4 via single multipart streaming (<= 16MB fast path) and start TikTok H.264/AAC MP4 transcode job
 app.post("/api/transcode/tiktok", (req, res) => {
   transcodeUpload.single("video")(req, res, (uploadErr: any) => {
     if (uploadErr) {

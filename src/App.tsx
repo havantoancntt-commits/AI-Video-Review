@@ -108,7 +108,9 @@ import {
 import {
   SAIGON_VOICE_POLICY,
   SAIGON_TTS_MODELS,
+  SAIGON_COMPLIANT_TTS_MODELS,
   TtsAudioProvenance,
+  adaptVietnameseTextForSaigonSpeech,
   buildTtsCacheKey,
   isCacheKeyValidForPolicy,
   computeDeterministicScriptHash
@@ -172,169 +174,15 @@ export function cleanScriptForSpeech(scriptText: string, options?: { adaptSouthe
   if (!scriptText) return "";
   let clean = scriptText
     .normalize('NFC')
-    .replace(/\[[^\]]*\]/g, ' ') 
-    .replace(/\([^)]*\)/g, ' ')  
-    .replace(/[*#_~`]/g, ' ') // remove italics/bold markdown
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/[*#_~`]/g, ' ')
     .replace(/(KOL:|Người dẫn:|Vlogger:|MC:|Dẫn chương trình:|Lời thoại:|Kịch bản:)/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
-  // LOẠI BỎ VĨNH VIỄN 100% TỪ NGỮ, NGỮ ĐIỆU, HƯ TỪ, THÁN TỪ VÀ PHÁT ÂM MIỀN BẮC KHỎI TOÀN BỘ ỨNG DỤNG
-  // Chuyển hóa toàn bộ sang phương ngữ Nam Bộ / Sài Gòn ngọt ngào, tự nhiên, sang trọng và chuẩn mực
-  const northToSouthList: [RegExp, string][] = [
-    // 1. Đại từ xưng hô & Đối tượng
-    [/\bchúng tôi\b/gi, 'tụi mình'],
-    [/\bchúng mình\b/gi, 'tụi mình'],
-    [/\bbọn mình\b/gi, 'tụi mình'],
-    [/\bchúng ta\b/gi, 'tụi mình'],
-    [/\bmọi người ơi\b/gi, 'cả nhà ơi'],
-    [/\bmọi người nhé\b/gi, 'cả nhà nha'],
-    [/\bmọi người nghen\b/gi, 'cả nhà nghen'],
-    [/\bmọi người\b/gi, 'cả nhà'],
-    [/\bcác bạn ơi\b/gi, 'mấy bạn ơi'],
-    [/\bcác bạn nhé\b/gi, 'mấy bạn nha'],
-    [/\bcác bạn\b/gi, 'mấy bạn'],
-    [/\bcác bác ơi\b/gi, 'cả nhà ơi'],
-    [/\bcác bác\b/gi, 'mấy bạn'],
-    [/\bchị em ơi\b/gi, 'mấy chị ơi'],
-    [/\banh em ơi\b/gi, 'mấy anh ơi'],
-    [/\bbố mẹ\b/gi, 'ba má'],
-    [/\bbố\b/gi, 'ba'],
-    [/\bmẹ\b/gi, 'má'],
-    [/\bông bà\b/gi, 'ông bà'],
-
-    // 2. Đuôi câu, Hư từ & Ngữ điệu Miền Bắc
-    [/\bnhé cả nhà\b/gi, 'nha cả nhà'],
-    [/\bnhé mọi người\b/gi, 'nha cả nhà'],
-    [/\bnhé các bạn\b/gi, 'nha mấy bạn'],
-    [/\bnhé bạn\b/gi, 'nha bạn'],
-    [/\bđâu nhé\b/gi, 'đâu nha'],
-    [/\bđược nhé\b/gi, 'được nha'],
-    [/\bnày nhé\b/gi, 'này nha'],
-    [/\bnữa nhé\b/gi, 'nữa nha'],
-    [/\bluôn nhé\b/gi, 'luôn nha'],
-    [/\bnhé\b/gi, 'nha'],
-    [/\bnhá cả nhà\b/gi, 'nha cả nhà'],
-    [/\bnhá\b/gi, 'nha'],
-    [/\bnhỉ cả nhà\b/gi, 'nha cả nhà'],
-    [/\bnhỉ bạn\b/gi, 'nha bạn'],
-    [/\bnhỉ\b/gi, 'nha'],
-    [/\bđấy nhé\b/gi, 'đó nha'],
-    [/\bđấy ạ\b/gi, 'đó nha'],
-    [/\bđấy chứ\b/gi, 'đó chớ'],
-    [/\bđấy\b/gi, 'đó'],
-    [/\bthế này này\b/gi, 'như vầy nè'],
-    [/\bthế này nhé\b/gi, 'như vầy nha'],
-    [/\bthế này nha\b/gi, 'như vầy nha'],
-    [/\bthế này\b/gi, 'như vầy'],
-    [/\bthế kia\b/gi, 'như vậy'],
-    [/\bthế nên\b/gi, 'cho nên'],
-    [/\bthế là\b/gi, 'thành ra'],
-    [/\bthế à\b/gi, 'vậy hả'],
-    [/\bthế á\b/gi, 'vậy hả'],
-    [/\bthế hả\b/gi, 'vậy nè'],
-    [/\bthế\b/gi, 'vậy'],
-    [/\bvậy nhé\b/gi, 'vậy nha'],
-    [/\bsao thế\b/gi, 'sao vậy'],
-    [/\bấy nhỉ\b/gi, 'đó nha'],
-    [/\blắm luôn ấy\b/gi, 'lắm luôn á'],
-    [/\blắm ấy\b/gi, 'lắm á'],
-    [/\bấy\b/gi, 'đó'],
-    [/\bđúng rồi đấy\b/gi, 'đúng rồi đó nha'],
-    [/\bchuẩn rồi đấy\b/gi, 'chuẩn rồi đó nha'],
-
-    // 3. Từ ngữ phủ định, nghi vấn & câu hỏi
-    [/\bchẳng\b/gi, 'hông'],
-    [/\bchả\b/gi, 'hông'],
-    [/\bkhông đấy\b/gi, 'hông đó'],
-    [/\bkhông nhé\b/gi, 'hông nha'],
-    [/\bkhông nhỉ\b/gi, 'hông nha'],
-    [/\bđược không ạ\b/gi, 'được hông nè'],
-    [/\bđược không\b/gi, 'được hông'],
-    [/\bphải không ạ\b/gi, 'phải hông nè'],
-    [/\bphải không\b/gi, 'phải hông'],
-    [/\bđúng không ạ\b/gi, 'đúng hông nè'],
-    [/\bđúng không nè\b/gi, 'đúng hông nè'],
-    [/\bđúng không\b/gi, 'đúng hông'],
-    [/\bcó đúng không\b/gi, 'đúng hông nè'],
-
-    // 4. Kính ngữ & Thán từ
-    [/\bvâng ạ\b/gi, 'dạ'],
-    [/\bvâng\b/gi, 'dạ'],
-    [/\bạ\b/gi, 'nha'],
-    [/\brất là\b/gi, 'cực kỳ'],
-    [/\bquá là\b/gi, 'quá chừng'],
-    [/\bquá đi\b/gi, 'quá chừng'],
-    [/\bquá trời luôn\b/gi, 'quá chừng luôn'],
-
-    // 5. Động từ & Hành động đời sống
-    [/\bnghìn\b/gi, 'ngàn'],
-    [/\bxem thử\b/gi, 'coi thử'],
-    [/\bxem clip\b/gi, 'coi clip'],
-    [/\bxem video\b/gi, 'coi clip'],
-    [/\bxem ngay\b/gi, 'coi ngay'],
-    [/\bxem hết\b/gi, 'coi hết'],
-    [/\bxem xong\b/gi, 'coi xong'],
-    [/\bxem\b/gi, 'coi'],
-    [/\bnhìn vào\b/gi, 'nhìn vô'],
-    [/\bvào đâu\b/gi, 'vô đâu'],
-    [/\bvào trong\b/gi, 'vô trong'],
-    [/\bvào\b/gi, 'vô'],
-    [/\bbảo là\b/gi, 'nói là'],
-    [/\bbảo\b/gi, 'nói'],
-    [/\bxử lý\b/gi, 'giải quyết'],
-    [/\bsẽ thấy\b/gi, 'sẽ coi thấy'],
-    [/\bsử dụng\b/gi, 'xài'],
-    [/\bdùng thử\b/gi, 'xài thử'],
-    [/\bdùng\b/gi, 'xài'],
-    [/\bngã\b/gi, 'té'],
-    [/\bchuẩn chỉ\b/gi, 'chuẩn chỉnh'],
-
-    // 6. Tính từ, Trạng từ & Nhận xét
-    [/\bthật là\b/gi, 'thiệt là'],
-    [/\bthật sự\b/gi, 'thiệt sự'],
-    [/\bthật ra\b/gi, 'thiệt ra'],
-    [/\bthật luôn\b/gi, 'thiệt luôn'],
-    [/\bthật đấy\b/gi, 'thiệt đó nha'],
-    [/\bthật nha\b/gi, 'thiệt nha'],
-    [/\bthật\b/gi, 'thiệt'],
-    [/\bmột tí\b/gi, 'chút xíu'],
-    [/\bmột tẹo\b/gi, 'chút xíu'],
-    [/\btẹo\b/gi, 'chút xíu'],
-    [/\btí xíu\b/gi, 'chút xíu'],
-    [/\bđắt đỏ\b/gi, 'mắc tiền'],
-    [/\bđắt quá\b/gi, 'mắc quá'],
-    [/\bđắt\b/gi, 'mắc'],
-    [/\brẻ bèo\b/gi, 'rẻ rề'],
-
-    // 7. Danh từ đời sống & Đồ vật
-    [/\bngõ hẻm\b/gi, 'hẻm'],
-    [/\bngõ\b/gi, 'hẻm'],
-    [/\bcây ô\b/gi, 'cây dù'],
-    [/\bô che\b/gi, 'dù che'],
-    [/\bô\b/gi, 'dù'],
-    [/\bthìa\b/gi, 'muỗng'],
-    [/\bbát ăn cơm\b/gi, 'chén ăn cơm'],
-    [/\bbát đũa\b/gi, 'chén đũa'],
-    [/\bbát\b/gi, 'chén'],
-    [/\bquả táo\b/gi, 'trái táo'],
-    [/\bhoa quả\b/gi, 'trái cây'],
-    [/\bquả\b/gi, 'trái'],
-    [/\bđôi tất\b/gi, 'đôi vớ'],
-    [/\btất chân\b/gi, 'vớ chân'],
-    [/\btất\b/gi, 'vớ'],
-    [/\bchăn màn\b/gi, 'mền mùng'],
-    [/\bchăn\b/gi, 'mền'],
-    [/\bmàn tuyn\b/gi, 'mùng'],
-    [/\bmàn\b/gi, 'mùng'],
-    [/\bbọc lót\b/gi, 'bọc đệm'],
-    [/\bbốc thăm\b/gi, 'bốc thăm']
-  ];
-
   if (options?.adaptSouthernDialect) {
-    for (const [pattern, replacement] of northToSouthList) {
-      clean = clean.replace(pattern, replacement);
-    }
+    clean = adaptVietnameseTextForSaigonSpeech(clean, true);
   }
 
   const spellAudit = correctVietnameseSpelling(clean.replace(/\s+/g, ' ').trim(), options);
@@ -1757,6 +1605,11 @@ export default function App() {
     setSaigonAuditError(null);
   }, [selectedVoice, reviewLanguage, activeAudioProvenance]);
 
+  // Cancel any stale auto-retry countdown when user switches voice or language
+  useEffect(() => {
+    setTtsCountdownSec(0);
+  }, [selectedVoice, reviewLanguage]);
+
   // Countdown timer for Google AI Studio rate limit queue
   useEffect(() => {
     if (ttsCountdownSec <= 0) return;
@@ -2981,6 +2834,7 @@ export default function App() {
 
     setIsGeneratingTTS(true);
     setApiError(null);
+    setTtsCountdownSec(0);
     setIsPlaying(false);
 
     const isEn = reviewLanguage === 'en';
@@ -2999,23 +2853,34 @@ export default function App() {
       scriptText: cleanSpeech,
     });
 
-    const cached = ttsClientCache.current[cacheKey];
-    if (
-      cached &&
-      cached.audioBase64 &&
-      cached.provenance &&
-      isCacheKeyValidForPolicy(cacheKey, {
+    const candidateKeys = SAIGON_COMPLIANT_TTS_MODELS.map((modelVer) =>
+      buildTtsCacheKey({
         voiceId: selectedVoice,
         language: expectedLang,
-        ttsModelVersion: expectedModel,
-      }) &&
-      cached.provenance.voiceId === selectedVoice &&
-      cached.provenance.language === expectedLang &&
-      cached.provenance.voiceConfigVersion === SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION
-    ) {
-      console.info("[CLIENT-CACHE-HIT] Phục hồi âm thanh giọng Sài Gòn khớp provenance:", cacheKey);
-      setAudioUrl(cached.url);
-      setActiveAudioProvenance({ ...cached.provenance, cacheHit: true });
+        accent: expectedAccent,
+        voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
+        ttsModelVersion: modelVer,
+        scriptText: cleanSpeech,
+      })
+    );
+    const cached = candidateKeys.map((k) => ({ key: k, entry: ttsClientCache.current[k] })).find(
+      ({ key, entry }) =>
+        entry &&
+        entry.audioBase64 &&
+        entry.provenance &&
+        isCacheKeyValidForPolicy(key, {
+          voiceId: selectedVoice,
+          language: expectedLang,
+        }) &&
+        entry.provenance.voiceId === selectedVoice &&
+        entry.provenance.language === expectedLang &&
+        entry.provenance.voiceConfigVersion === SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION
+    );
+
+    if (cached) {
+      console.info("[CLIENT-CACHE-HIT] Phục hồi âm thanh giọng Sài Gòn khớp provenance:", cached.key);
+      setAudioUrl(cached.entry.url);
+      setActiveAudioProvenance({ ...cached.entry.provenance, cacheHit: true });
 
       setTimeout(() => {
         if (audioRef.current) {
@@ -3056,7 +2921,13 @@ export default function App() {
 
       const resData = await response.json().catch(() => ({}));
       if (!response.ok || !resData.audioBase64) {
-        throw new Error(resData.error || `Lỗi máy chủ lồng tiếng (${response.status})`);
+        if (response.status === 429 || resData.code === 'TTS_QUOTA_EXCEEDED') {
+          const waitSec = Math.min(30, Math.max(5, Number(resData.retryAfterSeconds) || 10));
+          setTtsCountdownSec(waitSec);
+        }
+        const apiErr: any = new Error(resData.error || `Lỗi máy chủ lồng tiếng (${response.status})`);
+        apiErr.httpStatus = response.status;
+        throw apiErr;
       }
 
       const provenance: TtsAudioProvenance | undefined = resData.provenance;
@@ -3087,11 +2958,15 @@ export default function App() {
         synthesizedAt: Date.now(),
       };
 
-      ttsClientCache.current[cacheKey] = {
+      const cacheEntry = {
         url: wavUrl,
         audioBase64: resData.audioBase64,
         provenance: storedProvenance,
       };
+      ttsClientCache.current[cacheKey] = cacheEntry;
+      if (storedProvenance.cacheKey && storedProvenance.cacheKey !== cacheKey) {
+        ttsClientCache.current[storedProvenance.cacheKey] = cacheEntry;
+      }
 
       setAudioUrl(wavUrl);
       setActiveAudioProvenance(storedProvenance);
@@ -3116,7 +2991,8 @@ export default function App() {
         }
       }, 100);
     } catch (err: any) {
-      console.error("Lỗi tạo giọng đọc Sài Gòn:", err);
+      // Log handled API quota/availability status via console.warn (avoid triggering runtime crash error hooks)
+      console.warn("Tạo giọng đọc Sài Gòn tạm gián đoạn:", err?.message || err);
       // Strictly honest: Never substitute Northern/OS SpeechSynthesis or silent fake audio
       setAudioUrl("");
       setActiveAudioProvenance(null);
@@ -3356,8 +3232,20 @@ export default function App() {
         (!textToSynthesize || activeAudioProvenance!.scriptHash === expectedScriptHash);
 
       if (!provenanceMatches) {
-        const cached = ttsClientCache.current[cacheKey];
-        if (cached && cached.audioBase64 && cached.provenance?.voiceId === selectedVoice) {
+        const exportCandidateKeys = SAIGON_COMPLIANT_TTS_MODELS.map((modelVer) =>
+          buildTtsCacheKey({
+            voiceId: selectedVoice,
+            language: expectedLang,
+            accent: expectedAccent,
+            voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
+            ttsModelVersion: modelVer,
+            scriptText: cleanSpeech,
+          })
+        );
+        const cached = exportCandidateKeys.map((k) => ttsClientCache.current[k]).find(
+          (entry) => entry && entry.audioBase64 && entry.provenance?.voiceId === selectedVoice
+        );
+        if (cached) {
           currentAudioUrl = cached.url;
           setAudioUrl(cached.url);
           setActiveAudioProvenance({ ...cached.provenance, cacheHit: true });
@@ -3390,11 +3278,15 @@ export default function App() {
           }
 
           const wavUrl = pcmToWav(resData.audioBase64, 24000);
-          ttsClientCache.current[cacheKey] = {
+          const cacheEntry = {
             url: wavUrl,
             audioBase64: resData.audioBase64,
             provenance: resData.provenance,
           };
+          ttsClientCache.current[cacheKey] = cacheEntry;
+          if (resData.provenance?.cacheKey && resData.provenance.cacheKey !== cacheKey) {
+            ttsClientCache.current[resData.provenance.cacheKey] = cacheEntry;
+          }
 
           currentAudioUrl = wavUrl;
           setAudioUrl(wavUrl);
@@ -4748,8 +4640,10 @@ export default function App() {
           a.click();
           document.body.removeChild(a);
         } catch (onStopErr: any) {
-          console.error("Lỗi trong tiến trình chuyển mã/kiểm định TikTok MP4:", onStopErr);
-          if (!isExportCancelledRef.current) {
+          if (isExportCancelledRef.current) {
+            console.warn("Tiến trình xuất TikTok MP4 đã được người dùng hủy.");
+          } else {
+            console.error("Lỗi trong tiến trình chuyển mã/kiểm định TikTok MP4:", onStopErr);
             setApiError(onStopErr?.message || "Không thể chuyển mã video sang MP4 H.264/AAC chuẩn TikTok.");
           }
           setMergeProgress(0);
