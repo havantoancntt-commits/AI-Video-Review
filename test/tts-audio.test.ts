@@ -1,41 +1,118 @@
 import assert from 'node:assert/strict';
-
-// Binary WAV encoder verification (Node.js compatible)
-function encodePcmToWavBuffer(pcmBuffer: Buffer, sampleRate = 24000): Buffer {
-  // If already WAV RIFF
-  if (pcmBuffer.length >= 12 && pcmBuffer.subarray(0, 4).toString('ascii') === 'RIFF') {
-    return pcmBuffer;
-  }
-
-  const len = pcmBuffer.length;
-  const wavHeader = Buffer.alloc(44);
-
-  // RIFF identifier
-  wavHeader.write('RIFF', 0, 'ascii');
-  wavHeader.writeUInt32LE(36 + len, 4);
-  wavHeader.write('WAVE', 8, 'ascii');
-
-  // fmt chunk
-  wavHeader.write('fmt ', 12, 'ascii');
-  wavHeader.writeUInt32LE(16, 16);
-  wavHeader.writeUInt16LE(1, 20); // Linear PCM
-  wavHeader.writeUInt16LE(1, 22); // Mono (1 channel)
-  wavHeader.writeUInt32LE(sampleRate, 24);
-  wavHeader.writeUInt32LE(sampleRate * 2, 28); // Byte rate
-  wavHeader.writeUInt16LE(2, 32); // Block align
-  wavHeader.writeUInt16LE(16, 34); // 16-bit
-
-  // data chunk
-  wavHeader.write('data', 36, 'ascii');
-  wavHeader.writeUInt32LE(len, 40);
-
-  return Buffer.concat([wavHeader, pcmBuffer]);
-}
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  SAIGON_VOICE_POLICY,
+  SAIGON_TTS_MODELS,
+  SAIGON_AUDIO_DIRECTIVE,
+  SAIGON_VOICE_SPECS,
+  SAIGON_SAMPLE_SCRIPT,
+  buildTtsCacheKey,
+  isCacheKeyValidForPolicy,
+  resolveVoiceConfiguration,
+  computeDeterministicScriptHash,
+} from '../src/saigonVoicePolicy';
+import {
+  ensureWavBuffer,
+  inspectWavAudioMetrics,
+  TTS_SAMPLES_DIR,
+} from '../server/saigonTtsEngine';
+import { correctVietnameseSpelling } from '../src/utils';
+import { TTS_VOICES } from '../src/types';
 
 export function runTtsAudioTests() {
-  console.log('🧪 [TEST SUITE 4] Text-To-Speech Audio & WAV Validation Tests...');
+  console.log('🧪 [TEST SUITE 4] Southern Saigon TTS Policy, WAV Metrics & Provenance Tests...');
 
-  // 1. Synthesize 0.5s of 440Hz sine wave PCM 16-bit Mono at 24000Hz
+  // 1. Policy Locking Assertions
+  assert.equal(SAIGON_VOICE_POLICY.VIETNAMESE_LANGUAGE, 'vi-VN');
+  assert.equal(SAIGON_VOICE_POLICY.VIETNAMESE_ACCENT, 'Southern Vietnamese');
+  assert.equal(SAIGON_VOICE_POLICY.REGIONAL_VARIANT, 'Saigon Vietnamese');
+  assert.equal(SAIGON_VOICE_POLICY.ACCENT_POLICY, 'STRICT_SOUTHERN_ONLY');
+  assert.equal(SAIGON_VOICE_POLICY.FORBIDDEN_ACCENT, 'Northern Vietnamese');
+  assert.equal(SAIGON_VOICE_POLICY.DEFAULT_VOICE, 'Kore');
+  assert.equal(SAIGON_VOICE_POLICY.ALLOW_NORTHERN_FALLBACK, false);
+  assert.equal(SAIGON_VOICE_POLICY.ALLOW_BROWSER_SPEECH_SYNTHESIS_VIETNAMESE, false);
+
+  // 2. Voice Resolution Guardrails (Never fall back to Northern/unknown voice for vi-VN; preserve English _EN)
+  const defaultVi = resolveVoiceConfiguration(undefined, 'vi');
+  assert.equal(defaultVi.voiceId, 'Kore');
+  assert.equal(defaultVi.language, 'vi-VN');
+  assert.equal(defaultVi.accent, 'Southern Vietnamese');
+  assert.ok(defaultVi.speechStylePrompt.includes('Ho Chi Minh City'));
+  assert.ok(defaultVi.speechStylePrompt.includes(SAIGON_AUDIO_DIRECTIVE));
+
+  const tamperedVoice = resolveVoiceConfiguration('Northern_Hanoi_Default', 'vi');
+  assert.equal(tamperedVoice.voiceId, 'Kore', 'Unknown/Northern voice override must strictly clamp to approved Saigon default');
+  assert.equal(tamperedVoice.accent, 'Southern Vietnamese');
+
+  for (const spec of SAIGON_VOICE_SPECS) {
+    const resolved = resolveVoiceConfiguration(spec.id, 'vi');
+    assert.equal(resolved.voiceId, spec.id);
+    assert.equal(resolved.isEnglish, false);
+    assert.equal(resolved.accent, 'Southern Vietnamese');
+    assert.equal(resolved.regionalVariant, 'Saigon Vietnamese');
+    assert.ok(TTS_VOICES.some((v) => v.id === spec.id && v.language === 'vi' && v.accent === 'Southern Vietnamese'));
+  }
+
+  const enResolved = resolveVoiceConfiguration('Aoede_EN', 'en');
+  assert.equal(enResolved.isEnglish, true);
+  assert.equal(enResolved.language, 'en-US');
+  assert.equal(enResolved.geminiVoiceName, 'Aoede');
+
+  // 3. Cache Key Versioning & Legacy Cache Invalidation
+  assert.equal(
+    isCacheKeyValidForPolicy('v19_tts:Kore:std:hello', { voiceId: 'Kore', language: 'vi-VN' }),
+    false,
+    'Legacy v19_tts cache keys must be strictly rejected'
+  );
+
+  const keyKore = buildTtsCacheKey({
+    voiceId: 'Kore',
+    language: 'vi-VN',
+    accent: SAIGON_VOICE_POLICY.VIETNAMESE_ACCENT,
+    ttsModelVersion: SAIGON_TTS_MODELS.VIETNAMESE,
+    scriptText: SAIGON_SAMPLE_SCRIPT,
+  });
+  const keyFenrir = buildTtsCacheKey({
+    voiceId: 'Fenrir',
+    language: 'vi-VN',
+    accent: SAIGON_VOICE_POLICY.VIETNAMESE_ACCENT,
+    ttsModelVersion: SAIGON_TTS_MODELS.VIETNAMESE,
+    scriptText: SAIGON_SAMPLE_SCRIPT,
+  });
+  assert.notEqual(keyKore, keyFenrir, 'Switching voice must never collide cache keys');
+  assert.equal(
+    isCacheKeyValidForPolicy(keyKore, {
+      voiceId: 'Kore',
+      language: 'vi-VN',
+      ttsModelVersion: SAIGON_TTS_MODELS.VIETNAMESE,
+    }),
+    true
+  );
+  assert.equal(
+    isCacheKeyValidForPolicy(keyKore, {
+      voiceId: 'Fenrir',
+      language: 'vi-VN',
+      ttsModelVersion: SAIGON_TTS_MODELS.VIETNAMESE,
+    }),
+    false,
+    'Cache lookup for Fenrir must reject Kore cache entry'
+  );
+  assert.notEqual(
+    computeDeterministicScriptHash('Dạ chào cả nhà nha.'),
+    computeDeterministicScriptHash('Dạ chào cả nhà nhé.')
+  );
+
+  // 4. Northern Phonetic / Lexical Scrubbing in Saigon TTS Mode
+  const northernInput = 'Vâng, các bạn hãy xem thử cái bát và thìa thế này nhé!';
+  const saigonAdapted = correctVietnameseSpelling(northernInput, { adaptSouthernDialect: true }).correctedText.toLowerCase();
+  assert.ok(saigonAdapted.includes('dạ'), 'Should map vâng -> dạ');
+  assert.ok(saigonAdapted.includes('coi thử'), 'Should map xem thử -> coi thử');
+  assert.ok(saigonAdapted.includes('chén'), 'Should map bát -> chén');
+  assert.ok(saigonAdapted.includes('muỗng'), 'Should map thìa -> muỗng');
+  assert.ok(saigonAdapted.includes('như vầy nha'), 'Should map thế này nhé -> như vầy nha');
+
+  // 5. Real WAV Synthesis & Silent-Audio Rejection Check
   const sampleRate = 24000;
   const durationSec = 0.5;
   const numSamples = Math.floor(sampleRate * durationSec);
@@ -43,38 +120,43 @@ export function runTtsAudioTests() {
 
   for (let i = 0; i < numSamples; i++) {
     const sample = Math.sin(2 * Math.PI * 440 * (i / sampleRate));
-    const intSample = Math.floor(sample * 32767);
-    pcmBuffer.writeInt16LE(intSample, i * 2);
+    pcmBuffer.writeInt16LE(Math.floor(sample * 32767), i * 2);
   }
 
-  // Verify non-zero amplitude (not silent!)
-  let hasNonZeroSample = false;
-  for (let i = 0; i < numSamples; i++) {
-    if (pcmBuffer.readInt16LE(i * 2) !== 0) {
-      hasNonZeroSample = true;
-      break;
-    }
-  }
-  assert.equal(hasNonZeroSample, true, "Synthesized audio must have real non-zero audio wave amplitudes");
-
-  // 2. Encode to WAV
-  const wavBuffer = encodePcmToWavBuffer(pcmBuffer, sampleRate);
+  const wavBuffer = ensureWavBuffer(pcmBuffer, sampleRate);
   assert.equal(wavBuffer.length, 44 + pcmBuffer.length);
-
-  // 3. Verify WAV RIFF Header specification
   assert.equal(wavBuffer.subarray(0, 4).toString('ascii'), 'RIFF');
   assert.equal(wavBuffer.subarray(8, 12).toString('ascii'), 'WAVE');
-  assert.equal(wavBuffer.subarray(12, 16).toString('ascii'), 'fmt ');
-  assert.equal(wavBuffer.readUInt16LE(20), 1, "Audio format must be Linear PCM (1)");
-  assert.equal(wavBuffer.readUInt16LE(22), 1, "Audio channels must be Mono (1)");
-  assert.equal(wavBuffer.readUInt32LE(24), 24000, "Sample rate must match 24000 Hz");
-  assert.equal(wavBuffer.readUInt16LE(34), 16, "Bit depth must be 16-bit");
-  assert.equal(wavBuffer.subarray(36, 40).toString('ascii'), 'data');
-  assert.equal(wavBuffer.readUInt32LE(40), pcmBuffer.length);
+  assert.equal(wavBuffer.readUInt16LE(20), 1);
+  assert.equal(wavBuffer.readUInt16LE(22), 1);
+  assert.equal(wavBuffer.readUInt32LE(24), 24000);
+  assert.equal(wavBuffer.readUInt16LE(34), 16);
 
-  // 4. Test idempotent RIFF bypass
-  const idempotentWav = encodePcmToWavBuffer(wavBuffer, sampleRate);
-  assert.equal(idempotentWav.length, wavBuffer.length, "Existing RIFF header should not be double-wrapped");
+  const realMetrics = inspectWavAudioMetrics(wavBuffer);
+  assert.equal(realMetrics.isValidRiffWav, true);
+  assert.equal(realMetrics.isSilent, false);
+  assert.ok(realMetrics.rmsDb > -10);
 
-  console.log('✅ [PASSED] Text-To-Speech Audio & WAV Validation Tests successfully passed!\n');
+  // Silent PCM buffer MUST be flagged isSilent = true (reject fake silence substitution)
+  const silentPcm = Buffer.alloc(numSamples * 2);
+  const silentMetrics = inspectWavAudioMetrics(ensureWavBuffer(silentPcm, sampleRate));
+  assert.equal(silentMetrics.isSilent, true, 'Silent WAV must be strictly detected & rejected');
+
+  // Idempotent RIFF bypass
+  assert.equal(ensureWavBuffer(wavBuffer, sampleRate).length, wavBuffer.length);
+
+  // 6. Verify all 6 Live-Synthesized Saigon Sample WAVs on Disk
+  for (const spec of SAIGON_VOICE_SPECS) {
+    const sampleFile = path.join(TTS_SAMPLES_DIR, `sample_${spec.id}_${SAIGON_TTS_MODELS.VIETNAMESE}.wav`);
+    assert.ok(fs.existsSync(sampleFile), `Verified live Saigon WAV sample must exist for ${spec.id}: ${sampleFile}`);
+    const fileBuf = fs.readFileSync(sampleFile);
+    const metrics = inspectWavAudioMetrics(fileBuf);
+    assert.equal(metrics.isValidRiffWav, true, `${spec.id} WAV must have valid RIFF/WAVE header`);
+    assert.equal(metrics.isSilent, false, `${spec.id} WAV must contain real non-silent audio`);
+    assert.equal(metrics.sampleRate, 24000, `${spec.id} WAV sample rate must be 24000Hz`);
+    assert.ok(metrics.durationSec > 5, `${spec.id} sample WAV duration (${metrics.durationSec}s) should contain full benchmark script`);
+  }
+
+  console.log('✅ [PASSED] Southern Saigon TTS Policy, WAV Metrics & Live Sample Verification Tests passed!\n');
 }
+

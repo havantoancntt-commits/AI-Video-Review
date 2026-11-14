@@ -1,10 +1,33 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import dotenv from "dotenv";
+import multer from "multer";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import dns from "dns";
+import {
+  checkFfmpegCapabilities,
+  normalizeQualityTier,
+  transcodeJobManager,
+  TRANSCODE_TMP_ROOT,
+} from "./server/tiktokTranscoder";
+import {
+  PRIMARY_TTS_LITE_MODEL,
+  VOICE_DESIGN_TTS_MODEL,
+  TTS_SAMPLES_DIR,
+  synthesizeGeminiTtsStrict,
+  auditWavDialectWithGemini,
+  saveSampleWavFile,
+} from "./server/saigonTtsEngine";
+import {
+  SAIGON_VOICE_POLICY,
+  SAIGON_TEST_SENTENCES,
+  SAIGON_SAMPLE_SCRIPT,
+  TtsAudioProvenance,
+  resolveVoiceConfiguration,
+} from "./src/saigonVoicePolicy";
 
 // Set DNS resolution to prioritize IPv4 over IPv6. This prevents "fetch failed" errors inside Cloud Run and sandboxed Node.js environments when connecting to Google APIs.
 dns.setDefaultResultOrder("ipv4first");
@@ -25,19 +48,21 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : (portArg || 300
 app.get("/__health", (req, res) => res.status(200).send("OK"));
 app.get("/api/health", (req, res) => res.status(200).json({ status: "ok", timestamp: Date.now() }));
 
-// Request Timeout Middleware (90 seconds safety cap for high-definition video processing)
+// Request Timeout Middleware (600s for large multipart video uploads/downloads, 90s for AI endpoints)
 app.use((req, res, next) => {
-  res.setTimeout(90000, () => {
+  const timeoutMs = req.path.startsWith("/api/transcode/") ? 600000 : 90000;
+  res.setTimeout(timeoutMs, () => {
     if (!res.headersSent) {
-      res.status(504).json({ error: "Thời gian xử lý yêu cầu vượt quá giới hạn an toàn (90 giây). Vui lòng thử lại với video dung lượng nhỏ hơn." });
+      res.status(504).json({ error: "Thời gian xử lý yêu cầu vượt quá giới hạn an toàn. Vui lòng thử lại." });
     }
   });
   next();
 });
 
-// Set up JSON body parser with increased limit to handle video uploads up to 1 GB
-app.use(express.json({ limit: "1024mb" }));
-app.use(express.urlencoded({ limit: "1024mb", extended: true }));
+// Configurable safe payload limit to prevent Node.js Heap Out-Of-Memory while allowing high-res keyframes
+const MAX_PAYLOAD_LIMIT = process.env.MAX_PAYLOAD_LIMIT || "50mb";
+app.use(express.json({ limit: MAX_PAYLOAD_LIMIT }));
+app.use(express.urlencoded({ limit: MAX_PAYLOAD_LIMIT, extended: true }));
 
 // In-Memory Sliding Window Rate Limiter
 interface RateLimitRecord {
@@ -105,14 +130,39 @@ function validateBase64FileSignature(base64Data: string, expectedTypes: string[]
 
 // Helper function to lazily initialize the Gemini client so it does not crash if keys are missing
 let googleAi: GoogleGenAI | null = null;
-// Rapid In-Memory TTS Voiceover caching system to prevent redundant API latency
-const ttsMemoryCache = new Map<string, string>();
+let googleAiBeta: GoogleGenAI | null = null;
+// Strict Provenance-Verified In-Memory TTS Voiceover Cache (Saigon Policy v3)
+const ttsMemoryCache = new Map<string, { audioBase64: string; provenance: TtsAudioProvenance }>();
 
-function getGoogleAI(): GoogleGenAI | null {
+const PRIMARY_TEXT_VISION_MODEL = "gemini-4-hydrogen";
+const LITE_FALLBACK_MODEL = "gemini-3.1-flash-lite";
+const PRIMARY_TTS_MODEL = VOICE_DESIGN_TTS_MODEL;
+
+function getGoogleAI(apiVersion?: string): GoogleGenAI | null {
   const key = process.env.GEMINI_API_KEY;
   if (!key || key === "MY_GEMINI_API_KEY" || key.trim() === "") {
     return null;
   }
+  if (apiVersion === "v1beta") {
+    if (!googleAiBeta) {
+      try {
+        googleAiBeta = new GoogleGenAI({
+          apiKey: key.trim(),
+          apiVersion: "v1beta",
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build',
+            }
+          }
+        });
+      } catch (e) {
+        console.warn("[GEMINI-INIT-WARN] Không thể khởi tạo GoogleGenAI v1beta SDK:", e);
+        return null;
+      }
+    }
+    return googleAiBeta;
+  }
+
   if (!googleAi) {
     try {
       googleAi = new GoogleGenAI({
@@ -132,26 +182,83 @@ function getGoogleAI(): GoogleGenAI | null {
 }
 
 // System Status Live Probe Cache (30s TTL to prevent rate limit exhaustion)
-interface SystemProbeStatus {
-  geminiStatus: "CONNECTED" | "DEGRADED" | "UNAVAILABLE" | "MISCONFIGURED";
-  testedAt: number;
+interface ServiceHealthResult {
+  status: "CONNECTED" | "DEGRADED" | "UNAVAILABLE" | "QUOTA_EXCEEDED" | "MISCONFIGURED";
+  latencyMs: number;
   model: string;
-  ttsModel: string;
+  error?: string;
+}
+
+interface SystemProbeStatus {
+  geminiStatus: "CONNECTED" | "DEGRADED" | "UNAVAILABLE" | "QUOTA_EXCEEDED" | "MISCONFIGURED";
+  testedAt: number;
+  services: {
+    text: ServiceHealthResult;
+    vision: ServiceHealthResult;
+    tts: ServiceHealthResult;
+  };
   latencyMs: number;
   message: string;
 }
 let statusCache: SystemProbeStatus | null = null;
+
+async function probeSingleService(
+  probeFn: () => Promise<any>,
+  modelName: string,
+  timeoutMs = 8000
+): Promise<ServiceHealthResult> {
+  const t0 = Date.now();
+  try {
+    await Promise.race([
+      probeFn(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("PROBE_TIMEOUT")), timeoutMs))
+    ]);
+    const latencyMs = Date.now() - t0;
+    return {
+      status: "CONNECTED",
+      latencyMs,
+      model: modelName
+    };
+  } catch (err: any) {
+    const latencyMs = Date.now() - t0;
+    const msg = String(err.message || "");
+    const isAuth = msg.includes("403") || msg.includes("PERMISSION_DENIED") || msg.includes("API key") || msg.includes("API_KEY_INVALID");
+    const isQuota = msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("429");
+    const isDegraded = msg.includes("503") || msg.includes("UNAVAILABLE") || msg.includes("high demand") || msg.includes("PROBE_TIMEOUT");
+
+    let status: ServiceHealthResult["status"] = "UNAVAILABLE";
+    if (isAuth) status = "MISCONFIGURED";
+    else if (isQuota) status = "QUOTA_EXCEEDED";
+    else if (isDegraded) status = "DEGRADED";
+
+    return {
+      status,
+      latencyMs,
+      model: modelName,
+      error: msg
+    };
+  }
+}
 
 async function probeGeminiHealth(force = false): Promise<SystemProbeStatus> {
   const key = process.env.GEMINI_API_KEY || "";
   const hasKey = !!key && key !== "MY_GEMINI_API_KEY" && key.trim() !== "";
   
   if (!hasKey) {
+    const unconfig: ServiceHealthResult = {
+      status: "MISCONFIGURED",
+      latencyMs: 0,
+      model: PRIMARY_TEXT_VISION_MODEL,
+      error: "Chưa cấu hình GEMINI_API_KEY."
+    };
     return {
       geminiStatus: "MISCONFIGURED",
       testedAt: Date.now(),
-      model: "gemini-3.8-flash",
-      ttsModel: "gemini-3.8-flash-lite-tts",
+      services: {
+        text: { ...unconfig, model: PRIMARY_TEXT_VISION_MODEL },
+        vision: { ...unconfig, model: PRIMARY_TEXT_VISION_MODEL },
+        tts: { ...unconfig, model: PRIMARY_TTS_MODEL }
+      },
       latencyMs: 0,
       message: "Chưa cấu hình GEMINI_API_KEY trong biến môi trường máy chủ."
     };
@@ -163,12 +270,22 @@ async function probeGeminiHealth(force = false): Promise<SystemProbeStatus> {
   }
 
   const ai = getGoogleAI();
-  if (!ai) {
+  const aiBeta = getGoogleAI("v1beta");
+  if (!ai || !aiBeta) {
+    const misconfig: ServiceHealthResult = {
+      status: "MISCONFIGURED",
+      latencyMs: 0,
+      model: PRIMARY_TEXT_VISION_MODEL,
+      error: "Khởi tạo GoogleGenAI SDK thất bại."
+    };
     statusCache = {
       geminiStatus: "MISCONFIGURED",
       testedAt: Date.now(),
-      model: "gemini-3.8-flash",
-      ttsModel: "gemini-3.8-flash-lite-tts",
+      services: {
+        text: { ...misconfig, model: PRIMARY_TEXT_VISION_MODEL },
+        vision: { ...misconfig, model: PRIMARY_TEXT_VISION_MODEL },
+        tts: { ...misconfig, model: PRIMARY_TTS_MODEL }
+      },
       latencyMs: 0,
       message: "Khởi tạo GoogleGenAI SDK thất bại với API key hiện tại."
     };
@@ -176,58 +293,93 @@ async function probeGeminiHealth(force = false): Promise<SystemProbeStatus> {
   }
 
   const t0 = Date.now();
-  try {
-    // Perform an actual live health check probe
-    await Promise.race([
+  const tinyGif = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
+  const [textProbe, visionProbe, ttsProbe] = await Promise.all([
+    probeSingleService(() =>
       ai.models.generateContent({
-        model: "gemini-3.8-flash",
+        model: PRIMARY_TEXT_VISION_MODEL,
         contents: "ping",
       }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("PROBE_TIMEOUT")), 4000))
-    ]);
+      PRIMARY_TEXT_VISION_MODEL,
+      8000
+    ),
+    probeSingleService(() =>
+      ai.models.generateContent({
+        model: PRIMARY_TEXT_VISION_MODEL,
+        contents: [
+          { inlineData: { mimeType: "image/gif", data: tinyGif } },
+          { text: "describe in 1 word" }
+        ]
+      }),
+      PRIMARY_TEXT_VISION_MODEL,
+      8000
+    ),
+    probeSingleService(() => {
+      const probeVoice = resolveVoiceConfiguration(SAIGON_VOICE_POLICY.DEFAULT_VOICE, "vi");
+      return aiBeta.models.generateContent({
+        model: PRIMARY_TTS_MODEL,
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: "Dạ chào cả nhà nha.",
+                speechMetadata: { style: probeVoice.speechStylePrompt },
+              },
+            ],
+          },
+        ],
+        config: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: probeVoice.geminiVoiceName },
+            },
+          },
+        },
+      });
+    },
+      PRIMARY_TTS_MODEL,
+      8000
+    )
+  ]);
 
-    const latencyMs = Date.now() - t0;
-    statusCache = {
-      geminiStatus: "CONNECTED",
-      testedAt: Date.now(),
-      model: "gemini-3.8-flash",
-      ttsModel: "gemini-3.8-flash-lite-tts",
-      latencyMs,
-      message: `Gemini 3.8 Flash Vision và Flash Lite TTS đã xác minh kết nối thực tế thành công (${latencyMs}ms).`
-    };
-    return statusCache;
-  } catch (err: any) {
-    const latencyMs = Date.now() - t0;
-    const msg = String(err.message || "");
-    
-    const isAuth = msg.includes("403") || msg.includes("PERMISSION_DENIED") || msg.includes("API key");
-    const isQuota = msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("429");
-    const isDegraded = msg.includes("503") || msg.includes("UNAVAILABLE") || msg.includes("high demand") || msg.includes("PROBE_TIMEOUT");
+  const totalLatency = Date.now() - t0;
+  const services = { text: textProbe, vision: visionProbe, tts: ttsProbe };
 
-    let geminiStatus: "CONNECTED" | "DEGRADED" | "UNAVAILABLE" | "MISCONFIGURED" = "UNAVAILABLE";
-    let statusMessage = "Không thể kết nối tới Google Gemini API.";
+  // Calculate composite status
+  const statuses = [textProbe.status, visionProbe.status, ttsProbe.status];
+  let compositeStatus: SystemProbeStatus["geminiStatus"] = "CONNECTED";
+  let message = `Tất cả dịch vụ Gemini (Text: ${textProbe.latencyMs}ms, Vision: ${visionProbe.latencyMs}ms, TTS: ${ttsProbe.latencyMs}ms) hoạt động bình thường.`;
 
-    if (isAuth) {
-      geminiStatus = "MISCONFIGURED";
-      statusMessage = "API Key không hợp lệ hoặc thiếu quyền truy cập Google Generative Language.";
-    } else if (isDegraded) {
-      geminiStatus = "DEGRADED";
-      statusMessage = "Mô hình Gemini đang trải qua thời điểm nhu cầu cao (503 / Timeout). Đang sẵn sàng cơ chế chuyển kênh phụ.";
-    } else if (isQuota) {
-      geminiStatus = "UNAVAILABLE";
-      statusMessage = "Hạn ngạch (Quota) Gemini API đã chạm giới hạn mức sử dụng hiện tại.";
-    }
-
-    statusCache = {
-      geminiStatus,
-      testedAt: Date.now(),
-      model: "gemini-3.8-flash",
-      ttsModel: "gemini-3.8-flash-lite-tts",
-      latencyMs,
-      message: statusMessage
-    };
-    return statusCache;
+  if (statuses.some(s => s === "MISCONFIGURED")) {
+    compositeStatus = "MISCONFIGURED";
+    message = "API key không hợp lệ hoặc thiếu quyền hạn truy cập Google Gemini.";
+  } else if (statuses.every(s => s === "QUOTA_EXCEEDED")) {
+    compositeStatus = "QUOTA_EXCEEDED";
+    message = "Hạn ngạch (Quota) Gemini API đã chạm giới hạn trên toàn bộ dịch vụ.";
+  } else if (statuses.every(s => s === "UNAVAILABLE" || s === "QUOTA_EXCEEDED")) {
+    compositeStatus = "UNAVAILABLE";
+    message = "Không thể kết nối đến máy chủ Google Gemini.";
+  } else if (statuses.some(s => s !== "CONNECTED")) {
+    compositeStatus = "DEGRADED";
+    const failedServices = Object.entries(services)
+      .filter(([_, v]) => v.status !== "CONNECTED")
+      .map(([k, v]) => `${k}: ${v.status}`)
+      .join(", ");
+    message = `Hệ thống đang hoạt động ở chế độ phân cấp; dịch vụ cần lưu ý: ${failedServices}.`;
   }
+
+  statusCache = {
+    geminiStatus: compositeStatus,
+    testedAt: Date.now(),
+    services,
+    latencyMs: totalLatency,
+    message
+  };
+
+  return statusCache;
 }
 
 // Resilient API Call Execution with Retry & Exponential Backoff for 503 unavailable spikes
@@ -235,7 +387,7 @@ async function generateWithRetry(
   fn: (modelName: string) => Promise<any>, 
   retries = 4, 
   delayMs = 1200, 
-  defaultModel = "gemini-3.8-flash", 
+  defaultModel = PRIMARY_TEXT_VISION_MODEL, 
   useModelFallback = true
 ) {
   let modelName = defaultModel;
@@ -252,12 +404,11 @@ async function generateWithRetry(
                             errMsg.includes("RESOURCE_EXHAUSTED");
 
       if (isQuotaExceeded) {
-        if (useModelFallback && (modelName === "gemini-3.8-flash" || modelName === "gemini-3.7-flash")) {
-          console.info(`[TIKTOK-OPTIMIZER] Chuyển đổi thông minh sang kênh phụ để giữ tốc độ phản hồi tối ưu...`);
-          modelName = "gemini-3.1-flash-lite";
-          continue; // Retry instantly without waiting delayMs
+        if (useModelFallback && modelName !== LITE_FALLBACK_MODEL) {
+          console.info(`[GEMINI-RETRY] Chuyển đổi sang mô hình dự phòng ${LITE_FALLBACK_MODEL} do hạn ngạch...`);
+          modelName = LITE_FALLBACK_MODEL;
+          continue;
         }
-        console.info(`[TIKTOK-OPTIMIZER] Khởi chạy công cụ tối ưu hóa dữ liệu nội địa nhanh...`);
         throw err;
       }
 
@@ -265,6 +416,8 @@ async function generateWithRetry(
                         errMsg.includes("UNAVAILABLE") || 
                         errMsg.includes("high demand") || 
                         errMsg.includes("429") ||
+                        errMsg.includes("404") ||
+                        errMsg.includes("NOT_FOUND") ||
                         errMsg.includes("limit") ||
                         errMsg.toLowerCase().includes("fetch failed") ||
                         errMsg.toLowerCase().includes("request failed") ||
@@ -274,128 +427,22 @@ async function generateWithRetry(
                         errMsg.toLowerCase().includes("internal") ||
                         err.status === 503 ||
                         err.status === 429 ||
+                        err.status === 404 ||
                         err.status === 500;
       if (isTemporary && i < retries) {
-        if (useModelFallback && (modelName === "gemini-3.8-flash" || modelName === "gemini-3.7-flash")) {
-          console.info(`[TIKTOK-OPTIMIZER] Điều chỉnh kênh chuyển dịch phân tích thông minh mượt mà...`);
-          modelName = "gemini-3.1-flash-lite";
-          continue; // Retry instantly using the high-availability model
+        if (useModelFallback && modelName !== LITE_FALLBACK_MODEL) {
+          console.info(`[GEMINI-RETRY] Điều chỉnh sang mô hình ${LITE_FALLBACK_MODEL} để đảm bảo độ ổn định...`);
+          modelName = LITE_FALLBACK_MODEL;
+          continue;
         }
-        console.info(`[TIKTOK-OPTIMIZER] Đang đảm bảo lưu lượng kết nối kết nối ổn định... Thử lại nhịp nhàng (Lần ${i + 1}/${retries}).`);
+        console.info(`[GEMINI-RETRY] Thử lại sau ${delayMs}ms (Lần ${i + 1}/${retries}).`);
         await new Promise(resolve => setTimeout(resolve, delayMs));
-        delayMs *= 2.0; // Exponential backoff multiplier is increased to 2.0 to disperse peak rate limits
+        delayMs *= 2.0;
         continue;
       }
       throw err;
     }
   }
-}
-
-// High quality default fallback product suggestion when Gemini API limits or error spikes
-function getFallbackSuggestProduct(nameInput?: string): any {
-  const normName = (nameInput || "Sản phẩm xu hướng cao cấp").trim();
-  return {
-    productName: normName,
-    category: "Gia dụng & Tiện ích thông minh",
-    productDesc: `Siêu phẩm ${normName} sở hữu ngôn ngữ thiết kế tối giản sang trọng, hoàn thiện từ vật liệu bền bỉ cao cấp, tích hợp các công năng tiện ích đột phá giúp nâng tầm chất lượng cuộc sống hàng ngày.`,
-    suggestedTone: "Thuyết phục & Truyền cảm",
-    keywords: ["#review", "#sanphamhot", "#giadungthongminh", "#trend", "#xuhuong", "#fyp", "#tiktokshop"],
-    keyUSPs: [
-      "Vật liệu cao cấp chống trầy xước, đầm tay chắc chắn",
-      "Tối ưu hóa hiệu suất vận hành nhanh gấp 3 lần",
-      "Tiết kiệm thời gian và mang lại trải nghiệm tiện nghi vượt bậc"
-    ]
-  };
-}
-
-// High quality default fallback review report when Gemini API suffers from global 503 spikes
-function getFallbackReviewReport(nameInput?: string, descInput?: string): any {
-  const normName = (nameInput || "Sản phẩm xu hướng cao cấp").trim();
-  const normDesc = (descInput || "Sản phẩm hoàn thiện cao cấp, thiết kế mượt mà, định hình lại thói quen hằng ngày của bạn.").trim();
-
-  return {
-    productName: normName,
-    category: "Gia dụng & Tiện ích thông minh",
-    rating: 4.9,
-    summary: `Trải nghiệm tiện nghi tinh tế vượt bậc đến từ cấu hình hoàn thiện đỉnh cao của ${normName} — mảnh ghép hoàn hảo định hình phong cách sống hiện đại và thông thái.`,
-    pros: [
-      "Hoàn thiện tinh xảo từ chất liệu cao cấp bền bỉ, mang lại cảm giác cầm nắm đầm chắc và sang trọng.",
-      "Thiết kế công thái học thông minh tối ưu hóa tối đa công năng thực chiến, giải quyết triệt để sự bất tiện.",
-      "Vận hành êm ái, bền bỉ vượt trội và tiết kiệm đáng kể thời gian trong mọi sinh hoạt hàng ngày."
-    ],
-    cons: [
-      "Số lượng ưu đãi kèm quà tặng có hạn do nhu cầu đặt hàng tăng đột biến từ cộng đồng sáng tạo nội dung.",
-      "Màu sắc hot trend thường xuyên rơi vào tình trạng cháy hàng nhanh chóng."
-    ],
-    detailedReview: `### 🌟 TỔNG QUAN ĐỘT PHÁ & ẤN TƯỢNG BAN ĐẦU
-Sản phẩm **${normName}** khẳng định vị thế dẫn đầu trong phân khúc nhờ triết lý thiết kế tối giản nhưng toát lên vẻ đẹp kiêu hãnh. Từng đường nét bo cong, bề mặt hoàn thiện nhám mờ cao cấp không chỉ chống bám vân tay mà còn mang đến cảm giác xúc giác vô cùng tinh tế.
-
----
-
-### 🎬 KỊCH BẢN PHÂN CẢNH CHI TIẾT (STUDIO MASTER PRODUCTION)
-
-#### 🎥 Phân cảnh 1: Hook Mở Màn & Phá Vỡ Nhận Thức (00:00 - 00:05)
-*   **Góc máy & B-Roll**: Quay cận cảnh (Super Macro Close-Up) đặc tả bề mặt tinh xảo lấp lánh phản chiếu ánh sáng, chuyển cảnh chớp nhoáng đối chiếu sự bất tiện của đồ cũ ọp ẹp.
-*   **Lời bình thuyết minh (Giọng Nam Bộ ấm áp, cuốn hút)**: *"Cả nhà ơi, có bao giờ mọi người tốn tiền oan uổng vì mấy món đồ xài dăm bữa nửa tháng là hư chưa? Coi ngay chiếc ${normName} này nha, bảo đảm mê mẩn từ cái nhìn đầu tiên luôn nè!"*
-*   **Hiệu ứng âm thanh (SFX)**: 💨 *Whoosh chuyển cảnh chớp nhoáng + 🔔 Chime sáng bừng.*
-*   **Kỹ thuật tâm lý**: *Zeigarnik Effect + Problem Agitation (Khơi gợi nỗi bực dọc thầm kín).*
-
-#### 🎥 Phân cảnh 2: Trải Nghiệm Xúc Giác & Thẩm Mỹ Sang Trọng (00:05 - 00:15)
-*   **Góc máy & B-Roll**: Bàn tay lướt nhẹ mở hộp tinh tế, tay cầm nắm sản phẩm xoay 45 độ phô diễn độ hoàn thiện sắc nét không một chi tiết thừa.
-*   **Lời bình thuyết minh (Giọng Nam Bộ ấm áp, cuốn hút)**: *"Thiết kế tối giản sang xịn ghê chưa cả nhà? Bề mặt nhám mờ cầm đầm tay dã man luôn á, nhìn vô là thấy toát lên phong thái thông minh thời thượng liền nha!"*
-*   **Hiệu ứng âm thanh (SFX)**: 📸 *Camera Shutter + Âm thanh gõ nhẹ bề mặt đanh chắc.*
-*   **Kỹ thuật tâm lý**: *Endowment Effect (Đưa người xem cảm giác đã sở hữu món đồ).*
-
-#### 🎥 Phân cảnh 3: Trình Diễn Công Năng Thực Chiến & Hiệu Suất Đỉnh Cao (00:15 - 00:30)
-*   **Góc máy & B-Roll**: Biểu diễn thao tác vận hành một chạm mượt mà. Thiết bị giải quyết công việc trơn tru tức thì, tôn vinh lực đẩy và độ êm ái vượt trội.
-*   **Lời bình thuyết minh (Giọng Nam Bộ ấm áp, cuốn hút)**: *"Mà đâu chỉ đẹp mã thôi đâu nha, công năng của em nó mới thiệt sự là đỉnh chóp á! Bấm nhẹ một phát là vận hành êm ru mượt mà gấp 3 lần bình thường, tiện lợi quá chừng luôn hà!"*
-*   **Hiệu ứng âm thanh (SFX)**: ⚡ *Impact Bass Drop nhẹ nhàng tôn vinh sức mạnh.*
-*   **Kỹ thuật tâm lý**: *Sensory Hypnosis & Feature-Benefit Transformation.*
-
-#### 🎥 Phân cảnh 4: Kêu Gọi Hành Động Quyết Đoán & Chốt Đơn (00:30 - Kết thúc)
-*   **Góc máy & B-Roll**: Sản phẩm đặt kiêu hãnh trong không gian sống hiện đại. Bàn tay nhẹ nhàng chỉ về biểu tượng giỏ hàng vàng nhỏ xinh góc trái bên dưới.
-*   **Lời bình thuyết minh (Giọng Nam Bộ ấm áp, cuốn hút)**: *"Đầu tư một lần mà xài xứng đáng cả đời nhen! Cả nhà nhanh tay nhấp vô chiếc giỏ hàng màu vàng nhỏ xinh góc trái bên dưới để rinh liền ưu đãi khủng hôm nay nha!"*
-*   **Hiệu ứng âm thanh (SFX)**: 🛎️ *Chuông vàng giỏ hàng Cash Register.*
-*   **Kỹ thuật tâm lý**: *FOMO Scarcity + Duyên dáng kêu gọi hành động.*
-
----
-
-### 📊 BẢNG ĐÁNH GIÁ TIÊU CHUẨN CHUYÊN GIA (CHỈ SỐ 5 SAO)
-*   ⭐ **Thiết kế & Độ hoàn thiện**: 4.9/5.0 — *Vật liệu cao cấp, đường nét sắc sảo.*
-*   ⚡ **Công năng thực chiến**: 4.8/5.0 — *Hiệu suất ổn định, giải quyết triệt để nhu cầu.*
-*   🛡️ **Độ bền & Tin cậy**: 4.9/5.0 — *Cấu trúc chắc chắn, chịu lực tối ưu.*
-*   💰 **Tỷ lệ Giá trị / Chi phí**: 5.0/5.0 — *Đầu tư xứng đáng từng đồng.*`,
-    marketingScript: `Có bao giờ bạn rơi vào tình huống khó chịu khi mua những sản phẩm giá rẻ ọp ẹp rồi phải vứt xó không? Đừng bao giờ tốn tiền oan uổng như vậy nữa nha, vì chiếc siêu phẩm ${normName} này xuất hiện chính là giải pháp tối ưu giúp bạn giải quyết dứt điểm rắc rối đó. Được thiết kế cực kỳ thông minh, tỉ mỉ và chắc tay bằng chất liệu bền bỉ cao cấp, sản phẩm mang lại khả năng ứng dụng vô cùng mượt mà cùng hiệu suất đáng kinh ngạc trong mọi sinh hoạt hàng ngày. Từng chi tiết nhỏ nhất đều được tinh tế mài giũa để tôn vinh trải nghiệm sống tiện nghi hiện đại của chính bạn. Đây chính là món bảo bối hoàn mỹ kiến tạo lối sống thời thượng mà ai cũng phải dõi mắt nhìn theo. Ưu đãi sập sàn cực lớn và những phần quà đặc quyền dành riêng cho bạn đang được bố trí sẵn trong chiếc giỏ hàng màu vàng nhỏ xinh đẹp phía dưới rồi nè, hãy nhanh tay click ngay hôm nay để nhận ưu đãi trước khi cháy hàng nha!`,
-    ctaText: "Nhấp chọn giỏ hàng màu vàng phía góc trái bên dưới để rinh ngay ưu đãi khủng hôm nay!",
-    targetedAudience: "Những ai yêu thích phong cách sống hiện đại tiện ích, đặc biệt quan tâm tới chất lượng hoàn thiện cao cấp và hiệu quả thực tế hàng ngày.",
-    productFeatures: [
-      "Bộ cấu trúc thông minh tối ưu hóa hiệu suất vận hành nhanh chóng và ổn định",
-      "Vật liệu hoàn thiện cao cấp chống trầy xước, thân thiện môi trường và an toàn tuyệt đối",
-      "Khả năng ứng dụng linh hoạt, kết nối và sạc nhanh tiện lợi thời thượng",
-      "Thiết kế công thái học chống trượt tay, tăng độ bám chắc chắn khi sử dụng"
-    ],
-    uniqueSellingPoints: [
-      "Giải quyết triệt để sự bất tiện của các sản phẩm đời cũ kém chất lượng",
-      "Ngôn ngữ thiết kế tối giản sang trọng tôn vinh không gian sống hiện đại",
-      "Độ bền vượt bậc với chế độ hậu mãi và bảo hành an tâm tuyệt đối"
-    ],
-    videoHighlights: [
-      "00:03 - Khoảnh khắc cận cảnh bề mặt hoàn thiện cao cấp không tì vết",
-      "00:12 - Cận cảnh thao tác trên tay mượt mà đầm chắc",
-      "00:22 - Trình diễn công năng thực tế vận hành êm ái vượt trội",
-      "00:35 - Điểm chạm kết thúc sang trọng định vị sản phẩm"
-    ],
-    reviewSuggestions: [
-      "Nhấn mạnh độ đầm tay và trải nghiệm thực tế ngay từ 3 giây đầu tiên",
-      "Tận dụng ánh sáng tự nhiên hoặc đèn mềm để tôn vinh bề mặt cao cấp của sản phẩm",
-      "Ghim bình luận giải đáp thắc mắc về nguồn gốc xuất xứ và chính sách bảo hành chính hãng"
-    ],
-    scriptSuggestions: [
-      "Đọc mở đầu với chất giọng hào hứng, tự nhiên khơi gợi tò mò của người bạn thân thiết",
-      "Hạ tông giọng ấm áp khi miêu tả chất liệu và trải nghiệm chạm",
-      "Tăng nhịp điệu dứt khoát và tươi vui ở câu kết kêu gọi nhấp giỏ hàng"
-    ]
-  };
 }
 
 // Endpoint: Analyze product video to generate detailed reviews and a voiceover script
@@ -623,7 +670,7 @@ Yêu cầu bổ sung từ người dùng: "${customPrompt || "Hãy review chân 
         }),
       2,
       1200,
-      "gemini-3.8-flash",
+      PRIMARY_TEXT_VISION_MODEL,
       true
     );
 
@@ -652,8 +699,8 @@ Yêu cầu bổ sung từ người dùng: "${customPrompt || "Hãy review chân 
   }
 });
 
-// Endpoint: Quickly identify the product and suggest details from keyframes and photo
-app.post("/api/suggest-product", async (req, res): Promise<any> => {
+// Endpoint: Quickly identify the product and suggest details from keyframes and photo with strict observational accuracy
+app.post("/api/suggest-product", aiEndpointLimiter, async (req, res): Promise<any> => {
   try {
     const { 
       video, 
@@ -669,6 +716,15 @@ app.post("/api/suggest-product", async (req, res): Promise<any> => {
     }
 
     const ai = getGoogleAI();
+    if (!ai) {
+      return res.status(503).json({
+        success: false,
+        error: "Chưa cấu hình GEMINI_API_KEY hoặc hệ thống AI chưa sẵn sàng.",
+        code: "MISCONFIGURED_API_KEY",
+        retryable: false
+      });
+    }
+
     const contents: any[] = [];
 
     // 1. Add video parts or keyframes (capped at 4 for sub-second vision recognition)
@@ -711,85 +767,119 @@ app.post("/api/suggest-product", async (req, res): Promise<any> => {
       });
     }
 
-    // 3. Prompt
+    // 3. Prompt with strict anti-fabrication guidelines
     const promptText = `
-Bạn là một chuyên gia AI phân tích thị giác và nhận diện sản phẩm thương mại thế hệ mới, sở hữu nhãn quan cực kỳ sắc bén.
-Hãy quét nhanh và phân tích tỉ mỉ các sản phẩm xuất hiện trong các khung hình/video này nhằm nhận diện chúng một cách thông minh, chính xác nhất và nhanh chóng:
+Bạn là chuyên gia thị giác máy tính và thẩm định sản phẩm thương mại điện tử chuyên nghiệp cấp cao.
+Nhiệm vụ: Phân tích các khung hình/hình ảnh thực tế được cung cấp để nhận diện sản phẩm một cách TRUNG THỰC VÀ CHÍNH XÁC NHẤT.
 
-1. TRÍCH XUẤT CHỮ VIẾT THỊ GIÁC (OCR): 
-   - Đọc quét cực kỳ chăm chú và trích xuất nguyên bản bất kỳ logo, thương hiệu, nhãn hiệu hoặc tên chữ, ký hiệu viết tắt nào in trên bao bì, nhãn chai, hoặc vỏ hộp của sản phẩm (Ví dụ: Apple, Anker, Merzy, L'Oreal, Xiaomi, DJI, Lock&Lock...). 
-   - Xác định đúng mã model, dòng sản phẩm hoặc mã số cụ thể (Ví dụ: "Son kem Merzy Velvet Tint V6", "Đế sạc MagSafe 3-in-1 Belkin", "Nồi chiên không dầu Philips HD9200"...) thay vì tên chung chung như "bình nước", "mỹ phẩm", "cáp sạc".
+QUY TẮC BẮT BUỘC VỀ TÍNH CHÂN THỰC (ZERO FAKE DATA):
+1. CHỈ NHẬN DIỆN DỰA TRÊN DỮ LIỆU THỊ GIÁC CÓ TRONG HÌNH/VIDEO:
+   - Trích xuất chữ viết/OCR in thực tế trên nhãn, bao bì, thân máy vào mảng 'ocrDetections'.
+   - Nếu đọc được rõ tên thương hiệu/model (ví dụ: 'Xiaomi', 'Merzy', 'Anker', v.v.), hãy dùng nó.
+   - NẾU KHÔNG THẤY THƯƠNG HIỆU: TUYỆT ĐỐI KHÔNG TỰ BỊA ĐẶT THƯƠNG HIỆU. Hãy dùng mô tả khách quan (ví dụ: 'Nồi chiên không dầu dung tích lớn', 'Tai nghe Bluetooth True Wireless').
+2. KHÔNG TỰ BỊA ĐẶT THÔNG SỐ KỸ THUẬT, CHẤT LIỆU, GIÁ BÁN HAY BẢO HÀNH:
+   - Những thông tin không thể khẳng định từ mắt nhìn, hãy đưa vào 'unverifiedData'.
+   - Những gì thấy rõ (màu sắc, hình dạng, cổng kết nối nhìn thấy) đưa vào 'directObservation'.
+   - Những suy luận logic hợp lý đưa vào 'aiInference'.
+3. TRẠNG THÁI XÁC MINH (verificationStatus):
+   - Đặt là 'VERIFIED' nếu nhìn rõ logo/model hoặc nhận diện chính xác không mơ hồ (confidenceScore >= 0.85).
+   - Đặt là 'NEED_MORE_INFORMATION' nếu nhận diện được dạng sản phẩm nhưng thiếu tên cụ thể hoặc mờ (0.50 <= confidenceScore < 0.85).
+   - Đặt là 'UNKNOWN' nếu hình ảnh quá tối, mờ hoặc không có sản phẩm rõ ràng (confidenceScore < 0.50).
 
-2. PHÂN TÍCH ĐẶC TÍNH CHI TIẾT & CHẤT LIỆU:
-   - Phân tích kỹ ngoại quan, kiểu dáng, chất liệu hoàn thiện (nhựa nhám cao cấp, kim loại mát lạnh, kính cường lực, thủy tinh borosilicate...) để đưa ra mô tả (2-3 câu) tinh tế, chuyên nghiệp và cuốn hút nhất.
-   - Ngôn từ mô tả lôi cuốn, mang tính kích thích tò mò mua sắm nhưng TUYỆT ĐỐI tuân thủ chính sách quảng cáo TikTok Shop & Shopee.
-
-3. ĐỀ XUẤT TÔNG GIỌNG PHÙ HỢP:
-   - Dựa trên phân loại sản phẩm thực tế, chọn tông giọng lồng tiếng đại diện phù hợp nhất ('Thuyết phục & Truyền cảm' | 'Sôi nổi & Kích thích' | 'Phân tích chuyên sâu' | 'Hài hước & Gần gũi').
-
-4. BỘ TỪ KHÓA TĂNG TRƯỞNG MULTI-SECTOR:
-   - Đề xuất 5-8 hashtags thịnh hành định vị mượt mà trên TikTok Shop/Facebook Reels để gia tăng tương tác hiển thị.
-
-Trả về kết quả bằng tiếng Việt theo định dạng JSON chứa các thuộc tính sau:
-- productName: Tên sản phẩm chính xác nhất nhận dạng được.
-- category: Phân loại ngành hàng chuyên nghiệp.
-- productDesc: Mô tả ngắn gọn chi tiết các tính năng phát hiện qua hình ảnh/video.
-- suggestedTone: Một trong các tông giọng chuẩn phổ biến phù hợp nhất.
-- keywords: Mảng các từ khóa thịnh hành giúp tăng trưởng tương tác.
-    `;
+Hãy trả về JSON theo đúng định dạng được yêu cầu.`;
 
     contents.push({ text: promptText });
 
-    let suggestData;
-    try {
-      if (!ai) {
-        throw new Error("GEMINI_CLIENT_NOT_AVAILABLE");
-      }
-      const response = await generateWithRetry((model) => 
-        ai.models.generateContent({
-          model: model,
-          contents: contents,
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                productName: { type: Type.STRING, description: "Tên thương mại chi tiết của sản phẩm nhận dạng được" },
-                category: { type: Type.STRING, description: "Danh mục ngành hàng chuyên nghiệp" },
-                productDesc: { type: Type.STRING, description: "Mô tả nhanh ngắn gọn và đắt giá về tính năng sản phẩm" },
-                suggestedTone: { type: Type.STRING, description: "Đề xuất tông giọng lồng tiếng tối ưu nhất" },
-                keywords: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: "Danh sách từ khóa thịnh hành/hashtags đề xuất"
-                }
+    const response = await generateWithRetry((model) => 
+      ai.models.generateContent({
+        model: model,
+        contents: contents,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              productName: { type: Type.STRING, description: "Tên thương mại chi tiết hoặc mô tả khách quan của sản phẩm" },
+              category: { type: Type.STRING, description: "Danh mục ngành hàng chuyên nghiệp" },
+              productDesc: { type: Type.STRING, description: "Mô tả ngắn gọn và trung thực về các đặc điểm nhìn thấy" },
+              suggestedTone: { type: Type.STRING, description: "Đề xuất tông giọng lồng tiếng tối ưu nhất" },
+              keywords: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Danh sách từ khóa thịnh hành/hashtags đề xuất"
               },
-              required: ["productName", "productDesc", "suggestedTone", "keywords"]
-            }
+              keyUSPs: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Điểm nổi bật quan sát được từ ngoại quan sản phẩm"
+              },
+              verificationStatus: {
+                type: Type.STRING,
+                description: "Trạng thái xác minh: VERIFIED, UNKNOWN, hoặc NEED_MORE_INFORMATION"
+              },
+              confidenceScore: {
+                type: Type.NUMBER,
+                description: "Mức độ tin cậy từ 0.0 đến 1.0"
+              },
+              directObservation: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Chi tiết ngoại quan nhìn thấy trực tiếp"
+              },
+              ocrDetections: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Chữ viết đọc được trên sản phẩm hoặc bao bì"
+              },
+              aiInference: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Suy luận logic của AI dựa trên ngoại quan quan sát"
+              },
+              unverifiedData: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Thông tin chưa thể kiểm chứng từ hình ảnh (giá, công suất nội bộ, bảo hành...)"
+              }
+            },
+            required: [
+              "productName", 
+              "category", 
+              "productDesc", 
+              "suggestedTone", 
+              "keywords", 
+              "verificationStatus", 
+              "confidenceScore", 
+              "directObservation", 
+              "ocrDetections", 
+              "aiInference", 
+              "unverifiedData"
+            ]
           }
-        })
-      );
+        }
+      })
+    );
 
-      const resultText = response.text;
-      if (!resultText) {
-        throw new Error("Không nhận diện được sản phẩm qua phương tiện truyền thông.");
-      }
-      suggestData = JSON.parse(resultText);
-    } catch (apiError: any) {
-      console.log("[PRODUCT-SUGGEST-FALLBACK] Gemini API is currently busy. Activating premium offline product suggestion.");
-      suggestData = getFallbackSuggestProduct(req.body.productName);
+    const resultText = response.text;
+    if (!resultText) {
+      throw new Error("Không nhận diện được nội dung từ hình ảnh/video cung cấp.");
     }
 
+    const suggestData = JSON.parse(resultText);
     res.json(suggestData);
 
-  } catch (error: any) {
-    console.error("Lỗi nhận diện nhanh sản phẩm:", error);
-    res.json(getFallbackSuggestProduct(req.body?.productName));
+  } catch (apiError: any) {
+    console.error("[PRODUCT-SUGGEST-ERROR]", apiError);
+    res.status(502).json({
+      success: false,
+      error: `Không thể nhận diện sản phẩm: ${apiError.message || "Lỗi dịch vụ AI"}`,
+      code: "RECOGNITION_FAILED",
+      retryable: true
+    });
   }
 });
 
-// Phân phác ngữ âm hoàn toàn tự nhiên tạo giọng đọc miền Nam rặt ngọt ngào lôi cuốn cho TTS chuyên nghiệp
-// Phân phác ngữ âm hoàn toàn tự nhiên tạo giọng đọc miền Nam rặt ngọt ngào lôi cuốn cho TTS chuyên nghiệp
+// Chuẩn hóa văn bản kịch bản cho giọng đọc TTS mượt mà và tự nhiên
 function cleanTextForSpeech(text: string): string {
   if (!text) return "";
   return text
@@ -801,7 +891,7 @@ function cleanTextForSpeech(text: string): string {
     .trim();
 }
 
-function sanitizeTextForVietnameseTTS(text: string): string {
+function sanitizeTextForVietnameseTTS(text: string, adaptSouthern: boolean = true): string {
   if (!text) return "";
   let clean = text;
 
@@ -813,8 +903,7 @@ function sanitizeTextForVietnameseTTS(text: string): string {
   clean = clean.replace(/(\d+)\s*k\b/gi, '$1 ngàn');
   clean = clean.replace(/(\d+)\s*(đ|VND|đồng)/gi, '$1 đồng');
 
-  // LOẠI BỎ VĨNH VIỄN 100% TỪ NGỮ, NGỮ ĐIỆU, HƯ TỪ, THÁN TỪ VÀ PHÁT ÂM MIỀN BẮC KHỎI TOÀN BỘ ỨNG DỤNG
-  // Chuyển hóa toàn bộ sang phương ngữ Nam Bộ / Sài Gòn ngọt ngào, tự nhiên, sang trọng và chuẩn mực
+  // Chỉ chuyển hóa sang phương ngữ Nam Bộ / Sài Gòn khi người dùng bật hoặc chọn giọng miền Nam
   const northToSouthMap: [RegExp, string][] = [
     // 1. Đại từ xưng hô & Đối tượng
     [/\bchúng tôi\b/gi, 'tụi mình'],
@@ -965,8 +1054,10 @@ function sanitizeTextForVietnameseTTS(text: string): string {
     [/\bbốc thăm\b/gi, 'bốc thăm']
   ];
 
-  for (const [pattern, replacement] of northToSouthMap) {
-    clean = clean.replace(pattern, replacement);
+  if (adaptSouthern) {
+    for (const [pattern, replacement] of northToSouthMap) {
+      clean = clean.replace(pattern, replacement);
+    }
   }
 
   // Loại bỏ các khoảng trắng thừa
@@ -975,139 +1066,262 @@ function sanitizeTextForVietnameseTTS(text: string): string {
   return clean.trim();
 }
 
-// Endpoint: Generate High-quality TTS Voiceover for marketing review script
+// Expose verified sample WAV files for live human listening & QA verification
+fs.mkdirSync(TTS_SAMPLES_DIR, { recursive: true });
+app.use("/samples/tts", express.static(TTS_SAMPLES_DIR));
+
+// Endpoint: Generate High-quality Southern Saigon TTS Voiceover (STRICT_SOUTHERN_ONLY for Vietnamese)
 app.post("/api/generate-tts", aiEndpointLimiter, async (req, res): Promise<any> => {
   try {
-    const { text, voiceName } = req.body;
+    const { text, voiceName, language, modelOverride } = req.body || {};
 
-    if (!text || typeof text !== 'string' || text.trim() === '') {
+    if (!text || typeof text !== "string" || text.trim() === "") {
       return res.status(400).json({ error: "Không có văn bản kịch bản hợp lệ để tạo giọng đọc.", code: "EMPTY_TEXT" });
     }
 
-    const selectedVoice = voiceName || "Kore";
-    // Check if the selected voice is English
-    let voiceForGemini = selectedVoice;
-    let isEnglish = false;
-    if (selectedVoice.endsWith("_EN")) {
-      voiceForGemini = selectedVoice.replace("_EN", "");
-      isEnglish = true;
-    }
-
-    // Clean all technical brackets and annotations so the voice is 100% pure and professional narration
-    const cleanSpeechText = cleanTextForSpeech(text);
-
-    // Check memory cache
-    const cacheKey = `v18_permanent_saigon_tts:${selectedVoice}:${cleanSpeechText.trim()}`;
-    if (ttsMemoryCache.has(cacheKey)) {
-      const cached = ttsMemoryCache.get(cacheKey)!;
-      if (cached && cached.length > 100) {
-        console.info(`[TTS-CACHE-HIT] Phản hồi tức thì giọng đọc Nam Bộ cực sạch cho ${selectedVoice}`);
-        return res.json({ success: true, audioBase64: cached });
-      }
-    }
-
-    const ai = getGoogleAI();
+    const ai = getGoogleAI("v1beta");
     if (!ai) {
       return res.status(503).json({
         success: false,
         error: "Chưa cấu hình GEMINI_API_KEY để kích hoạt tính năng lồng tiếng AI.",
         code: "MISCONFIGURED_API_KEY",
-        retryable: false
+        retryable: false,
       });
     }
 
-    // Perform ultimate phonetic preprocessing before TTS synthesis for maximum beauty
-    const phoneticOptimizedText = isEnglish ? cleanSpeechText : sanitizeTextForVietnameseTTS(cleanSpeechText);
-    const pureSpeechText = phoneticOptimizedText;
+    // Detect English vs Vietnamese input explicitly and resolve strictly against Southern Saigon voice policy
+    const langHint: "vi" | "en" =
+      language === "en" || (typeof voiceName === "string" && voiceName.endsWith("_EN")) ? "en" : "vi";
+    const resolved = resolveVoiceConfiguration(voiceName, langHint);
 
-    let base64Audio: string | null = null;
-    let delay = 1000;
-    const maxRetries = 2;
-    const ttsModel = "gemini-3.8-flash-lite-tts";
+    // Strip stage directions & annotations; unconditionally enforce Southern Saigon vocabulary for Vietnamese TTS
+    const cleanSpeechText = cleanTextForSpeech(text);
+    const pureSpeechText = resolved.isEnglish
+      ? cleanSpeechText
+      : sanitizeTextForVietnameseTTS(cleanSpeechText, true);
 
-    for (let i = 0; i < maxRetries; i++) {
-      try {
-        console.info(`[TTS-GEMINI-STUDIO] Khởi tạo lồng tiếng Nam Bộ Google AI Studio (Model: ${ttsModel}, Giọng: ${voiceForGemini}, Lần thử: ${i + 1}/${maxRetries})...`);
+    if (!pureSpeechText || pureSpeechText.trim() === "") {
+      return res.status(400).json({ error: "Kịch bản sau khi lọc ký tự kỹ thuật bị rỗng.", code: "EMPTY_SPEECH_TEXT" });
+    }
 
-        const response: any = await Promise.race([
-          ai.models.generateContent({
-            model: ttsModel,
-            contents: [
-              {
-                role: "user",
-                parts: [
-                  {
-                    text: pureSpeechText,
-                    speechMetadata: {
-                      style: isEnglish 
-                        ? "Natural, clear, professional voiceover narrator" 
-                        : "Authentic, sweet Southern Vietnamese (Saigon / Nam Bộ) accent, warm, friendly, melodious intonation",
-                    },
-                  },
-                ],
-              },
-            ],
-            config: {
-              responseModalities: ["AUDIO"],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: voiceForGemini },
-                },
-              },
+    const result = await synthesizeGeminiTtsStrict({
+      aiBeta: ai,
+      text: pureSpeechText,
+      requestedVoiceId: resolved.voiceId,
+      languageHint: langHint,
+      ttsModelOverride: modelOverride,
+      cacheMap: ttsMemoryCache,
+      timeoutMs: 45000,
+      maxRetries: 3,
+    });
+
+    return res.json({
+      success: true,
+      audioBase64: result.audioBase64,
+      provenance: result.provenance,
+      metrics: result.metrics,
+      policy: SAIGON_VOICE_POLICY,
+    });
+  } catch (error: any) {
+    console.error("[SAIGON-TTS-ENDPOINT-ERR]", error);
+    const status = error?.httpStatus || 503;
+    return res.status(status).json({
+      success: false,
+      error: error?.message || "Không thể tạo giọng đọc Sài Gòn từ Gemini TTS.",
+      code: error?.code || "TTS_UNAVAILABLE",
+      retryable: error?.retryable !== false,
+      policy: SAIGON_VOICE_POLICY,
+    });
+  }
+});
+
+// Endpoint: Synthesize & Serve Audition Sample WAV for Southern Saigon Voice Audition
+app.post("/api/tts/preview", aiEndpointLimiter, async (req, res): Promise<any> => {
+  try {
+    const { voiceName, customSampleText, modelOverride } = req.body || {};
+    const resolved = resolveVoiceConfiguration(voiceName, "vi");
+    const targetModel =
+      modelOverride === VOICE_DESIGN_TTS_MODEL || modelOverride === PRIMARY_TTS_LITE_MODEL
+        ? modelOverride
+        : resolved.isEnglish
+        ? PRIMARY_TTS_LITE_MODEL
+        : VOICE_DESIGN_TTS_MODEL;
+
+    const hasCustomText = typeof customSampleText === "string" && customSampleText.trim().length > 0;
+    const sampleScript = hasCustomText
+      ? sanitizeTextForVietnameseTTS(cleanTextForSpeech(customSampleText), !resolved.isEnglish)
+      : resolved.isEnglish
+      ? "Hello everyone! Today I am excited to introduce an amazingly useful product for daily life."
+      : SAIGON_SAMPLE_SCRIPT;
+
+    // Serve verified disk sample file immediately if it exists for canonical Saigon test sentences (saves RPM quota)
+    if (!hasCustomText && !resolved.isEnglish) {
+      const sampleFile = path.join(TTS_SAMPLES_DIR, `sample_${resolved.voiceId}_${targetModel}.wav`);
+      if (fs.existsSync(sampleFile)) {
+        const wavBuffer = fs.readFileSync(sampleFile);
+        const { inspectWavAudioMetrics } = await import("./server/saigonTtsEngine");
+        const { buildTtsCacheKey, computeDeterministicScriptHash } = await import("./src/saigonVoicePolicy");
+        const metrics = inspectWavAudioMetrics(wavBuffer);
+        if (metrics.isValidRiffWav && !metrics.isSilent) {
+          return res.json({
+            success: true,
+            voiceId: resolved.voiceId,
+            sampleText: sampleScript,
+            audioBase64: wavBuffer.toString("base64"),
+            samplePublicUrl: `/samples/tts/sample_${resolved.voiceId}_${targetModel}.wav`,
+            provenance: {
+              voiceId: resolved.voiceId,
+              geminiVoiceName: resolved.geminiVoiceName,
+              language: "vi-VN",
+              accent: resolved.accent,
+              regionalVariant: resolved.regionalVariant,
+              accentPolicy: SAIGON_VOICE_POLICY.ACCENT_POLICY,
+              voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
+              ttsModelVersion: targetModel,
+              scriptHash: computeDeterministicScriptHash(sampleScript),
+              cacheKey: buildTtsCacheKey({
+                voiceId: resolved.voiceId,
+                language: "vi-VN",
+                accent: resolved.accent,
+                voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
+                ttsModelVersion: targetModel,
+                scriptText: sampleScript,
+              }),
+              cacheHit: true,
+              synthesizedAt: Date.now(),
+              durationSec: metrics.durationSec,
+              rmsDb: metrics.rmsDb,
+              isSilent: metrics.isSilent,
             },
-          }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("TTS_TIMEOUT")), 12000))
-        ]);
-
-        const data = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-        if (data && data.length > 100) {
-          base64Audio = data;
-          console.info(`[TTS-GEMINI-STUDIO] Thành công! Tạo giọng Nam Bộ Google AI Studio hoàn tất (${data.length} bytes base64).`);
-          ttsMemoryCache.set(cacheKey, base64Audio);
-          break;
-        }
-      } catch (apiError: any) {
-        const errMsg = apiError?.message || String(apiError);
-        console.error(`[TTS-ERROR-TRACE] Lần ${i + 1}:`, errMsg, apiError?.status || '');
-        const match = errMsg.match(/Please retry in (\d+(?:\.\d+)?)s/i);
-        let waitSec = 0;
-        if (match && match[1]) {
-          waitSec = Math.ceil(parseFloat(match[1]));
-        }
-
-        if (i < maxRetries - 1) {
-          let waitMs = waitSec > 0 ? (Math.min(waitSec, 4) * 1000 + 400) : delay;
-          await new Promise((resolve) => setTimeout(resolve, waitMs));
-          delay = Math.min(delay * 1.5, 2500);
+            metrics,
+          });
         }
       }
     }
 
-    if (!base64Audio) {
-      console.warn("[TTS-UNAVAILABLE] Không thể tạo âm thanh giọng đọc từ Gemini TTS.");
+    const ai = getGoogleAI("v1beta");
+    if (!ai) {
       return res.status(503).json({
         success: false,
-        error: "Hệ thống Google Gemini Flash Lite TTS đang quá tải tạm thời hoặc gặp sự cố kết nối. Vui lòng bấm Thử lại lồng tiếng.",
-        code: "TTS_UNAVAILABLE",
-        retryable: true
+        error: "Chưa cấu hình GEMINI_API_KEY để nghe thử giọng đọc.",
+        code: "MISCONFIGURED_API_KEY",
       });
     }
 
-    return res.json({ success: true, audioBase64: base64Audio });
+    const result = await synthesizeGeminiTtsStrict({
+      aiBeta: ai,
+      text: sampleScript,
+      requestedVoiceId: resolved.voiceId,
+      languageHint: resolved.isEnglish ? "en" : "vi",
+      ttsModelOverride: targetModel,
+      cacheMap: ttsMemoryCache,
+      timeoutMs: 45000,
+      maxRetries: 2,
+    });
 
+    const saved = saveSampleWavFile(resolved.voiceId, result.provenance.ttsModelVersion, result.wavBuffer);
+
+    return res.json({
+      success: true,
+      voiceId: resolved.voiceId,
+      sampleText: sampleScript,
+      audioBase64: result.audioBase64,
+      samplePublicUrl: saved.publicUrl,
+      provenance: result.provenance,
+      metrics: result.metrics,
+    });
   } catch (error: any) {
-    console.error("Lỗi tạo giọng nói TTS:", error);
-    return res.status(500).json({
+    return res.status(error?.httpStatus || 503).json({
       success: false,
-      error: `Lỗi máy chủ khi tạo giọng đọc: ${error.message || "Lỗi không xác định"}`,
-      code: "TTS_SERVER_ERROR",
-      retryable: true
+      error: error?.message || "Không thể tạo mẫu âm thanh nghe thử.",
+      code: error?.code || "PREVIEW_FAILED",
+      retryable: true,
+    });
+  }
+});
+
+// Endpoint: Live Saigon Accent Acoustic Audit (synthesizes real WAV + analyzes audio stream honestly)
+app.post("/api/tts/validate-saigon", aiEndpointLimiter, async (req, res): Promise<any> => {
+  try {
+    const { voiceName, customText, modelOverride, useCachedSample } = req.body || {};
+    const aiBeta = getGoogleAI("v1beta");
+    const aiStd = getGoogleAI();
+    if (!aiBeta || !aiStd) {
+      return res.status(503).json({
+        success: false,
+        error: "Chưa cấu hình GEMINI_API_KEY.",
+        code: "MISCONFIGURED_API_KEY",
+      });
+    }
+
+    const resolved = resolveVoiceConfiguration(voiceName, "vi");
+    if (resolved.isEnglish) {
+      return res.status(400).json({ error: "Kiểm định giọng Sài Gòn chỉ áp dụng cho voice tiếng Việt." });
+    }
+
+    const targetModel =
+      modelOverride === VOICE_DESIGN_TTS_MODEL || modelOverride === PRIMARY_TTS_LITE_MODEL
+        ? modelOverride
+        : VOICE_DESIGN_TTS_MODEL;
+
+    const rawText = typeof customText === "string" && customText.trim() ? customText : SAIGON_SAMPLE_SCRIPT;
+    const sampleScript = sanitizeTextForVietnameseTTS(cleanTextForSpeech(rawText), true);
+    const existingSamplePath = path.join(TTS_SAMPLES_DIR, `sample_${resolved.voiceId}_${targetModel}.wav`);
+
+    let wavBuffer: Buffer;
+    let saved = {
+      filePath: existingSamplePath,
+      publicUrl: `/samples/tts/sample_${resolved.voiceId}_${targetModel}.wav`,
+    };
+    let provenance: any = null;
+
+    if (useCachedSample === true && !customText && fs.existsSync(existingSamplePath)) {
+      wavBuffer = fs.readFileSync(existingSamplePath);
+    } else {
+      const synth = await synthesizeGeminiTtsStrict({
+        aiBeta,
+        text: sampleScript,
+        requestedVoiceId: resolved.voiceId,
+        languageHint: "vi",
+        ttsModelOverride: targetModel,
+        cacheMap: ttsMemoryCache,
+        timeoutMs: 45000,
+        maxRetries: 2,
+      });
+      wavBuffer = synth.wavBuffer;
+      provenance = synth.provenance;
+      saved = saveSampleWavFile(resolved.voiceId, synth.provenance.ttsModelVersion, synth.wavBuffer);
+    }
+
+    const audit = await auditWavDialectWithGemini({
+      aiStd,
+      wavBuffer,
+      voiceId: resolved.voiceId,
+      modelUsed: targetModel,
+      testScript: sampleScript,
+      sampleSavedPath: saved.filePath,
+      samplePublicUrl: saved.publicUrl,
+    });
+
+    return res.json({
+      success: true,
+      policy: SAIGON_VOICE_POLICY,
+      testSentences: SAIGON_TEST_SENTENCES,
+      provenance,
+      audit,
+    });
+  } catch (error: any) {
+    return res.status(error?.httpStatus || 503).json({
+      success: false,
+      error: error?.message || "Kiểm định âm thanh Sài Gòn thất bại.",
+      code: error?.code || "VALIDATION_FAILED",
+      retryable: true,
     });
   }
 });
 
 // Endpoint: Optimize the length and tempo of a review script to precisely synchronize with the video duration
-app.post("/api/optimize-script", async (req, res): Promise<any> => {
+app.post("/api/optimize-script", aiEndpointLimiter, async (req, res): Promise<any> => {
   try {
     const { script, videoDuration, language } = req.body;
 
@@ -1120,6 +1334,15 @@ app.post("/api/optimize-script", async (req, res): Promise<any> => {
     }
 
     const ai = getGoogleAI();
+    if (!ai) {
+      return res.status(503).json({
+        success: false,
+        error: "Chưa cấu hình GEMINI_API_KEY hoặc hệ thống AI chưa sẵn sàng.",
+        code: "MISCONFIGURED_API_KEY",
+        retryable: false
+      });
+    }
+
     const isEn = language === 'en';
 
     // 2.2 words per second is the sweet spot for professional, warm, natural Southern Vietnamese voice-overs, and around 2.3 for English
@@ -1159,188 +1382,161 @@ VĂN BẢN GỐC CỦA NGƯỜI DÙNG:
 "${script}"
 
 YÊU CẦU THIẾT KẾ & TẤN CÔNG ĐỘ DÀI:
-1. Bạn phải viết lại kịch bản, giữ nguyên 100% tinh thần, đặc điểm sản phẩm, cảm xúc dạt dào, phong cách Nam Bộ chuyên nghiệp, ấm áp và cực kỳ cuốn hút sang trọng.
+1. Bạn phải viết lại kịch bản, giữ nguyên 100% tinh thần, đặc điểm sản phẩm, cảm xúc dạt dào, văn phong Nam Bộ / Sài Gòn chuyên nghiệp, ấm áp và cực kỳ cuốn hút sang trọng. Tuyệt đối KHÔNG dùng từ ngữ hoặc ngữ điệu miền Bắc (như "nhé", "thế này", "bát", "thìa", "vâng", "xem").
 2. Bạn có thể lược bớt những câu từ rườm rà, lặp ý hoặc kéo dài thêm câu từ bằng cách bổ sung tính từ/trải nghiệm sành sỏi nếu kịch bản quá ngắn.
-3. KHÔNG đưa bất kỳ chỉ dẫn cảnh quay, B-Roll, SFX, hay ký hiệu nào khác ngoài văn bản thoại thuyết minh thuần túy. KHÔNG thêm emojis, hashtags, hay dấu ngoặc đơn. Chỉ lồng tiếng thuần để cho AI TTS đọc mượt mà.
+3. KHÔNG đưa bất kỳ chỉ dẫn cảnh quay, B-Roll, SFX, hay ký hiệu nào khác ngoài văn bản thoại thuyết minh thuần túy. KHÔNG thêm emojis, hashtags, hay dấu ngoặc đơn. Chỉ lồng tiếng thuần để cho AI TTS giọng Sài Gòn đọc mượt mà.
 4. BẮT BUỘC ĐẾM chính xác số từ (syllables) trong kịch bản mới của bạn trước khi trả về. Tổng số từ PHẢI nằm trong khoảng từ ${minWords} đến ${maxWords} từ. Đây là yêu cầu quan trọng số một của Dự án để không làm lag hay tràn âm thanh.
 5. Kết quả trả về chỉ được chứa duy nhất nội dung kịch bản văn bản review thuần túy đã tối ưu, không có lời dạo đầu, lời khuyên, hay bất cứ lời chào xã giao nào bổ sung.
 
 Hãy thực thi nhiệm vụ một cách chuyên nghiệp nhất!`;
 
-    let resultText = "";
-    try {
-      if (!ai) {
-        throw new Error("GEMINI_CLIENT_NOT_AVAILABLE");
-      }
-      const response = await generateWithRetry(
-        (model) => 
-          ai.models.generateContent({
-            model: model,
-            contents: [{ parts: [{ text: optimizationPrompt }] }],
-          }),
-        3,
-        1000,
-        "gemini-3.8-flash",
-        true
-      );
+    const response = await generateWithRetry(
+      (model) => 
+        ai.models.generateContent({
+          model: model,
+          contents: [{ parts: [{ text: optimizationPrompt }] }],
+        }),
+      3,
+      1000,
+      PRIMARY_TEXT_VISION_MODEL,
+      true
+    );
 
-      resultText = response.text || "";
-      if (!resultText) {
-        throw new Error("Không thể tối ưu hóa kịch bản từ mô hình AI.");
-      }
-    } catch (apiError: any) {
-      console.log("[OPTIMIZE-FALLBACK] Gemini API is currently busy. Returning original script without modification.");
-      resultText = script || "";
+    const resultText = response.text || "";
+    if (!resultText) {
+      throw new Error("Không thể tối ưu hóa kịch bản từ mô hình AI.");
     }
 
     res.json({ optimizedScript: resultText.trim() });
 
   } catch (error: any) {
     console.error("Lỗi tối ưu kịch bản:", error);
-    res.status(500).json({ error: error.message || "Lỗi máy chủ khi tối ưu kịch bản." });
+    res.status(502).json({
+      success: false,
+      error: `Không thể tối ưu kịch bản: ${error.message || "Lỗi dịch vụ AI"}`,
+      code: "OPTIMIZE_FAILED",
+      retryable: true
+    });
   }
 });
 
-// Endpoint: AI Smart Trending Product Scanner
-app.post("/api/scan-trending-products", async (req, res): Promise<any> => {
+// Endpoint: AI Smart Trending Product Scanner with market hypotheses transparency
+app.post("/api/scan-trending-products", aiEndpointLimiter, async (req, res): Promise<any> => {
   try {
     const { category } = req.body;
     const ai = getGoogleAI();
+    if (!ai) {
+      return res.status(503).json({
+        success: false,
+        error: "Chưa cấu hình GEMINI_API_KEY hoặc hệ thống AI chưa sẵn sàng.",
+        code: "MISCONFIGURED_API_KEY",
+        retryable: false
+      });
+    }
 
     const selectedCategory = category || "all";
     const promptText = `
-Chào mừng bạn đến với Hệ thống Tìm kiếm Xu hướng Thị trường Toàn cầu (Global Trend Scouting Intelligence).
-Hãy đóng vai một chuyên gia phân tích dữ liệu thương mại điện tử cấp cao và cố vấn nội dung triệu view cho các TikTok Creator hàng đầu.
+Bạn là chuyên gia phân tích xu hướng thương mại điện tử và cố vấn kịch bản video review ngắn (TikTok, Reels, Shorts).
+Nhiệm vụ: Đề xuất danh sách 5 ý tưởng sản phẩm tiềm năng thuộc danh mục: "${selectedCategory}" (nếu là "all", hãy chọn đa dạng từ Gia dụng, Công nghệ, Mỹ phẩm, Decor).
 
-Nhiệm vụ của bạn là hãy "quét" (scan) và tổng hợp ra danh sách chứa chính xác 5 sản phẩm đang cực kỳ thịnh hành, có tỷ lệ chuyển đổi cao và mang tính viral dữ dội nhất trong thời điểm hiện tại tại thị trường Việt Nam (phù hợp tuyệt đối để làm video lồng tiếng review ngắn).
+NGUYÊN TẮC MINH BẠCH VÀ CHÂN THỰC (ZERO FAKE DATA):
+1. TUYỆT ĐỐI KHÔNG BỊA ĐẶT SỐ LIỆU ĐƠN HÀNG HOẶC LƯỢT MUA THỰC TẾ (ví dụ: cấm bịa "12k+ lượt mua", "15k+ đơn hàng", "8.5k+ KOLs tin dùng").
+2. ĐÂY LÀ GIẢ THUYẾT XU HƯỚNG TỪ MÔ HÌNH AI:
+   - Ghi rõ 'isMarketHypothesis': true.
+   - Ghi 'marketHypothesisNotice': "AI-generated market hypothesis – Chưa xác minh bằng dữ liệu thị trường".
+   - 'estimationMethod': "Mô hình ngôn ngữ phân tích xu hướng tìm kiếm và nội dung sáng tạo số".
+   - 'dataPeriod': "Giai đoạn 30 ngày gần nhất".
+   - 'verificationStatus': "UNVERIFIED_HYPOTHESIS".
+   - 'marketInterestLevel': Một trong 3 mức: "Cao" | "Rất cao" | "Đột biến".
 
-Phân loại danh mục quét yêu cầu là: "${selectedCategory}" (Nếu là "all", hãy chọn đa dạng các nhóm sản phẩm hot nhất như Mỹ phẩm, Đồ công nghệ, Đồ gia dụng thông minh, Đồ decor phòng).
-
-Hãy kiến tạo các thông tin chất lượng cao, sành sỏi, tinh tế cho mỗi sản phẩm. Trả về kết quả hoàn chỉnh bằng tiếng Việt dưới định dạng JSON khớp hoàn hảo với cấu trúc sau:
+Hãy trả về định dạng JSON chuẩn:
 {
   "trendingProducts": [
     {
-      "id": "string (ví dụ: trend_1, trend_2)",
-      "name": "string (Tên sản phẩm đầy đủ, cụ thể, kích thích và sang trọng)",
-      "category": "string (Ví dụ: Thiết bị thông minh, Mỹ phẩm cao cấp, Gia dụng sành điệu, v.v.)",
-      "hotScore": "number (Chỉ số độ hot sục sôi từ 94.0 đến 99.9)",
-      "viralFactor": "string (Tốc độ lan truyền phần trăm tăng trưởng, ví dụ: +145% tuần qua, +320% hôm nay)",
-      "purchaseCount": "string (Số lượng bán hoặc tìm kiếm bùng nổ, ví dụ: 25k+ lượt mua, 8.2k+ KOLs tin dùng)",
-      "targetAudience": "string (Mô tả đối tượng khách hàng thèm khát sở hữu sản phẩm này nhất)",
-      "viralHook": "string (Câu hook mở màn lồng tiếng triệu view bắt tai gợi ý cho sản phẩm này)",
-      "shortDesc": "string (Mô tả ngắn gọn, súc tích đầy đặn về công năng đột phá của sản phẩm)",
-      "suggestedTone": "string (Nên là một trong các tông giọng: 'Thuyết phục & Truyền cảm', 'Sôi nổi & Kích thích', 'Phân tích chuyên sâu', 'Hài hước & Gần gũi')",
-      "hashtags": ["string", "string"] (Mảng từ 3-4 hashtags thịnh hành có tương tác cực cao như #fyp, #review,...)
+      "id": "trend_1",
+      "name": "Tên sản phẩm cụ thể và hấp dẫn",
+      "category": "Danh mục sản phẩm",
+      "marketInterestLevel": "Cao" | "Rất cao" | "Đột biến",
+      "isMarketHypothesis": true,
+      "marketHypothesisNotice": "AI-generated market hypothesis – Chưa xác minh bằng dữ liệu thị trường",
+      "estimationMethod": "Phân tích xu hướng từ khóa AI & cộng đồng sáng tạo",
+      "dataPeriod": "Gần đây",
+      "verificationStatus": "UNVERIFIED_HYPOTHESIS",
+      "targetAudience": "Đối tượng khách hàng tiềm năng",
+      "viralHook": "Câu Hook mở màn ấn tượng (không giục mua, tập trung trải nghiệm)",
+      "shortDesc": "Mô tả công năng và lý do sản phẩm thu hút sự chú ý",
+      "suggestedTone": "Thuyết phục & Truyền cảm" | "Sôi nổi & Kích thích" | "Phân tích chuyên sâu" | "Hài hước & Gần gũi",
+      "hashtags": ["#review", "#trending", "#fyp"]
     }
   ]
-}
-    `;
+}`;
 
-    let trendData;
-    try {
-      const response = await generateWithRetry((model) => 
-        ai.models.generateContent({
-          model: model,
-          contents: [{ parts: [{ text: promptText }] }],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                trendingProducts: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      id: { type: Type.STRING },
-                      name: { type: Type.STRING },
-                      category: { type: Type.STRING },
-                      hotScore: { type: Type.NUMBER },
-                      viralFactor: { type: Type.STRING },
-                      purchaseCount: { type: Type.STRING },
-                      targetAudience: { type: Type.STRING },
-                      viralHook: { type: Type.STRING },
-                      shortDesc: { type: Type.STRING },
-                      suggestedTone: { type: Type.STRING },
-                      hashtags: {
-                        type: Type.ARRAY,
-                        items: { type: Type.STRING }
-                      }
-                    },
-                    required: [
-                      "id", "name", "category", "hotScore", "viralFactor", "purchaseCount", "targetAudience", "viralHook", "shortDesc", "suggestedTone", "hashtags"
-                    ]
-                  }
+    const response = await generateWithRetry((model) => 
+      ai.models.generateContent({
+        model: model,
+        contents: [{ parts: [{ text: promptText }] }],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              trendingProducts: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    name: { type: Type.STRING },
+                    category: { type: Type.STRING },
+                    marketInterestLevel: { type: Type.STRING },
+                    isMarketHypothesis: { type: Type.BOOLEAN },
+                    marketHypothesisNotice: { type: Type.STRING },
+                    estimationMethod: { type: Type.STRING },
+                    dataPeriod: { type: Type.STRING },
+                    verificationStatus: { type: Type.STRING },
+                    targetAudience: { type: Type.STRING },
+                    viralHook: { type: Type.STRING },
+                    shortDesc: { type: Type.STRING },
+                    suggestedTone: { type: Type.STRING },
+                    hashtags: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING }
+                    }
+                  },
+                  required: [
+                    "id", "name", "category", "marketInterestLevel", "isMarketHypothesis",
+                    "marketHypothesisNotice", "estimationMethod", "dataPeriod", "verificationStatus",
+                    "targetAudience", "viralHook", "shortDesc", "suggestedTone", "hashtags"
+                  ]
                 }
-              },
-              required: ["trendingProducts"]
-            }
+              }
+            },
+            required: ["trendingProducts"]
           }
-        })
-      );
+        }
+      })
+    );
 
-      const resultText = response.text;
-      if (!resultText) {
-        throw new Error("Không nhận được dữ liệu xu hướng thương mại điện tử.");
-      }
-      trendData = JSON.parse(resultText);
-    } catch (apiError: any) {
-      console.log("[TRENDS-FALLBACK] Gemini Trends API is busy. Serving high-converting offline trending products list.");
-      trendData = {
-        trendingProducts: [
-          {
-            id: "trend_1",
-            name: "Robot Hút Bụi Lau Nhà Xiaomi Vacuum S10 PRO",
-            category: "Gia dụng thông minh",
-            hotScore: 98.7,
-            viralFactor: "+245% tuần này",
-            purchaseCount: "12k+ lượt mua tại Việt Nam",
-            targetAudience: "Gia đình bận rộn, người yêu thích công nghệ rảnh tay",
-            viralHook: "ĐỪNG MUA ROBOT HÚT BỤI XIAOMI S10 NẾU BẠN CHƯA BIẾT BÍ MẬT NÀY!",
-            shortDesc: "Thiết kế mỏng nhẹ tinh xảo, lực hút siêu khỏe kết hợp cảm biến laser LDS tránh vật cản đỉnh cao giúp sàn nhà luôn bóng sạch hoàn hảo.",
-            suggestedTone: "Thuyết phục & Truyền cảm",
-            hashtags: ["laser_lds", "vacuum", "xiaomi_s10", "cleanhome"]
-          },
-          {
-            id: "trend_2",
-            name: "Loa Bluetooth Marshall Acton III Elite",
-            category: "Thiết bị âm thanh chất lượng cao",
-            hotScore: 99.1,
-            viralFactor: "+310% hôm nay",
-            purchaseCount: "8.5k+ KOLS & Reviewer tin dùng",
-            targetAudience: "Tín đồ âm nhạc retro, trang trí decor phòng sang trọng",
-            viralHook: "CẢNH BÁO: CHIẾC LOA MARSHALL ACTON 3 SẼ LÀM BẠN NGHIỆN ÂM THANH NÀY...",
-            shortDesc: "Phong cách thiết kế vintage hoàng gia sang trọng, dải âm trầm uy lực sâu lắng cùng kết nối Bluetooth 5.2 mượt mà hoàn mỹ.",
-            suggestedTone: "Sôi nổi & Kích thích",
-            hashtags: ["marshall", "acton_3", "decor", "music_lover"]
-          },
-          {
-            id: "trend_3",
-            name: "Bàn Chải Điện Tự Động Halio Sonic Whitening PRO",
-            category: "Chăm sóc cá nhân cao cấp",
-            hotScore: 95.8,
-            viralFactor: "+130% tuần qua",
-            purchaseCount: "15k+ đơn hàng thành công",
-            targetAudience: "Những ai mong muốn nụ cười trắng sáng tự tin chuẩn nha khoa",
-            viralHook: "SỰ THẬT VỀ BÀN CHẢI ĐIỆN HALIO PRO CÓ THẦN THÁNH NHƯ LỜI ĐỒN?",
-            shortDesc: "Công nghệ sóng âm Sonic vượt trội làm sạch sâu gấp 10 lần dòng bàn chải thường, mang lại nụ cười rạng rỡ chuẩn phong thái.",
-            suggestedTone: "Phân tích chuyên sâu",
-            hashtags: ["halio_sonic", "toothbrush", "teethcare", "beauty_tips"]
-          }
-        ]
-      };
+    const resultText = response.text;
+    if (!resultText) {
+      throw new Error("Không nhận được dữ liệu xu hướng từ mô hình AI.");
     }
-
+    const trendData = JSON.parse(resultText);
     res.json(trendData);
 
   } catch (error: any) {
-    console.error("Lỗi quét sản phẩm hot trend:", error);
-    res.status(500).json({ error: error.message || "Lỗi máy chủ khi quét thông tin xu hướng." });
+    console.error("Lỗi quét sản phẩm xu hướng:", error);
+    res.status(502).json({
+      success: false,
+      error: `Không thể quét sản phẩm xu hướng: ${error.message || "Lỗi dịch vụ AI"}`,
+      code: "TRENDS_FAILED",
+      retryable: true
+    });
   }
 });
 
 // Endpoint: AI Smart Hook generator
-app.post("/api/suggest-hooks", async (req, res): Promise<any> => {
+app.post("/api/suggest-hooks", aiEndpointLimiter, async (req, res): Promise<any> => {
   try {
     const { productName, language } = req.body;
     if (!productName) {
@@ -1348,7 +1544,15 @@ app.post("/api/suggest-hooks", async (req, res): Promise<any> => {
     }
 
     const ai = getGoogleAI();
-    const uppercaseName = productName.toUpperCase();
+    if (!ai) {
+      return res.status(503).json({
+        success: false,
+        error: "Chưa cấu hình GEMINI_API_KEY hoặc hệ thống AI chưa sẵn sàng.",
+        code: "MISCONFIGURED_API_KEY",
+        retryable: false
+      });
+    }
+
     const isEn = language === 'en';
 
     const promptText = isEn ? `
@@ -1395,77 +1599,63 @@ Trả về kết quả chuẩn định dạng JSON chứa mảng "hooks" như sa
 }
 `;
 
-    let hooksData;
-    try {
-      if (!ai) {
-        throw new Error("GEMINI_CLIENT_NOT_AVAILABLE");
-      }
-      const response = await generateWithRetry((model) =>
-        ai.models.generateContent({
-          model: model,
-          contents: [{ parts: [{ text: promptText }] }],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                hooks: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: "Mảng chứa chính xác 3 câu hook giật gân độc quyền"
-                }
-              },
-              required: ["hooks"]
-            }
+    const response = await generateWithRetry((model) =>
+      ai.models.generateContent({
+        model: model,
+        contents: [{ parts: [{ text: promptText }] }],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              hooks: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Mảng chứa chính xác 3 câu hook giật gân độc quyền"
+              }
+            },
+            required: ["hooks"]
           }
-        })
-      );
+        }
+      })
+    );
 
-      const resultText = response.text;
-      if (!resultText) {
-        throw new Error("Không nhận được phản hồi gợi ý câu Hook từ AI.");
-      }
-      hooksData = JSON.parse(resultText);
-    } catch (apiError: any) {
-      console.log("[HOOKS-FALLBACK] Gemini Hooks API is busy. Constructing dynamic high-converting fallback hooks.");
-      hooksData = {
-        hooks: isEn ? [
-          `WARNING: WHAT THEY NEVER TOLD YOU ABOUT ${uppercaseName}!`,
-          `THE HONEST TRUTH ABOUT THE SO-CALLED REVOLUTIONARY ${uppercaseName}...`,
-          `STOP BUYING ${uppercaseName} BEFORE YOU WATCH THIS VIDEO!`
-        ] : [
-          `CẢNH BÁO: LƯU TRỮ VÀ SỬ DỤNG ${uppercaseName} CẦN BIẾT ĐIỀU NÀY CHƯA?`,
-          `SỰ THẬT CỰC SỐC VỀ TRẢI NGHIỆM THỰC TẾ CỦA ${uppercaseName}...`,
-          `TẠI SAO CHƯA AI NÓI CHO BẠN BIẾT LƯU Ý QUAN TRỌNG NÀY VỀ ${uppercaseName}?`
-        ]
-      };
+    const resultText = response.text;
+    if (!resultText) {
+      throw new Error("Không nhận được phản hồi gợi ý câu Hook từ AI.");
     }
-
+    const hooksData = JSON.parse(resultText);
     res.json(hooksData);
 
   } catch (error: any) {
     console.error("Lỗi gợi ý câu Hook:", error);
-    const uppercaseName = (req.body?.productName || "SẢN PHẨM").toUpperCase();
-    res.json({
-      hooks: [
-        `CẢNH BÁO: LƯU TRỮ VÀ SỬ DỤNG ${uppercaseName} CẦN BIẾT ĐIỀU NÀY CHƯA?`,
-        `SỰ THẬT CỰC SỐC VỀ TRẢI NGHIỆM THỰC TẾ CỦA ${uppercaseName}...`,
-        `TẠI SAO CHƯA AI NÓI CHO BẠN BIẾT LƯU Ý QUAN TRỌNG NÀY VỀ ${uppercaseName}?`
-      ]
+    res.status(502).json({
+      success: false,
+      error: `Không thể gợi ý câu Hook: ${error.message || "Lỗi dịch vụ AI"}`,
+      code: "HOOKS_FAILED",
+      retryable: true
     });
   }
 });
 
 // Endpoint: Translate subtitle segments for bilingual display
-app.post("/api/translate-subtitles", async (req, res): Promise<any> => {
+app.post("/api/translate-subtitles", aiEndpointLimiter, async (req, res): Promise<any> => {
   try {
-    const { segments, sourceLang, targetLang } = req.body;
+    const { segments, targetLang } = req.body;
 
     if (!segments || !Array.isArray(segments) || segments.length === 0) {
       return res.status(400).json({ error: "Thiếu danh sách các phân cảnh phụ đề cần dịch." });
     }
 
     const ai = getGoogleAI();
+    if (!ai) {
+      return res.status(503).json({
+        success: false,
+        error: "Chưa cấu hình GEMINI_API_KEY hoặc hệ thống AI chưa sẵn sàng.",
+        code: "MISCONFIGURED_API_KEY",
+        retryable: false
+      });
+    }
 
     const targetLanguageName = {
       vi: "Vietnamese",
@@ -1493,60 +1683,47 @@ Input segments to translate:
 ${segments.map((seg: any, idx: number) => `[${idx}]: "${seg.text}"`).join("\n")}
 `;
 
-    let translationsData;
-    try {
-      if (!ai) {
-        throw new Error("GEMINI_CLIENT_NOT_AVAILABLE");
-      }
-      const response = await generateWithRetry((model) =>
-        ai.models.generateContent({
-          model: model,
-          contents: [{ parts: [{ text: promptText }] }],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                translations: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: "Translated texts for each segment in the exact same order as input"
-                }
-              },
-              required: ["translations"]
-            }
+    const response = await generateWithRetry((model) =>
+      ai.models.generateContent({
+        model: model,
+        contents: [{ parts: [{ text: promptText }] }],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              translations: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Translated texts for each segment in the exact same order as input"
+              }
+            },
+            required: ["translations"]
           }
-        })
-      );
+        }
+      })
+    );
 
-      const resultText = response.text;
-      if (!resultText) {
-        throw new Error("Không nhận được phản hồi dịch thuật từ AI.");
-      }
-      translationsData = JSON.parse(resultText);
-    } catch (apiError: any) {
-      console.log("[TRANSLATE-FALLBACK] Gemini Translation API is busy. Falling back to direct layout preservation.");
-      // Fallback simple translation or just copy if fail
-      translationsData = {
-        translations: segments.map((seg: any) => {
-          return seg.text;
-        })
-      };
+    const resultText = response.text;
+    if (!resultText) {
+      throw new Error("Không nhận được phản hồi dịch thuật từ AI.");
     }
-
+    const translationsData = JSON.parse(resultText);
     res.json(translationsData);
 
   } catch (error: any) {
     console.error("Lỗi dịch thuật phụ đề:", error);
-    const segments = Array.isArray(req.body?.segments) ? req.body.segments : [];
-    res.json({
-      translations: segments.map((seg: any) => seg.text || "")
+    res.status(502).json({
+      success: false,
+      error: `Không thể dịch phụ đề: ${error.message || "Lỗi dịch vụ AI"}`,
+      code: "TRANSLATE_FAILED",
+      retryable: true
     });
   }
 });
 
 // Endpoint: Comprehensive Smart Checker and Auto-Fixer for Reviews, Scripts and Subtitles
-app.post("/api/check-and-fix-review-and-subtitles", async (req, res): Promise<any> => {
+app.post("/api/check-and-fix-review-and-subtitles", aiEndpointLimiter, async (req, res): Promise<any> => {
   try {
     const { 
       detailedReview, 
@@ -1556,15 +1733,33 @@ app.post("/api/check-and-fix-review-and-subtitles", async (req, res): Promise<an
       subtitleSegments, 
       videoDuration, 
       language = 'vi',
-      productName = ''
+      productName = '',
+      adaptSouthern = language !== 'en'
     } = req.body;
 
     const ai = getGoogleAI();
+    if (!ai) {
+      return res.status(503).json({
+        success: false,
+        error: "Chưa cấu hình GEMINI_API_KEY hoặc hệ thống AI chưa sẵn sàng.",
+        code: "MISCONFIGURED_API_KEY",
+        retryable: false
+      });
+    }
+
     const duration = typeof videoDuration === 'number' && videoDuration > 0 ? videoDuration : 30;
+
+    const dialectInstruction = adaptSouthern ? `
+2. 🗣️ ĐỒNG BỘ PHONG CÁCH NAM BỘ (THEO YÊU CẦU):
+   - Chuyển các hư từ sang văn phong Nam Bộ / Sài Gòn ấm áp, tự nhiên (*nha, nha bạn, nha cả nhà, thiệt là, thiệt sự, coi, ngàn, như vầy, muỗng, chén, trái...*).
+` : `
+2. 🗣️ TÔN TRỌNG GIỌNG VĂN & PHƯƠNG NGỮ GỐC:
+   - Giữ nguyên đại từ và phương ngữ gốc của người viết (không tự ý chuyển từ Bắc/Trung sang Nam hoặc ngược lại trừ khi sai chính tả).
+`;
 
     const promptText = `
 Bạn là Chuyên gia Kiểm định Chất lượng Nội dung (Chief Content QA & Subtitle Master) hàng đầu thế giới cho Video Thương mại Điện tử và TikTok Shop / Reels.
-Nhiệm vụ của bạn là rà soát, kiểm tra toàn diện và tự động sửa chữa triệt để mọi lỗi trong bài viết review, kịch bản lồng tiếng và phụ đề video sau đây:
+Nhiệm vụ của bạn là rà soát, kiểm tra toàn diện và tự động sửa chữa triệt để mọi lỗi chính tả và cấu trúc trong bài viết review, kịch bản lồng tiếng và phụ đề video sau đây:
 
 THÔNG TIN ĐẦU VÀO:
 - Tên sản phẩm: "${productName}"
@@ -1582,11 +1777,7 @@ CÁC TIÊU CHUẨN KIỂM TRA VÀ TỰ ĐỘNG SỬA LỖI BẮT BUỘC:
    - Sửa toàn bộ lỗi chính tả tiếng Việt (lỗi dấu hỏi/ngã, lỗi gõ Telex, lỗi từ ghép) hoặc ngữ pháp tiếng Anh.
    - Viết hoa đúng danh từ riêng, tên thương hiệu, tên sản phẩm.
    - Đảm bảo câu cú mạch lạc, chấm phẩy đúng nhịp thở thuyết minh.
-
-2. 🗣️ KHỬ TRIỆT ĐỂ 100% GIỌNG MIỀN BẮC (ĐỐI VỚI TIẾNG VIỆT):
-   - Tuyệt đối loại bỏ toàn bộ các từ ngữ, hư từ miền Bắc (*nhé, nhỉ, nhé bạn, nhé mọi người, thật là, thật sự, xem, nghìn, bảo, chẳng, chả, thế này, thế kia, ấy, vâng, ạ, ngõ, ô, thìa, bát, quả, bố mẹ, sử dụng, dùng...*).
-   - Chuyển sang văn phong Nam Bộ / Sài Gòn ấm áp, ngọt ngào, tự nhiên 100% (*nha, nha bạn, nha cả nhà, thiệt là, thiệt sự, coi, ngàn, nói, hông, như vầy, như vậy, đó, dạ, hẻm, dù, muỗng, chén, trái, ba má, xài...*).
-
+${dialectInstruction}
 3. 🛡️ TUÂN THỦ CHÍNH SÁCH TIKTOK SHOP / SHOPEE / REELS (AN TOÀN BÁN HÀNG 100%):
    - Tuyệt đối không dùng các từ bị cấm, phóng đại hoặc trị liệu: "cam kết 100%", "trị dứt điểm", "vĩnh viễn", "chữa khỏi hoàn toàn", "số 1 thế giới", "hàng đầu", "rẻ nhất", "chính hãng 100%", "quốc dân".
    - Thay thế bằng các từ ngữ tinh tế, thuyết phục, chuẩn chính sách thương mại điện tử.
@@ -1616,155 +1807,76 @@ Hãy trả về phản hồi theo định dạng JSON với schema sau:
 - optimizationSummary: Tóm tắt ngắn gọn 1-2 câu về những cải tiến lớn nhất
 `;
 
-    let checkResult;
-    try {
-      if (!ai) {
-        throw new Error("GEMINI_CLIENT_NOT_AVAILABLE");
-      }
-      const response = await generateWithRetry((model) =>
-        ai.models.generateContent({
-          model: model,
-          contents: [{ parts: [{ text: promptText }] }],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                fixedSummary: { type: Type.STRING, description: "Tóm tắt đã sửa lỗi" },
-                fixedCtaText: { type: Type.STRING, description: "CTA đã sửa lỗi" },
-                fixedMarketingScript: { type: Type.STRING, description: "Kịch bản lồng tiếng đã sửa lỗi và chuẩn nhịp điệu" },
-                fixedDetailedReview: { type: Type.STRING, description: "Bài review phân cảnh đã sửa lỗi" },
-                fixedSubtitles: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      start: { type: Type.NUMBER, description: "Giây bắt đầu" },
-                      end: { type: Type.NUMBER, description: "Giây kết thúc" },
-                      text: { type: Type.STRING, description: "Câu phụ đề đã sửa lỗi" }
-                    },
-                    required: ["start", "end", "text"]
+    const response = await generateWithRetry((model) =>
+      ai.models.generateContent({
+        model: model,
+        contents: [{ parts: [{ text: promptText }] }],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              fixedSummary: { type: Type.STRING, description: "Tóm tắt đã sửa lỗi" },
+              fixedCtaText: { type: Type.STRING, description: "CTA đã sửa lỗi" },
+              fixedMarketingScript: { type: Type.STRING, description: "Kịch bản lồng tiếng đã sửa lỗi và chuẩn nhịp điệu" },
+              fixedDetailedReview: { type: Type.STRING, description: "Bài review phân cảnh đã sửa lỗi" },
+              fixedSubtitles: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    start: { type: Type.NUMBER, description: "Giây bắt đầu" },
+                    end: { type: Type.NUMBER, description: "Giây kết thúc" },
+                    text: { type: Type.STRING, description: "Câu phụ đề đã sửa lỗi" }
                   },
-                  description: "Danh sách phụ đề đã sửa lỗi và phân bổ đều theo thời lượng"
+                  required: ["start", "end", "text"]
                 },
-                fixedIssues: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: "Danh sách các lỗi đã phát hiện và sửa chữa"
-                },
-                qualityScoreBefore: { type: Type.NUMBER, description: "Điểm chất lượng ban đầu (1-100)" },
-                qualityScoreAfter: { type: Type.NUMBER, description: "Điểm chất lượng hoàn hảo sau khi sửa (95-100)" },
-                optimizationSummary: { type: Type.STRING, description: "Tóm tắt kết quả kiểm tra sửa lỗi" }
+                description: "Danh sách phụ đề đã sửa lỗi và phân bổ đều theo thời lượng"
               },
-              required: [
-                "fixedSummary", 
-                "fixedCtaText", 
-                "fixedMarketingScript", 
-                "fixedDetailedReview", 
-                "fixedSubtitles", 
-                "fixedIssues", 
-                "qualityScoreBefore", 
-                "qualityScoreAfter", 
-                "optimizationSummary"
-              ]
-            }
+              fixedIssues: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Danh sách các lỗi đã phát hiện và sửa chữa"
+              },
+              qualityScoreBefore: { type: Type.NUMBER, description: "Điểm chất lượng ban đầu (1-100)" },
+              qualityScoreAfter: { type: Type.NUMBER, description: "Điểm chất lượng sau khi sửa (1-100)" },
+              optimizationSummary: { type: Type.STRING, description: "Tóm tắt kết quả kiểm tra sửa lỗi" }
+            },
+            required: [
+              "fixedSummary", 
+              "fixedCtaText", 
+              "fixedMarketingScript", 
+              "fixedDetailedReview", 
+              "fixedSubtitles", 
+              "fixedIssues", 
+              "qualityScoreBefore", 
+              "qualityScoreAfter", 
+              "optimizationSummary"
+            ]
           }
-        })
-      );
-
-      const resultText = response.text;
-      if (!resultText) {
-        throw new Error("Không nhận được kết quả phân tích sửa lỗi từ AI.");
-      }
-      checkResult = JSON.parse(resultText);
-    } catch (apiErr: any) {
-      console.warn("[CHECK-FIX-FALLBACK] Gemini busy, running algorithmic heuristic auto-fixer:", apiErr.message);
-
-      // Algorithmic local heuristics fallback
-      const cleanScriptToSouthernVietnamese = (text: string): string => {
-        if (!text) return "";
-        let clean = text;
-        const replacements: [RegExp, string][] = [
-          [/\bchúng mình\b/gi, 'tụi mình'],
-          [/\bchúng tôi\b/gi, 'tụi mình'],
-          [/\bbọn mình\b/gi, 'tụi mình'],
-          [/\bnhỉ\b/gi, 'nè'],
-          [/\bnhé\b/gi, 'nha'],
-          [/\bnhá\b/gi, 'nha'],
-          [/\bthế này\b/gi, 'vầy nè'],
-          [/\bthế kia\b/gi, 'vậy đó'],
-          [/\bnhưng mà\b/gi, 'mà'],
-          [/\bthôi nào\b/gi, 'nghen'],
-          [/\bơi là ơi\b/gi, 'dữ dằn'],
-          [/\bvào đây\b/gi, 'vô đây'],
-          [/\bvào trong\b/gi, 'vô trong'],
-          [/\bnhìn này\b/gi, 'coi nè'],
-          [/\bxem này\b/gi, 'coi nè'],
-          [/\brất là\b/gi, 'cực kỳ'],
-          [/\bquá trời\b/gi, 'quá chừng']
-        ];
-        for (const [p, r] of replacements) {
-          clean = clean.replace(p, r);
         }
-        return clean;
-      };
+      })
+    );
 
-      let cleanScript = cleanScriptToSouthernVietnamese(marketingScript || summary || "Sản phẩm xu hướng chất lượng cao.");
-      let cleanDetailed = cleanScriptToSouthernVietnamese(detailedReview || "");
-      let cleanSum = cleanScriptToSouthernVietnamese(summary || "");
-      let cleanCta = cleanScriptToSouthernVietnamese(ctaText || "Nhấp chọn giỏ hàng màu vàng góc trái bên dưới để rinh ngay ưu đãi khủng hôm nay nha!");
-
-      // Policy violations filter
-      const policyWords: [RegExp, string][] = [
-        [/\bcam kết 100%\b/gi, 'trải nghiệm thực tế chứng minh'],
-        [/\btrị dứt điểm\b/gi, 'hỗ trợ cải thiện rõ rệt'],
-        [/\bvĩnh viễn\b/gi, 'lâu dài bền vững'],
-        [/\bchữa khỏi\b/gi, 'hỗ trợ chăm sóc tối ưu'],
-        [/\bsố 1 thế giới\b/gi, 'thuộc top dẫn đầu phân khúc'],
-        [/\bhàng đầu\b/gi, 'đẳng cấp'],
-        [/\brẻ nhất\b/gi, 'mức giá cực kỳ ưu đãi'],
-        [/\bchính hãng 100%\b/gi, 'chính hãng an tâm']
-      ];
-      for (const [pat, rep] of policyWords) {
-        cleanScript = cleanScript.replace(pat, rep);
-        cleanDetailed = cleanDetailed.replace(pat, rep);
-        cleanSum = cleanSum.replace(pat, rep);
-        cleanCta = cleanCta.replace(pat, rep);
-      }
-
-      // Subtitles generation & alignment
-      const sentences = cleanScript.split(/(?<=[.!?])\s+|,\s+/).filter(s => s.trim().length > 0);
-      const totalSentences = Math.max(1, sentences.length);
-      const step = duration / totalSentences;
-      const fixedSubs = sentences.map((sent, idx) => ({
-        start: Number((idx * step).toFixed(2)),
-        end: Number(((idx + 1) * step).toFixed(2)),
-        text: sent.replace(/[*#_`~\[\]\(\)]/g, '').trim()
-      }));
-
-      checkResult = {
-        fixedSummary: cleanSum,
-        fixedCtaText: cleanCta,
-        fixedMarketingScript: cleanScript,
-        fixedDetailedReview: cleanDetailed,
-        fixedSubtitles: fixedSubs,
-        fixedIssues: [
-          "Chuẩn hóa 100% ngữ điệu & từ vựng sang văn phong Nam Bộ / Sài Gòn truyền cảm.",
-          "Thanh lọc các từ ngữ vi phạm chính sách quảng cáo TikTok Shop & Shopee.",
-          "Sửa lỗi chính tả, chuẩn hóa dấu câu và loại bỏ các ký tự Markdown thừa trong phụ đề.",
-          "Cân chỉnh lại mốc thời gian phụ đề (Timeline) liên tục, loại bỏ hoàn toàn hiện tượng chồng lấn giây."
-        ],
-        qualityScoreBefore: 76,
-        qualityScoreAfter: 99,
-        optimizationSummary: "Đã rà soát và tự động hiệu chỉnh toàn diện kịch bản review cùng hệ thống phụ đề đồng bộ chuẩn TikTok Shop."
-      };
+    const resultText = response.text;
+    if (!resultText) {
+      throw new Error("Không nhận được kết quả phân tích sửa lỗi từ AI.");
     }
-
-    res.json(checkResult);
+    const checkResult = JSON.parse(resultText);
+    return res.json(checkResult);
 
   } catch (error: any) {
     console.error("Lỗi kiểm tra sửa lỗi bài viết review & phụ đề:", error);
-    res.status(500).json({ error: error.message || "Lỗi máy chủ khi kiểm tra sửa lỗi." });
+    const isQuota = error.status === 429 || String(error.message).includes("quota") || String(error.message).includes("RESOURCE_EXHAUSTED");
+    const isUnavailable = error.status === 503 || String(error.message).includes("503") || String(error.message).includes("UNAVAILABLE");
+    return res.status(isQuota ? 429 : (isUnavailable ? 503 : 502)).json({
+      success: false,
+      error: isQuota
+        ? "Hạn ngạch Google Gemini API tạm thời chạm mức giới hạn. Vui lòng thử lại sau."
+        : `Không thể kiểm tra & sửa lỗi bằng AI: ${error.message || "Lỗi dịch vụ AI"}`,
+      code: isQuota ? "QUOTA_EXHAUSTED" : (isUnavailable ? "SERVICE_UNAVAILABLE" : "AUDIT_FAILED"),
+      retryable: true
+    });
   }
 });
 
@@ -1940,7 +2052,10 @@ const SERVER_LOCAL_SPELL_RULES: Array<[RegExp, string, string]> = [
   [/\btoots\b/gi, 'tốt', "Sửa lỗi gõ Telex: 'tốt'"],
   [/\bmays\b/gi, 'máy', "Sửa lỗi gõ Telex: 'máy'"],
   [/\bcuar\b/gi, 'của', "Sửa lỗi gõ Telex: 'của'"],
-  [/\bchiecs\b/gi, 'chiếc', "Sửa lỗi gõ Telex: 'chiếc'"],
+  [/\bchiecs\b/gi, 'chiếc', "Sửa lỗi gõ Telex: 'chiếc'"]
+];
+
+const SERVER_SOUTHERN_DIALECT_RULES: Array<[RegExp, string, string]> = [
   [/\bnhé cả nhà\b/gi, 'nha cả nhà', "Chuẩn hóa Nam Bộ: 'nha cả nhà'"],
   [/\bnhé mọi người\b/gi, 'nha cả nhà', "Chuẩn hóa Nam Bộ: 'nha cả nhà'"],
   [/\bnhé\b/gi, 'nha', "Chuẩn hóa Nam Bộ: 'nha'"],
@@ -1968,32 +2083,45 @@ const COMPILED_SERVER_SPELL_RULES = SERVER_LOCAL_SPELL_RULES.map(([pat, rep, rea
   reason
 }));
 
-function applyServerSpellCorrections(text: string): string {
+const COMPILED_SERVER_DIALECT_RULES = SERVER_SOUTHERN_DIALECT_RULES.map(([pat, rep, reason]) => ({
+  pattern: toServerUnicodeBoundaryRegex(pat),
+  replacement: rep,
+  reason
+}));
+
+function applyServerSpellCorrections(text: string, adaptSouthern: boolean = false): string {
   let t = (text || "").trim();
-  for (const rule of COMPILED_SERVER_SPELL_RULES) {
-    rule.pattern.lastIndex = 0;
-    if (rule.pattern.test(t)) {
+  const applyRuleList = (rules: typeof COMPILED_SERVER_SPELL_RULES) => {
+    for (const rule of rules) {
       rule.pattern.lastIndex = 0;
-      t = t.replace(rule.pattern, (m, ...args) => {
-        let rep = rule.replacement;
-        if (typeof rep === 'string' && rep.includes('$1') && args[0] !== undefined) {
-          rep = rep.replace('$1', String(args[0]));
-        }
-        if (typeof rep === 'string' && rep.includes('$2') && args[1] !== undefined) {
-          rep = rep.replace('$2', String(args[1]));
-        }
-        return serverPreserveCase(m, rep);
-      });
-      rule.pattern.lastIndex = 0;
+      if (rule.pattern.test(t)) {
+        rule.pattern.lastIndex = 0;
+        t = t.replace(rule.pattern, (m, ...args) => {
+          let rep = rule.replacement;
+          if (typeof rep === 'string' && rep.includes('$1') && args[0] !== undefined) {
+            rep = rep.replace('$1', String(args[0]));
+          }
+          if (typeof rep === 'string' && rep.includes('$2') && args[1] !== undefined) {
+            rep = rep.replace('$2', String(args[1]));
+          }
+          return serverPreserveCase(m, rep);
+        });
+        rule.pattern.lastIndex = 0;
+      }
     }
+  };
+
+  applyRuleList(COMPILED_SERVER_SPELL_RULES);
+  if (adaptSouthern) {
+    applyRuleList(COMPILED_SERVER_DIALECT_RULES);
   }
   return t;
 }
 
 // Dedicated Fast AI Subtitle Spelling & Grammar Polisher Endpoint
-app.post("/api/fix-subtitles-spelling", async (req, res): Promise<any> => {
+app.post("/api/fix-subtitles-spelling", aiEndpointLimiter, async (req, res): Promise<any> => {
   try {
-    const { subtitles, productName = '', language = 'vi' } = req.body;
+    const { subtitles, productName = '', language = 'vi', adaptSouthern = false } = req.body;
 
     if (!Array.isArray(subtitles) || subtitles.length === 0) {
       return res.json({
@@ -2007,7 +2135,7 @@ app.post("/api/fix-subtitles-spelling", async (req, res): Promise<any> => {
     // Pre-clean subtitles with Unicode rules before feeding to Gemini model
     const preCleanedSubtitles = subtitles.map((s: any) => ({
       ...s,
-      text: applyServerSpellCorrections(s.text || "")
+      text: applyServerSpellCorrections(s.text || "", adaptSouthern)
     }));
 
     const ai = getGoogleAI();
@@ -2100,8 +2228,7 @@ HỆ THỐNG TIÊU CHUẨN CHÍNH TẢ & PHỤ ĐỀ BẮT BUỘC:
    - Sửa triệt để lỗi gõ dính phím Telex: dd -> đ, duwocj -> được, nhieeuf -> nhiều, toots -> tốt, mays -> máy, cuar -> của, chiecs -> chiếc...
    - Chuẩn hóa vị trí dấu thanh theo chuẩn quốc gia: hòa, hóa, hoàn, tỏa, toán, khỏe, thủy, thúy, hủy, quỳ, quý.
 
-2. 🗣️ ĐỒNG BỘ NGỮ ĐIỆU NAM BỘ REVIEW QUẢNG CÁO:
-   - Dùng ngữ điệu gần gũi, cuốn hút: "nha cả nhà", "nha mấy bạn", "thiệt sự", "thiệt là", "coi ngay", "coi thử", "nhìn vô", "bước vô", "cho vô", "bỏ vô", "muỗng", "chén", "trái cây", "tụi mình", "như vầy", "ngàn" (khi nói về giá tiền).
+2. 🗣️ ${adaptSouthern ? "ĐỒNG BỘ NGỮ ĐIỆU NAM BỘ REVIEW QUẢNG CÁO:\n   - Dùng ngữ điệu gần gũi, cuốn hút: \"nha cả nhà\", \"nha mấy bạn\", \"thiệt sự\", \"thiệt là\", \"coi ngay\", \"coi thử\", \"nhìn vô\", \"muỗng\", \"chén\", \"trái cây\", \"tụi mình\"." : "GIỮ NGUYÊN PHƯƠNG NGỮ VÀ PHONG CÁCH GỐC:\n   - Chỉ sửa lỗi chính tả, dấu thanh điệu và ngữ pháp; TUYỆT ĐỐI KHÔNG tự ý đổi từ ngữ phương ngữ (Bắc/Trung/Nam) của người dùng (ví dụ giữ nguyên 'nhé', 'bát', 'thìa', 'chúng mình' nếu không sai chính tả)."}
 
 3. 🎬 ĐỊNH DẠNG PHỤ ĐỀ CHUẨN TIKTOK/REELS:
    - Luôn viết hoa chữ cái đầu tiên của phân cảnh.
@@ -2161,16 +2288,17 @@ Trả về phản hồi JSON theo schema:
             }),
           1,
           500,
-          "gemini-3.8-flash",
+          PRIMARY_TEXT_VISION_MODEL,
           true
         ),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("AI_SUBTITLE_SPELL_TIMEOUT")), 3500))
+        new Promise((_, reject) => setTimeout(() => reject(new Error("AI_SUBTITLE_SPELL_TIMEOUT")), 12000))
       ]);
 
       result = JSON.parse(response.text || '{}');
       if (result && Array.isArray(result.fixedSubtitles)) {
+        result.usedLocalEngine = false;
         result.fixedSubtitles = result.fixedSubtitles.map((sub: any) => {
-          let txt = applyServerSpellCorrections(sub.text || "");
+          let txt = applyServerSpellCorrections(sub.text || "", adaptSouthern);
           txt = txt.replace(/[.,]+$/g, '').trim();
           if (txt.length > 0) {
             txt = txt.charAt(0).toUpperCase() + txt.slice(1);
@@ -2182,7 +2310,7 @@ Trả về phản hồi JSON theo schema:
         });
       }
     } catch (e: any) {
-      console.warn("[SUBTITLE-SPELL-FALLBACK] Running local algorithmic spell corrector:", e.message);
+      console.warn("[SUBTITLE-SPELL-LOCAL] AI unavailable, running local algorithmic spell corrector:", e.message);
 
       const fixedDetails: string[] = [];
       let count = 0;
@@ -2194,7 +2322,7 @@ Trả về phản hồi JSON theo schema:
           .trim();
         const originalTxt = txt;
 
-        txt = applyServerSpellCorrections(txt);
+        txt = applyServerSpellCorrections(txt, adaptSouthern);
 
         txt = txt.replace(/\s+([,.\?!;:\u2026])/g, '$1')
                  .replace(/([,;:])([^\s\d])/g, '$1 $2')
@@ -2220,12 +2348,13 @@ Trả về phản hồi JSON theo schema:
       });
 
       result = {
+        usedLocalEngine: true,
         fixedSubtitles: fallbackSubs,
         fixedCount: count,
-        fixedDetails: fixedDetails.length > 0 ? fixedDetails : ["Đã rà soát và xác nhận toàn bộ phụ đề đúng chuẩn chính tả 100%."],
+        fixedDetails: fixedDetails.length > 0 ? fixedDetails : ["Bộ quy tắc cục bộ không phát hiện thêm lỗi chính tả phổ biến nào."],
         summary: count > 0 
-          ? `Đã chuẩn hóa chính tả và dấu câu thành công cho ${count} phân cảnh phụ đề.`
-          : "Tất cả các phân cảnh phụ đề đều đã đạt chuẩn chính tả tiếng Việt 100%."
+          ? `AI chính tả tạm bận — bộ quy tắc cục bộ đã sửa ${count} phân cảnh phụ đề.`
+          : "AI chính tả tạm bận — bộ quy tắc cục bộ chưa phát hiện lỗi chính tả trong danh sách từ điển."
       };
     }
 
@@ -2236,17 +2365,175 @@ Trả về phản hồi JSON theo schema:
   }
 });
 
+// Multipart/form-data Disk Storage for TikTok Video Transcoding (zero RAM/Base64 bloat)
+const transcodeUploadDir = path.join(TRANSCODE_TMP_ROOT, "uploads");
+fs.mkdirSync(transcodeUploadDir, { recursive: true });
+
+const transcodeUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, transcodeUploadDir),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname || "").replace(/[^.a-zA-Z0-9]/g, "") || ".webm";
+      cb(null, `upload_${Date.now()}_${crypto.randomUUID()}${ext}`);
+    },
+  }),
+  limits: {
+    fileSize: 500 * 1024 * 1024, // 500MB max upload guard
+    files: 1,
+  },
+});
+
+function validateMagicFileHeaderOnDisk(filePath: string): boolean {
+  try {
+    const fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(16);
+    const bytesRead = fs.readSync(fd, buf, 0, 16, 0);
+    fs.closeSync(fd);
+    if (bytesRead < 8) return false;
+    const isWebm = buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3;
+    const isMp4 = buf.slice(4, 8).toString("ascii") === "ftyp";
+    const isMatroskaOrMov = isWebm || isMp4 || buf.slice(4, 8).toString("ascii") === "moov" || buf.slice(4, 8).toString("ascii") === "wide";
+    return isMatroskaOrMov;
+  } catch {
+    return false;
+  }
+}
+
+// Endpoint: Upload recorded WebM/MP4 via multipart streaming and start TikTok H.264/AAC MP4 transcode job
+app.post("/api/transcode/tiktok", (req, res) => {
+  transcodeUpload.single("video")(req, res, (uploadErr: any) => {
+    if (uploadErr) {
+      if (uploadErr.code === "LIMIT_FILE_SIZE") {
+        return res.status(413).json({
+          error: "Dung lượng video vượt quá giới hạn tối đa 500MB.",
+          code: "FILE_TOO_LARGE",
+        });
+      }
+      return res.status(400).json({
+        error: `Lỗi tải tệp lên bộ chuyển mã: ${uploadErr.message || "Upload thất bại"}`,
+        code: "UPLOAD_ERROR",
+      });
+    }
+
+    const uploadedFile = req.file;
+    if (!uploadedFile || !uploadedFile.path) {
+      return res.status(400).json({
+        error: "Không tìm thấy tệp video tải lên trong trường 'video'.",
+        code: "MISSING_VIDEO_FILE",
+      });
+    }
+
+    if (uploadedFile.size < 1024 || !validateMagicFileHeaderOnDisk(uploadedFile.path)) {
+      try { fs.unlinkSync(uploadedFile.path); } catch {}
+      return res.status(400).json({
+        error: "Tệp video tải lên không đúng định dạng WebM/MP4 hợp lệ hoặc bị rỗng.",
+        code: "INVALID_VIDEO_CONTAINER",
+      });
+    }
+
+    const caps = checkFfmpegCapabilities();
+    if (!caps.ffmpegAvailable || !caps.ffprobeAvailable || !caps.encoders.h264 || !caps.encoders.aac) {
+      try { fs.unlinkSync(uploadedFile.path); } catch {}
+      return res.status(503).json({
+        error: "Máy chủ chưa sẵn sàng bộ chuyển mã FFmpeg (libx264 / aac / ffprobe).",
+        code: "TRANSCODER_UNAVAILABLE",
+      });
+    }
+
+    const qualityTier = normalizeQualityTier(req.body?.qualityTier);
+    const baseFileName = typeof req.body?.baseFileName === "string" ? req.body.baseFileName : "tiktok_review";
+
+    const job = transcodeJobManager.createJob({
+      inputPath: uploadedFile.path,
+      qualityTier,
+      baseFileName,
+    });
+
+    return res.status(202).json(job);
+  });
+});
+
+// Endpoint: Poll TikTok transcoding + FFprobe validation progress
+app.get("/api/transcode/status/:jobId", (req, res) => {
+  const job = transcodeJobManager.getJobStatus(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: "Không tìm thấy tiến trình chuyển mã hoặc tệp đã hết hạn.", code: "JOB_NOT_FOUND" });
+  }
+  return res.json(job);
+});
+
+// Endpoint: Download verified MP4 output ONLY after completion + FFprobe + full decode check pass (Range-enabled for Android)
+app.get("/api/transcode/download/:jobId", (req, res) => {
+  const job = transcodeJobManager.getJobStatus(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: "Không tìm thấy tệp MP4 hoặc liên kết đã hết hạn.", code: "JOB_NOT_FOUND" });
+  }
+  if (job.status !== "completed" || !job.validation?.valid) {
+    return res.status(409).json({
+      error: "Video vẫn đang xử lý hoặc chưa vượt qua kiểm định TikTok MP4.",
+      code: "TRANSCODE_NOT_READY",
+      status: job.status,
+    });
+  }
+
+  const fileInfo = transcodeJobManager.getDownloadableFile(req.params.jobId);
+  if (!fileInfo) {
+    return res.status(404).json({ error: "Tệp MP4 không còn tồn tại trên đĩa tạm.", code: "FILE_EXPIRED" });
+  }
+
+  const total = fileInfo.sizeBytes;
+  const safeFileName = fileInfo.fileName.replace(/["\\/\r\n]/g, "_");
+  const range = req.headers.range;
+
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Content-Disposition", `attachment; filename="${safeFileName}"`);
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Cache-Control", "no-store");
+
+  if (range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!match) {
+      res.setHeader("Content-Range", `bytes */${total}`);
+      return res.status(416).end();
+    }
+    const start = match[1] ? parseInt(match[1], 10) : 0;
+    const end = match[2] ? Math.min(parseInt(match[2], 10), total - 1) : total - 1;
+    if (isNaN(start) || isNaN(end) || start > end || start >= total) {
+      res.setHeader("Content-Range", `bytes */${total}`);
+      return res.status(416).end();
+    }
+    res.status(206);
+    res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+    res.setHeader("Content-Length", String(end - start + 1));
+    fs.createReadStream(fileInfo.outputPath, { start, end }).pipe(res);
+  } else {
+    res.status(200);
+    res.setHeader("Content-Length", String(total));
+    fs.createReadStream(fileInfo.outputPath).pipe(res);
+  }
+});
+
+// Endpoint: Cancel/Clean up transcoding temp job
+app.delete("/api/transcode/job/:jobId", (req, res) => {
+  const deleted = transcodeJobManager.deleteJob(req.params.jobId);
+  return res.json({ deleted });
+});
+
 // System Status & Health Check for Production-Grade Verification
 app.get("/api/system-status", generalEndpointLimiter, async (req, res) => {
   const probe = await probeGeminiHealth(req.query.force === 'true');
+  const mediaCapabilities = checkFfmpegCapabilities();
 
   res.json({
     status: "ok",
     version: "2026.4.0-production-grade",
     engine: "AI-Video-Review Production Engine",
-    geminiStatus: probe.geminiStatus, // CONNECTED | DEGRADED | UNAVAILABLE | MISCONFIGURED
-    defaultModel: probe.model,
-    ttsModel: probe.ttsModel,
+    geminiStatus: probe.geminiStatus, // CONNECTED | DEGRADED | UNAVAILABLE | QUOTA_EXCEEDED | MISCONFIGURED
+    services: probe.services,
+    mediaCapabilities,
+    defaultModel: PRIMARY_TEXT_VISION_MODEL,
+    ttsModel: PRIMARY_TTS_MODEL,
     latencyMs: probe.latencyMs,
     testedAt: probe.testedAt,
     message: probe.message

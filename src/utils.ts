@@ -730,40 +730,46 @@ const VIETNAMESE_SPELL_RULES: Array<{ pattern: RegExp; replacement: string | ((m
   { pattern: /\bquỳ\b/gi, replacement: 'quỳ', reason: "Chuẩn hóa vị trí dấu thanh: 'quỳ'" },
   { pattern: /\bquý\b/gi, replacement: 'quý', reason: "Chuẩn hóa vị trí dấu thanh: 'quý'" },
 
-  // 7. Southern Vietnamese Dialect Normalization (Đồng bộ tuyệt đối ngữ điệu Nam Bộ / Sài Gòn ngọt ngào)
-  { pattern: /\bnhé cả nhà\b/gi, replacement: 'nha cả nhà', reason: "Chuẩn hóa Nam Bộ: 'nha cả nhà'" },
-  { pattern: /\bnhé mọi người\b/gi, replacement: 'nha cả nhà', reason: "Chuẩn hóa Nam Bộ: 'nha cả nhà'" },
-  { pattern: /\bnhé các bạn\b/gi, replacement: 'nha mấy bạn', reason: "Chuẩn hóa Nam Bộ: 'nha mấy bạn'" },
-  { pattern: /\bnhé bạn\b/gi, replacement: 'nha bạn', reason: "Chuẩn hóa Nam Bộ: 'nha bạn'" },
-  { pattern: /\bnhé\b/gi, replacement: 'nha', reason: "Chuẩn hóa Nam Bộ: 'nha'" },
-  { pattern: /\bnhá\b/gi, replacement: 'nha', reason: "Chuẩn hóa Nam Bộ: 'nha'" },
-  { pattern: /\bnhỉ\b/gi, replacement: 'nha', reason: "Chuẩn hóa Nam Bộ: 'nha'" },
-  { pattern: /\bthật sự\b/gi, replacement: 'thiệt sự', reason: "Chuẩn hóa Nam Bộ: 'thiệt sự'" },
-  { pattern: /\bthật là\b/gi, replacement: 'thiệt là', reason: "Chuẩn hóa Nam Bộ: 'thiệt là'" },
-  { pattern: /\bthật ra\b/gi, replacement: 'thiệt ra', reason: "Chuẩn hóa Nam Bộ: 'thiệt ra'" },
-  { pattern: /\bthật luôn\b/gi, replacement: 'thiệt luôn', reason: "Chuẩn hóa Nam Bộ: 'thiệt luôn'" },
-  { pattern: /\bthật đấy\b/gi, replacement: 'thiệt đó', reason: "Chuẩn hóa Nam Bộ: 'thiệt đó'" },
-  { pattern: /\bxem thử\b/gi, replacement: 'coi thử', reason: "Chuẩn hóa Nam Bộ: 'coi thử'" },
-  { pattern: /\bxem ngay\b/gi, replacement: 'coi ngay', reason: "Chuẩn hóa Nam Bộ: 'coi ngay'" },
-  { pattern: /\bxem kỹ\b/gi, replacement: 'coi kỹ', reason: "Chuẩn hóa Nam Bộ: 'coi kỹ'" },
-  { pattern: /\bnhìn vào\b/gi, replacement: 'nhìn vô', reason: "Chuẩn hóa Nam Bộ: 'nhìn vô'" },
-  { pattern: /\bbước vào\b/gi, replacement: 'bước vô', reason: "Chuẩn hóa Nam Bộ: 'bước vô'" },
-  { pattern: /\bcho vào\b/gi, replacement: 'cho vô', reason: "Chuẩn hóa Nam Bộ: 'cho vô'" },
-  { pattern: /\bbỏ vào\b/gi, replacement: 'bỏ vô', reason: "Chuẩn hóa Nam Bộ: 'bỏ vô'" },
-  { pattern: /\bcất vào\b/gi, replacement: 'cất vô', reason: "Chuẩn hóa Nam Bộ: 'cất vô'" },
-  { pattern: /\bthìa\b/gi, replacement: 'muỗng', reason: "Chuẩn hóa Nam Bộ: 'muỗng'" },
-  { pattern: /\bbát ăn\b/gi, replacement: 'chén ăn', reason: "Chuẩn hóa Nam Bộ: 'chén ăn'" },
-  { pattern: /\bhoa quả\b/gi, replacement: 'trái cây', reason: "Chuẩn hóa Nam Bộ: 'trái cây'" },
-  { pattern: /\bchúng mình\b/gi, replacement: 'tụi mình', reason: "Chuẩn hóa Nam Bộ: 'tụi mình'" },
-  { pattern: /\bchúng tôi\b/gi, replacement: 'tụi mình', reason: "Chuẩn hóa Nam Bộ: 'tụi mình'" },
-  { pattern: /\bthế này nè\b/gi, replacement: 'như vầy nè', reason: "Chuẩn hóa Nam Bộ: 'như vầy nè'" },
-  { pattern: /\bthế này\b/gi, replacement: 'như vầy', reason: "Chuẩn hóa Nam Bộ: 'như vầy'" },
-  { pattern: /(\d+)\s*nghìn\b/gi, replacement: '$1 ngàn', reason: "Chuẩn hóa tiền tệ Nam Bộ: 'ngàn'" },
-
-  // 8. Punctuation spacing & typography formatting
+  // 7. Punctuation spacing & typography formatting
   { pattern: /\s+([,.\?!;:\u2026])/g, replacement: '$1', reason: "Loại bỏ khoảng trắng trước dấu câu" },
   { pattern: /([,;:])([^\s\d])/g, replacement: '$1 $2', reason: "Thêm khoảng trắng sau dấu câu" },
   { pattern: /\.{3,}/g, replacement: '…', reason: "Chuẩn hóa dấu ba chấm thành '…'" }
+];
+
+// 8. Optional Southern Vietnamese Dialect Rules (Only applied when requested by voice or user setting)
+const SOUTHERN_DIALECT_RULES: Array<{ pattern: RegExp; replacement: string | ((match: string, ...args: any[]) => string); reason: string }> = [
+  { pattern: /\bnhé cả nhà\b/gi, replacement: 'nha cả nhà', reason: "Phương ngữ Nam Bộ: 'nha cả nhà'" },
+  { pattern: /\bnhé mọi người\b/gi, replacement: 'nha cả nhà', reason: "Phương ngữ Nam Bộ: 'nha cả nhà'" },
+  { pattern: /\bnhé các bạn\b/gi, replacement: 'nha mấy bạn', reason: "Phương ngữ Nam Bộ: 'nha mấy bạn'" },
+  { pattern: /\bnhé bạn\b/gi, replacement: 'nha bạn', reason: "Phương ngữ Nam Bộ: 'nha bạn'" },
+  { pattern: /\bnhé\b/gi, replacement: 'nha', reason: "Phương ngữ Nam Bộ: 'nha'" },
+  { pattern: /\bnhá\b/gi, replacement: 'nha', reason: "Phương ngữ Nam Bộ: 'nha'" },
+  { pattern: /\bnhỉ\b/gi, replacement: 'nha', reason: "Phương ngữ Nam Bộ: 'nha'" },
+  { pattern: /\bthật sự\b/gi, replacement: 'thiệt sự', reason: "Phương ngữ Nam Bộ: 'thiệt sự'" },
+  { pattern: /\bthật là\b/gi, replacement: 'thiệt là', reason: "Phương ngữ Nam Bộ: 'thiệt là'" },
+  { pattern: /\bthật ra\b/gi, replacement: 'thiệt ra', reason: "Phương ngữ Nam Bộ: 'thiệt ra'" },
+  { pattern: /\bthật luôn\b/gi, replacement: 'thiệt luôn', reason: "Phương ngữ Nam Bộ: 'thiệt luôn'" },
+  { pattern: /\bthật đấy\b/gi, replacement: 'thiệt đó', reason: "Phương ngữ Nam Bộ: 'thiệt đó'" },
+  { pattern: /\bxem thử\b/gi, replacement: 'coi thử', reason: "Phương ngữ Nam Bộ: 'coi thử'" },
+  { pattern: /\bxem ngay\b/gi, replacement: 'coi ngay', reason: "Phương ngữ Nam Bộ: 'coi ngay'" },
+  { pattern: /\bxem kỹ\b/gi, replacement: 'coi kỹ', reason: "Phương ngữ Nam Bộ: 'coi kỹ'" },
+  { pattern: /\bnhìn vào\b/gi, replacement: 'nhìn vô', reason: "Phương ngữ Nam Bộ: 'nhìn vô'" },
+  { pattern: /\bbước vào\b/gi, replacement: 'bước vô', reason: "Phương ngữ Nam Bộ: 'bước vô'" },
+  { pattern: /\bcho vào\b/gi, replacement: 'cho vô', reason: "Phương ngữ Nam Bộ: 'cho vô'" },
+  { pattern: /\bbỏ vào\b/gi, replacement: 'bỏ vô', reason: "Phương ngữ Nam Bộ: 'bỏ vô'" },
+  { pattern: /\bcất vào\b/gi, replacement: 'cất vô', reason: "Phương ngữ Nam Bộ: 'cất vô'" },
+  { pattern: /\bvâng ạ\b/gi, replacement: 'dạ', reason: "Phương ngữ Nam Bộ: 'dạ'" },
+  { pattern: /\bvâng\b/gi, replacement: 'dạ', reason: "Phương ngữ Nam Bộ: 'dạ'" },
+  { pattern: /\bthìa\b/gi, replacement: 'muỗng', reason: "Phương ngữ Nam Bộ: 'muỗng'" },
+  { pattern: /\bbát ăn\b/gi, replacement: 'chén ăn', reason: "Phương ngữ Nam Bộ: 'chén ăn'" },
+  { pattern: /\bbát đũa\b/gi, replacement: 'chén đũa', reason: "Phương ngữ Nam Bộ: 'chén đũa'" },
+  { pattern: /\bbát\b/gi, replacement: 'chén', reason: "Phương ngữ Nam Bộ: 'chén'" },
+  { pattern: /\bhoa quả\b/gi, replacement: 'trái cây', reason: "Phương ngữ Nam Bộ: 'trái cây'" },
+  { pattern: /\bchúng mình\b/gi, replacement: 'tụi mình', reason: "Phương ngữ Nam Bộ: 'tụi mình'" },
+  { pattern: /\bchúng tôi\b/gi, replacement: 'tụi mình', reason: "Phương ngữ Nam Bộ: 'tụi mình'" },
+  { pattern: /\bthế này nè\b/gi, replacement: 'như vầy nè', reason: "Phương ngữ Nam Bộ: 'như vầy nè'" },
+  { pattern: /\bthế này\b/gi, replacement: 'như vầy', reason: "Phương ngữ Nam Bộ: 'như vầy'" },
+  { pattern: /(\d+)\s*nghìn\b/gi, replacement: '$1 ngàn', reason: "Phương ngữ Nam Bộ: 'ngàn'" }
 ];
 
 /**
@@ -795,18 +801,33 @@ const COMPILED_VIETNAMESE_SPELL_RULES = VIETNAMESE_SPELL_RULES.map(rule => ({
   reason: rule.reason
 }));
 
+const COMPILED_SOUTHERN_DIALECT_RULES = SOUTHERN_DIALECT_RULES.map(rule => ({
+  pattern: toUnicodeBoundaryRegex(rule.pattern),
+  replacement: rule.replacement,
+  reason: rule.reason
+}));
+
+export interface SpellingCorrectionOptions {
+  adaptSouthernDialect?: boolean;
+}
+
 /**
  * Intelligent Vietnamese Spell & Grammar Corrector
  * Fixes spelling, accents, typos, and typography while preserving capitalization structure.
+ * Dialect adaptation is independent and only activated when adaptSouthernDialect is enabled.
  */
-export function correctVietnameseSpelling(text: string): { correctedText: string; fixes: SpellingCorrection[] } {
+export function correctVietnameseSpelling(text: string, options?: SpellingCorrectionOptions): { correctedText: string; fixes: SpellingCorrection[] } {
   if (!text) return { correctedText: "", fixes: [] };
 
   // Normalize to standard NFC Unicode to prevent any decomposed character font issues
   let corrected = text.normalize('NFC');
   const fixes: SpellingCorrection[] = [];
 
-  for (const rule of COMPILED_VIETNAMESE_SPELL_RULES) {
+  const activeRules = options?.adaptSouthernDialect
+    ? [...COMPILED_VIETNAMESE_SPELL_RULES, ...COMPILED_SOUTHERN_DIALECT_RULES]
+    : COMPILED_VIETNAMESE_SPELL_RULES;
+
+  for (const rule of activeRules) {
     rule.pattern.lastIndex = 0;
     if (rule.pattern.test(corrected)) {
       rule.pattern.lastIndex = 0;
@@ -856,7 +877,10 @@ export function correctVietnameseSpelling(text: string): { correctedText: string
 /**
  * Audit and Fix Subtitle Segments with full timing preservation and intelligent phrase boundary polishing
  */
-export function auditAndFixSubtitlesSpelling(subtitles: Array<{ text: string; start: number; end: number; translation?: string }>): {
+export function auditAndFixSubtitlesSpelling(
+  subtitles: Array<{ text: string; start: number; end: number; translation?: string }>,
+  options?: SpellingCorrectionOptions
+): {
   fixedSubtitles: Array<{ text: string; start: number; end: number; translation?: string }>;
   fixCount: number;
   fixedItems: Array<{ index: number; before: string; after: string; reason: string }>;
@@ -876,7 +900,7 @@ export function auditAndFixSubtitlesSpelling(subtitles: Array<{ text: string; st
       .replace(/^(Subtitle|Lời thoại|KOL|MC|Voiceover|Host|Phân cảnh \d+|Scene \d+):\s*/gi, '')
       .trim();
 
-    const result = correctVietnameseSpelling(clean);
+    const result = correctVietnameseSpelling(clean, options);
     let finalText = result.correctedText;
 
     // Remove dangling trailing period or comma in short subtitle frames (TikTok/Reels subtitle standard)

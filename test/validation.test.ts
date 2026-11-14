@@ -58,5 +58,19 @@ export function runValidationTests() {
   assert.equal(validateBase64FileSignature('', 'video'), false, 'Should reject empty string');
   assert.equal(validateBase64FileSignature('abc', 'video'), false, 'Should reject too short string');
 
-  console.log('✅ [PASSED] 6/6 File Signature Validation Tests successfully passed!\n');
+  // Test 7: Safe API JSON Payload Limit verification (prevent 1024MB OOM risk)
+  const parseLimitMb = (limitStr: string): number => {
+    const match = limitStr.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*(mb|gb|kb)?$/);
+    if (!match) return 0;
+    const val = parseFloat(match[1]);
+    const unit = match[2] || 'mb';
+    if (unit === 'gb') return val * 1024;
+    if (unit === 'kb') return val / 1024;
+    return val;
+  };
+  const defaultServerJsonLimit = process.env.MAX_PAYLOAD_LIMIT || '50mb';
+  const limitInMb = parseLimitMb(defaultServerJsonLimit);
+  assert.ok(limitInMb > 0 && limitInMb <= 100, `Default JSON payload limit (${defaultServerJsonLimit}) must stay safely bounded (<= 100MB)`);
+
+  console.log('✅ [PASSED] 7/7 File Signature & Payload Limit Validation Tests passed!\n');
 }

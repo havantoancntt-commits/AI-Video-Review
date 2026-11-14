@@ -77,7 +77,7 @@ import {
   Activity,
   AlertTriangle
 } from 'lucide-react';
-import { ReviewReport, TTS_VOICES, TTSVoiceOption, SavedReview, TrendingProduct, UploadedVideoSegment, SubtitleFontId, SUBTITLE_FONTS } from './types';
+import { ReviewReport, TTS_VOICES, TTSVoiceOption, SavedReview, TrendingProduct, SuggestedProductResult, SystemStatusResponse, UploadedVideoSegment, SubtitleFontId, SUBTITLE_FONTS, ExportQualityTier, TikTokValidationReport } from './types';
 import { 
   detectSilenceAndAlignSubtitles, 
   SilenceDetectionResult, 
@@ -98,7 +98,21 @@ import {
   auditAndFixSubtitlesSpelling,
   wrapSubtitleIntoLines
 } from './utils';
-import ysFixWebmDuration from 'fix-webm-duration';
+import {
+  selectOptimalRecorderCodec,
+  getTikTokExportBitrateBps,
+  computeTikTokCanvasDimensions,
+  uploadAndTranscodeToTikTokMp4,
+  EXPORT_QUALITY_META
+} from './tiktokExportEngine';
+import {
+  SAIGON_VOICE_POLICY,
+  SAIGON_TTS_MODELS,
+  TtsAudioProvenance,
+  buildTtsCacheKey,
+  isCacheKeyValidForPolicy,
+  computeDeterministicScriptHash
+} from './saigonVoicePolicy';
 
 async function safeParseJSON(response: Response, defaultError: string): Promise<any> {
   const text = await response.text();
@@ -154,7 +168,7 @@ interface SubtitleSegment {
   sentenceIndex?: number;
 }
 
-export function cleanScriptForSpeech(scriptText: string): string {
+export function cleanScriptForSpeech(scriptText: string, options?: { adaptSouthernDialect?: boolean }): string {
   if (!scriptText) return "";
   let clean = scriptText
     .normalize('NFC')
@@ -317,11 +331,13 @@ export function cleanScriptForSpeech(scriptText: string): string {
     [/\bbốc thăm\b/gi, 'bốc thăm']
   ];
 
-  for (const [pattern, replacement] of northToSouthList) {
-    clean = clean.replace(pattern, replacement);
+  if (options?.adaptSouthernDialect) {
+    for (const [pattern, replacement] of northToSouthList) {
+      clean = clean.replace(pattern, replacement);
+    }
   }
 
-  const spellAudit = correctVietnameseSpelling(clean.replace(/\s+/g, ' ').trim());
+  const spellAudit = correctVietnameseSpelling(clean.replace(/\s+/g, ' ').trim(), options);
   return spellAudit.correctedText;
 }
 
@@ -754,9 +770,9 @@ export default function App() {
   // Core Active States
   const [activeReview, setActiveReview] = useState<ReviewReport | null>(null);
   const [customPrompt, setCustomPrompt] = useState<string>('');
-  const [selectedVoice, setSelectedVoice] = useState<string>('Kore');
+  const [selectedVoice, setSelectedVoice] = useState<string>(SAIGON_VOICE_POLICY.DEFAULT_VOICE);
   const [voiceGenderFilter, setVoiceGenderFilter] = useState<'female' | 'male'>('female');
-  const [ttsMode, setTtsMode] = useState<'cloud' | 'native'>('cloud');
+  const ttsMode: 'cloud' = 'cloud';
 
   // Synchronize gender filter tab automatically with selectedVoice configuration
   useEffect(() => {
@@ -778,13 +794,23 @@ export default function App() {
   // Theme state: dark or light
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
 
-  // Server & Gemini Engine Status
-  const [systemStatus, setSystemStatus] = useState<{
-    geminiStatus: string;
-    defaultModel: string;
-    ttsModel: string;
-    message: string;
-  } | null>(null);
+  // Server & Gemini Engine Status + Locked Southern Saigon Policy States
+  const [systemStatus, setSystemStatus] = useState<SystemStatusResponse | null>(null);
+  const [activeAudioProvenance, setActiveAudioProvenance] = useState<TtsAudioProvenance | null>(null);
+  const [previewVoiceId, setPreviewVoiceId] = useState<string | null>(null);
+  const [previewLoadingId, setPreviewLoadingId] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewResults, setPreviewResults] = useState<Record<string, {
+    audioUrl: string;
+    samplePublicUrl?: string;
+    durationSec?: number;
+    rmsDb?: number;
+    provenance?: TtsAudioProvenance;
+  }>>({});
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [saigonAuditLoading, setSaigonAuditLoading] = useState<boolean>(false);
+  const [saigonAuditResult, setSaigonAuditResult] = useState<any | null>(null);
+  const [saigonAuditError, setSaigonAuditError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch('/api/system-status')
@@ -821,6 +847,8 @@ export default function App() {
   const [colorPreset, setColorPreset] = useState<string>('original');
   const [reviewType, setReviewType] = useState<'normal' | 'product'>('product');
   const [reviewLanguage, setReviewLanguage] = useState<'vi' | 'en'>('vi');
+  // Strictly lock Southern Saigon dialect adaptation for ALL Vietnamese processing (never allow Northern fallback)
+  const adaptSouthernDialect = reviewLanguage !== 'en';
 
   const handleLanguageChange = (lang: 'vi' | 'en') => {
     setReviewLanguage(lang);
@@ -864,10 +892,10 @@ export default function App() {
   const [isRefreshingHooks, setIsRefreshingHooks] = useState<boolean>(false);
   const [resultSubTab, setResultSubTab] = useState<'review' | 'video-analysis'>('review');
 
-  // WORLD-CLASS PRO STUDIO SUITE STATES
+  // WORLD-CLASS PRO STUDIO SUITE STATES (TikTok Export Engine: 1080x1920 @ 30fps CFR, 8/10/12 Mbps)
   const [exportResolution, setExportResolution] = useState<'4k' | '1080p' | '720p'>('1080p');
-  const [exportFps, setExportFps] = useState<60 | 30>(60);
-  const [exportBitratePreset, setExportBitratePreset] = useState<'master' | 'high' | 'standard'>('high');
+  const [exportFps, setExportFps] = useState<60 | 30>(30);
+  const [exportBitratePreset, setExportBitratePreset] = useState<ExportQualityTier>('high');
   const [autoSFXOnHook, setAutoSFXOnHook] = useState<boolean>(true);
   const [isKeyboardHelpOpen, setIsKeyboardHelpOpen] = useState<boolean>(false);
   const [isSFXModalOpen, setIsSFXModalOpen] = useState<boolean>(false);
@@ -1192,7 +1220,8 @@ export default function App() {
           subtitleSegments: subsToFix,
           videoDuration: videoDuration,
           language: reviewLanguage,
-          productName: activeReview?.productName || productName || ''
+          productName: activeReview?.productName || productName || '',
+          adaptSouthern: adaptSouthernDialect
         })
       });
 
@@ -1252,7 +1281,8 @@ export default function App() {
         body: JSON.stringify({
           subtitles: currentSubs,
           productName: activeReview?.productName || productName || '',
-          language: reviewLanguage
+          language: reviewLanguage,
+          adaptSouthern: adaptSouthernDialect
         })
       });
 
@@ -1266,14 +1296,14 @@ export default function App() {
         playSynthesizedSFX('chime', 0.9);
         setSubtitleSpellToast({
           show: true,
-          title: "✨ AI Chuẩn Hóa Chính Tả & Dấu Câu Thành Công",
-          message: data.summary || `Đã tối ưu chính xác 100% ngữ pháp & dấu câu cho ${data.fixedSubtitles.length} phân cảnh.`,
+          title: data.usedLocalEngine ? "⚡ Chuẩn Hóa Chính Tả Tiếng Việt (Cục Bộ)" : "✨ AI Chuẩn Hóa Chính Tả & Dấu Câu Thành Công",
+          message: data.summary || `Đã rà soát chính tả & dấu câu cho ${data.fixedSubtitles.length} phân cảnh.`,
           fixes: data.fixedDetails || []
         });
       }
     } catch (err: any) {
       console.warn("Dùng bộ quy chuẩn chính tả tiếng Việt nội bộ:", err.message);
-      const localResult = auditAndFixSubtitlesSpelling(currentSubs);
+      const localResult = auditAndFixSubtitlesSpelling(currentSubs, { adaptSouthernDialect });
       setCustomSubtitleSegments(localResult.fixedSubtitles);
       playSynthesizedSFX('chime', 0.8);
       setSubtitleSpellToast({
@@ -1602,6 +1632,7 @@ export default function App() {
   const [isScanningTrends, setIsScanningTrends] = useState<boolean>(false);
   const [scannedCategory, setScannedCategory] = useState<string>('all');
   const [scannedProducts, setScannedProducts] = useState<TrendingProduct[]>([]);
+  const [trendsError, setTrendsError] = useState<string | null>(null);
   
   // Custom Product Inputs
   const [productName, setProductName] = useState<string>('');
@@ -1631,6 +1662,7 @@ export default function App() {
   // Execution states
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
   const [isIdentifying, setIsIdentifying] = useState<boolean>(false);
+  const [recognitionResult, setRecognitionResult] = useState<SuggestedProductResult | null>(null);
   const [suggestedKeywords, setSuggestedKeywords] = useState<string[]>([]);
   const [isGeneratingTTS, setIsGeneratingTTS] = useState<boolean>(false);
   const [apiError, setApiError] = useState<string | null>(null);
@@ -1674,14 +1706,56 @@ export default function App() {
     };
   }, [isAnalyzing, extractionProgress]);
   
-  // Audio & Video Playback Engine
+  // Audio & Video Playback Engine (Strictly Google Cloud Saigon TTS — Zero OS/Android SpeechSynthesis fallback)
   const [audioUrl, setAudioUrl] = useState<string>('');
-  const [isClientTTSActive, setIsClientTTSActive] = useState<boolean>(false);
-  const [clientTTSScript, setClientTTSScript] = useState<string>('');
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [ttsCountdownSec, setTtsCountdownSec] = useState<number>(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const ttsClientCache = useRef<Record<string, { url: string; useClientTTS: boolean; audioBase64?: string }>>({});
+  const ttsClientCache = useRef<Record<string, { url: string; audioBase64: string; provenance: TtsAudioProvenance }>>({});
+
+  // Purge any legacy client storage TTS cache keys on startup to enforce versioned Saigon voice provenance
+  useEffect(() => {
+    try {
+      const keysToDelete: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && (key.startsWith('v19_tts') || key.includes('tts_cache'))) {
+          keysToDelete.push(key);
+        }
+      }
+      keysToDelete.forEach((k) => localStorage.removeItem(k));
+    } catch {
+      // Ignore storage access errors in restricted sandbox iframes
+    }
+  }, []);
+
+  // Automatically invalidate stale/mismatched audio whenever user switches voice or language
+  useEffect(() => {
+    if (reviewLanguage === 'vi') {
+      const validViVoice = TTS_VOICES.find((v) => v.id === selectedVoice && (v.language || 'vi') === 'vi');
+      if (!validViVoice) {
+        setSelectedVoice(SAIGON_VOICE_POLICY.DEFAULT_VOICE);
+        return;
+      }
+    }
+    const expectedLang = reviewLanguage === 'en' ? 'en-US' : SAIGON_VOICE_POLICY.VIETNAMESE_LANGUAGE;
+    if (
+      activeAudioProvenance &&
+      (activeAudioProvenance.voiceId !== selectedVoice ||
+        activeAudioProvenance.language !== expectedLang ||
+        activeAudioProvenance.voiceConfigVersion !== SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION)
+    ) {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.currentTime = 0;
+      }
+      setIsPlaying(false);
+      setAudioUrl('');
+      setActiveAudioProvenance(null);
+    }
+    setSaigonAuditResult(null);
+    setSaigonAuditError(null);
+  }, [selectedVoice, reviewLanguage, activeAudioProvenance]);
 
   // Countdown timer for Google AI Studio rate limit queue
   useEffect(() => {
@@ -1825,14 +1899,22 @@ export default function App() {
   // Merge & export video states
   const [isMerging, setIsMerging] = useState<boolean>(false);
   const [mergeProgress, setMergeProgress] = useState<number>(0);
+  const [exportStageLabel, setExportStageLabel] = useState<string>('');
   const [mergedVideoUrl, setMergedVideoUrl] = useState<string>('');
   const [mergedVideoExt, setMergedVideoExt] = useState<string>('mp4');
+  const [tiktokValidation, setTiktokValidation] = useState<TikTokValidationReport | null>(null);
   const isExportCancelledRef = useRef<boolean>(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const exportAbortControllerRef = useRef<AbortController | null>(null);
 
   const cancelVideoExport = () => {
     if (!isMerging) return;
     isExportCancelledRef.current = true;
+    if (exportAbortControllerRef.current) {
+      try {
+        exportAbortControllerRef.current.abort();
+      } catch (e) {}
+    }
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try {
         mediaRecorderRef.current.stop();
@@ -1840,6 +1922,7 @@ export default function App() {
     }
     setIsMerging(false);
     setMergeProgress(0);
+    setExportStageLabel('');
     setApiError("Đã hủy quá trình xuất video theo yêu cầu của bạn.");
   };
 
@@ -1934,12 +2017,9 @@ export default function App() {
       updateEq();
     } else {
       setEqHeights([12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12]);
-      if (isClientTTSActive) {
-        stopClientTTS();
-      }
     }
     return () => clearTimeout(animationFrame);
-  }, [isPlaying, isClientTTSActive]);
+  }, [isPlaying]);
 
   // Sync custom speed parameter across players
   useEffect(() => {
@@ -2753,13 +2833,14 @@ export default function App() {
 
   // Run Gemini-powered quick product suggestion & auto-fill recognition
   const executeQuickRecognition = async () => {
-    if (!uploadedFile && !productImageBase64) {
+    if (!uploadedFile && !productImageBase64 && productImages.length === 0) {
       setApiError('Vui lòng tải lên ít nhất 1 video sản phẩm hoặc 1 tấm ảnh của sản phẩm để bắt đầu nhận diện!');
       return;
     }
 
     setIsIdentifying(true);
     setApiError(null);
+    setRecognitionResult(null);
     setSuggestedKeywords([]);
 
     try {
@@ -2810,7 +2891,8 @@ export default function App() {
         throw new Error(errorData.error || 'Máy chủ bận hoặc gặp lỗi khi nhận dạng sản phẩm.');
       }
 
-      const data = await response.json();
+      const data: SuggestedProductResult = await response.json();
+      setRecognitionResult(data);
       if (data.productName) {
         setProductName(data.productName);
       }
@@ -2842,16 +2924,17 @@ export default function App() {
 
     } catch (err: any) {
       console.error(err);
-      setApiError(err.message || 'Hệ thống tự động nhận dạng đang bận. Vui lòng thiết lập khóa GEMINI_API_KEY ở mục Settings > Secrets.');
+      setApiError(err.message || 'Không thể nhận diện sản phẩm qua AI Vision. Vui lòng kiểm tra GEMINI_API_KEY hoặc thử lại.');
     } finally {
       setIsIdentifying(false);
       setExtractionProgress(null);
     }
   };
 
-  // Scan trending market products on e-commerce platforms (TikTok, Shopee, Reels)
+  // Scan trending market products (AI market hypotheses with full transparency)
   const scanTrendingProducts = async (cat: string) => {
     setIsScanningTrends(true);
+    setTrendsError(null);
     setApiError(null);
     setScannedCategory(cat);
     try {
@@ -2864,8 +2947,8 @@ export default function App() {
       });
 
       if (!response.ok) {
-        const errorData = await safeParseJSON(response, 'Không thể tải dữ liệu xu hướng sản phẩm.');
-        throw new Error(errorData.error || 'Cơ sở dữ liệu xu hướng đang bận.');
+        const errorData = await safeParseJSON(response, 'Không thể tải dữ liệu gợi ý xu hướng.');
+        throw new Error(errorData.error || 'Dịch vụ AI xu hướng tạm thời gián đoạn.');
       }
 
       const data = await response.json();
@@ -2876,13 +2959,14 @@ export default function App() {
       }
     } catch (err: any) {
       console.error(err);
-      setApiError(err.message || 'Không thể quét danh sách sản phẩm hot trend. Vui lòng kiểm tra lại cấu hình API.');
+      setScannedProducts([]);
+      setTrendsError(err.message || 'Không thể quét danh sách xu hướng thị trường. Vui lòng thử lại.');
     } finally {
       setIsScanningTrends(false);
     }
   };
 
-  // Run Google AI Studio TTS Synthesis
+  // Run Google AI Studio Saigon Voiceover Synthesis (STRICT_SOUTHERN_ONLY for Vietnamese)
   const generateVoiceover = async () => {
     if (!activeReview || !activeReview.marketingScript) {
       setApiError('Không có kịch bản quảng cáo phù hợp để thực hiện lồng tiếng.');
@@ -2899,17 +2983,40 @@ export default function App() {
     setApiError(null);
     setIsPlaying(false);
 
-    // Dynamic Client-side Caching: instantly serve matching voice script configurations from Google AI Studio
-    const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
-    const cacheKey = `v18_permanent_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
-    const cached = ttsClientCache.current[cacheKey];
-    if (cached && cached.audioBase64) {
-      console.info("[CLIENT-CACHE-HIT] Khởi chạy tức thì từ bộ nhớ đệm kịch bản Google AI Studio:", cacheKey);
-      setAudioUrl(cached.url);
-      setIsClientTTSActive(false);
-      setClientTTSScript('');
+    const isEn = reviewLanguage === 'en';
+    const expectedLang: 'vi-VN' | 'en-US' = isEn ? 'en-US' : SAIGON_VOICE_POLICY.VIETNAMESE_LANGUAGE;
+    const expectedAccent = isEn ? 'Standard English' : SAIGON_VOICE_POLICY.VIETNAMESE_ACCENT;
+    const expectedModel = isEn ? SAIGON_TTS_MODELS.ENGLISH : SAIGON_TTS_MODELS.VIETNAMESE;
 
-      // Play cached voice and sync video instantly
+    // Normalize pure speech script with unconditional Saigon lexicon when Vietnamese
+    const cleanSpeech = cleanScriptForSpeech(textToSynthesize, { adaptSouthernDialect: !isEn });
+    const cacheKey = buildTtsCacheKey({
+      voiceId: selectedVoice,
+      language: expectedLang,
+      accent: expectedAccent,
+      voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
+      ttsModelVersion: expectedModel,
+      scriptText: cleanSpeech,
+    });
+
+    const cached = ttsClientCache.current[cacheKey];
+    if (
+      cached &&
+      cached.audioBase64 &&
+      cached.provenance &&
+      isCacheKeyValidForPolicy(cacheKey, {
+        voiceId: selectedVoice,
+        language: expectedLang,
+        ttsModelVersion: expectedModel,
+      }) &&
+      cached.provenance.voiceId === selectedVoice &&
+      cached.provenance.language === expectedLang &&
+      cached.provenance.voiceConfigVersion === SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION
+    ) {
+      console.info("[CLIENT-CACHE-HIT] Phục hồi âm thanh giọng Sài Gòn khớp provenance:", cacheKey);
+      setAudioUrl(cached.url);
+      setActiveAudioProvenance({ ...cached.provenance, cacheHit: true });
+
       setTimeout(() => {
         if (audioRef.current) {
           setupPreviewAudioGraph();
@@ -2931,9 +3038,9 @@ export default function App() {
       return;
     }
 
-    // Direct Google AI Studio Gemini 3.1 TTS generation
+    // Direct Google AI Studio Saigon Voice-Design TTS synthesis
     try {
-      console.info("[TTS-CLIENT] Đang gọi máy chủ lồng tiếng Google AI Studio...");
+      console.info(`[SAIGON-TTS-CLIENT] Requesting ${selectedVoice} (${expectedLang} / ${expectedModel})...`);
       const response = await fetch('/api/generate-tts', {
         method: 'POST',
         headers: {
@@ -2942,110 +3049,175 @@ export default function App() {
         body: JSON.stringify({
           text: textToSynthesize,
           voiceName: selectedVoice,
+          language: reviewLanguage,
+          adaptSouthern: !isEn,
         }),
       });
 
-      if (response.ok) {
-        const resData = await response.json();
-        if (resData.audioBase64) {
-          if (resData.isFallback) {
-            setIsClientTTSActive(false);
-            setClientTTSScript('');
-          } else {
-            setIsClientTTSActive(false);
-            setClientTTSScript('');
-          }
-
-          // Convert raw base64 PCM mono 24khz to playable dynamic WAV file
-          const wavUrl = pcmToWav(resData.audioBase64, 24000);
-          
-          // Save to client-side cache
-          ttsClientCache.current[cacheKey] = {
-            url: wavUrl,
-            useClientTTS: false,
-            audioBase64: resData.audioBase64
-          };
-
-          setAudioUrl(wavUrl);
-          setApiError(null);
-          setTtsCountdownSec(0);
-          
-          // Auto play once loaded with video synchronization
-          setTimeout(() => {
-            if (audioRef.current) {
-              setupPreviewAudioGraph();
-              audioRef.current.playbackRate = playbackSpeed;
-              audioRef.current.play()
-                .then(() => {
-                  setIsPlaying(true);
-                  if (isSyncPlay && videoRef.current) {
-                    videoRef.current.currentTime = 0;
-                    videoRef.current.playbackRate = 1.0;
-                    videoRef.current.volume = videoOriginalMute ? 0 : (duckOriginalAudio ? 0.15 : 0.8);
-                    videoRef.current.play().catch(e => console.log('Video autoplay interrupted', e));
-                  }
-                })
-                .catch(err => console.log('Auto-play blocked by browser. Ready for manual play.', err));
-            }
-          }, 100);
-
-          setIsGeneratingTTS(false);
-          return;
-        }
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || `Lỗi máy chủ lồng tiếng (${response.status})`);
-      } else {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || `Lỗi kết nối máy chủ lồng tiếng (${response.status})`);
+      const resData = await response.json().catch(() => ({}));
+      if (!response.ok || !resData.audioBase64) {
+        throw new Error(resData.error || `Lỗi máy chủ lồng tiếng (${response.status})`);
       }
+
+      const provenance: TtsAudioProvenance | undefined = resData.provenance;
+      if (!isEn) {
+        if (
+          !provenance ||
+          provenance.accentPolicy !== SAIGON_VOICE_POLICY.ACCENT_POLICY ||
+          provenance.language !== SAIGON_VOICE_POLICY.VIETNAMESE_LANGUAGE ||
+          provenance.voiceId !== selectedVoice
+        ) {
+          throw new Error('Phản hồi TTS không khớp chính sách STRICT_SOUTHERN_ONLY hoặc sai nhân vật giọng đã chọn.');
+        }
+      }
+
+      const wavUrl = pcmToWav(resData.audioBase64, 24000);
+      const storedProvenance: TtsAudioProvenance = provenance || {
+        voiceId: selectedVoice,
+        geminiVoiceName: selectedVoice,
+        language: expectedLang,
+        accent: expectedAccent,
+        regionalVariant: isEn ? 'International English' : SAIGON_VOICE_POLICY.REGIONAL_VARIANT,
+        accentPolicy: isEn ? 'ENGLISH_STANDARD' : SAIGON_VOICE_POLICY.ACCENT_POLICY,
+        voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
+        ttsModelVersion: expectedModel,
+        scriptHash: computeDeterministicScriptHash(cleanSpeech),
+        cacheKey,
+        cacheHit: false,
+        synthesizedAt: Date.now(),
+      };
+
+      ttsClientCache.current[cacheKey] = {
+        url: wavUrl,
+        audioBase64: resData.audioBase64,
+        provenance: storedProvenance,
+      };
+
+      setAudioUrl(wavUrl);
+      setActiveAudioProvenance(storedProvenance);
+      setApiError(null);
+      setTtsCountdownSec(0);
+
+      setTimeout(() => {
+        if (audioRef.current) {
+          setupPreviewAudioGraph();
+          audioRef.current.playbackRate = playbackSpeed;
+          audioRef.current.play()
+            .then(() => {
+              setIsPlaying(true);
+              if (isSyncPlay && videoRef.current) {
+                videoRef.current.currentTime = 0;
+                videoRef.current.playbackRate = 1.0;
+                videoRef.current.volume = videoOriginalMute ? 0 : (duckOriginalAudio ? 0.15 : 0.8);
+                videoRef.current.play().catch(e => console.log('Video autoplay interrupted', e));
+              }
+            })
+            .catch(err => console.log('Auto-play blocked by browser. Ready for manual play.', err));
+        }
+      }, 100);
     } catch (err: any) {
-      console.error("Lỗi kết nối máy chủ lồng tiếng:", err);
-      // Strictly honest: Never substitute real TTS with silent audio
+      console.error("Lỗi tạo giọng đọc Sài Gòn:", err);
+      // Strictly honest: Never substitute Northern/OS SpeechSynthesis or silent fake audio
       setAudioUrl("");
-      setApiError(`Không thể tạo giọng đọc lồng tiếng: ${err.message || 'Lỗi kết nối máy chủ'}. Vui lòng thử lại sau giây lát.`);
+      setActiveAudioProvenance(null);
+      setApiError(
+        `Không thể tạo giọng đọc Sài Gòn (${selectedVoice}): ${err.message || 'Lỗi kết nối máy chủ'}. ` +
+        `Hệ thống giữ nguyên chính sách STRICT_SOUTHERN_ONLY và không chuyển sang giọng miền Bắc hay giọng trình duyệt.`
+      );
     } finally {
       setIsGeneratingTTS(false);
     }
   };
 
-  // Helper to speak client-side SpeechSynthesis as a fallback (Strictly blocked for Vietnamese to eliminate Northern OS voices)
-  const speakClientTTS = (text: string, offsetPercentage = 0) => {
-    if (!('speechSynthesis' in window) || !text) return;
+  // Sample Voice Audition ("Nghe thử") for every voice card
+  const handlePreviewVoice = async (voice: TTSVoiceOption) => {
+    setPreviewError(null);
+
+    if (previewVoiceId === voice.id && previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      previewAudioRef.current.currentTime = 0;
+      setPreviewVoiceId(null);
+      return;
+    }
+
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      previewAudioRef.current.currentTime = 0;
+    }
+    if (audioRef.current && isPlaying) {
+      audioRef.current.pause();
+      setIsPlaying(false);
+    }
+
+    const existing = previewResults[voice.id];
+    if (existing && existing.audioUrl && previewAudioRef.current) {
+      previewAudioRef.current.src = existing.audioUrl;
+      previewAudioRef.current.play()
+        .then(() => setPreviewVoiceId(voice.id))
+        .catch(() => setPreviewError(`Trình duyệt chặn tự động phát mẫu ${voice.id}, vui lòng bấm lại.`));
+      return;
+    }
+
+    setPreviewLoadingId(voice.id);
     try {
-      window.speechSynthesis.cancel();
-      // TUYỆT ĐỐI KHÔNG DÙNG SpeechSynthesis TRÊN TRÌNH DUYỆT CHO TIẾNG VIỆT
-      // Vì mặc định giọng vi-VN của hệ điều hành OS (Windows, Android, Mac) luôn là Giọng Miền Bắc.
-      const isEn = selectedVoice.endsWith('_EN');
-      if (!isEn) return;
-
-      const cleanText = cleanScriptForSpeech(text);
-      if (!cleanText) return;
-
-      const utterance = new SpeechSynthesisUtterance(cleanText);
-      utterance.rate = playbackSpeed || 1.0;
-      utterance.pitch = 1.0;
-
-      const voices = window.speechSynthesis.getVoices();
-      const matchedVoice = voices.find(v => v.lang.toLowerCase().includes('en')) || voices[0];
-      if (matchedVoice) {
-        utterance.voice = matchedVoice;
-      }
-      utterance.lang = 'en-US';
-
-      if (offsetPercentage > 0 && offsetPercentage < 0.85) {
-        const startChar = Math.floor(cleanText.length * offsetPercentage);
-        utterance.text = cleanText.substring(startChar);
+      const response = await fetch('/api/tts/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ voiceName: voice.id }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.audioBase64) {
+        throw new Error(data.error || `Không thể tải mẫu nghe thử (${response.status})`);
       }
 
-      window.speechSynthesis.speak(utterance);
-    } catch (err) {
-      console.warn("Client speech synthesis fallback notice:", err);
+      const wavUrl = pcmToWav(data.audioBase64, 24000);
+      setPreviewResults((prev) => ({
+        ...prev,
+        [voice.id]: {
+          audioUrl: wavUrl,
+          samplePublicUrl: data.samplePublicUrl,
+          durationSec: data.metrics?.durationSec,
+          rmsDb: data.metrics?.rmsDb,
+          provenance: data.provenance,
+        },
+      }));
+
+      if (previewAudioRef.current) {
+        previewAudioRef.current.src = wavUrl;
+        await previewAudioRef.current.play();
+        setPreviewVoiceId(voice.id);
+      }
+    } catch (err: any) {
+      setPreviewError(err.message || `Không thể nghe thử giọng ${voice.name}`);
+      setPreviewVoiceId(null);
+    } finally {
+      setPreviewLoadingId(null);
     }
   };
 
-  const stopClientTTS = () => {
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+  // Run Live Saigon Acoustic Audit (/api/tts/validate-saigon) on demand
+  const handleRunSaigonAudit = async () => {
+    if (reviewLanguage !== 'vi') return;
+    setSaigonAuditLoading(true);
+    setSaigonAuditError(null);
+    try {
+      const response = await fetch('/api/tts/validate-saigon', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          voiceName: selectedVoice,
+          useCachedSample: true,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.audit) {
+        throw new Error(data.error || `Kiểm định thất bại (${response.status})`);
+      }
+      setSaigonAuditResult(data);
+    } catch (err: any) {
+      setSaigonAuditError(err.message || 'Không thể chạy kiểm định âm thanh Sài Gòn.');
+    } finally {
+      setSaigonAuditLoading(false);
     }
   };
 
@@ -3056,9 +3228,6 @@ export default function App() {
     if (isPlaying) {
       audioRef.current.pause();
       setIsPlaying(false);
-      if (isClientTTSActive) {
-        stopClientTTS();
-      }
       if (uploadedFiles.length > 0) {
         uploadedFiles.forEach((_, idx) => {
           const videoEl = segmentVideoRefs.current[idx];
@@ -3108,10 +3277,6 @@ export default function App() {
       audioRef.current.play()
         .then(() => {
           setIsPlaying(true);
-          if (isClientTTSActive && clientTTSScript) {
-            const pct = audioRef.current.currentTime / (audioRef.current.duration || 30);
-            speakClientTTS(clientTTSScript, pct);
-          }
           if (isSyncPlay) {
             if (uploadedFiles.length > 0) {
               const { index } = getSegmentAndRelativeTime(audioRef.current ? audioRef.current.currentTime : 0);
@@ -3128,11 +3293,8 @@ export default function App() {
     }
   };
 
-  // Merge and export complete synchronized review video with voiceover
+  // Merge and export complete synchronized review video with verified Saigon voiceover
   const mergeAndDownloadVideo = async () => {
-    // CRITICAL USER GESTURE PASS-THROUGH:
-    // Resume the AudioContext synchronously within the absolute same microtask of the user click gesture!
-    // This pre-authorizes the audio pipeline to capture high-quality audio packages without Chromium silencing.
     try {
       const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
       if (!previewAudioCtxRef.current) {
@@ -3147,16 +3309,19 @@ export default function App() {
     }
 
     const hasVideo = (uploadedFiles.length > 0) || !!videoRef.current;
-    if (!hasVideo || !audioRef.current || !audioUrl) {
-      setApiError("Thiếu tệp video hoặc âm thanh lồng tiếng AI để thực hiện.");
+    const textToSynthesize = (editedScript || activeReview?.marketingScript || "").trim();
+    if (!hasVideo || !audioRef.current || (!audioUrl && !textToSynthesize)) {
+      setApiError("Thiếu tệp video hoặc âm thanh lồng tiếng Sài Gòn hợp lệ để xuất video.");
       return;
     }
 
     try {
       isExportCancelledRef.current = false;
       setIsMerging(true);
-      setMergeProgress(0);
+      setMergeProgress(1);
+      setExportStageLabel('Đang xác thực giọng lồng tiếng Sài Gòn & chuẩn bị luồng video 9:16...');
       setMergedVideoUrl('');
+      setTiktokValidation(null);
 
       const videoEl = videoRef.current || segmentVideoRefs.current[0];
       if (!videoEl) {
@@ -3164,56 +3329,81 @@ export default function App() {
         return;
       }
       const audioEl = audioRef.current;
-
-      // Ensure backup voice is upgraded to high definition Google AI Studio voiceover on export
       let currentAudioUrl = audioUrl;
-      const textToSynthesize = (editedScript || activeReview?.marketingScript || "").trim();
-      const cleanSpeech = cleanScriptForSpeech(textToSynthesize);
-      const cacheKey = `v18_permanent_saigon_tts:${selectedVoice}:${cleanSpeech.trim()}`;
-      const cached = ttsClientCache.current[cacheKey];
-      
-      const needsRealTTS = !currentAudioUrl || currentAudioUrl.includes('silent_wav');
 
-      if (needsRealTTS && textToSynthesize) {
-        console.info("[EXPORT-TTS-UPGRADE] Đang nỗ lực khôi phục và đồng bộ giọng đọc Google AI Studio chuẩn cho video chất lượng cao...");
-        try {
+      const isEn = reviewLanguage === 'en';
+      const expectedLang: 'vi-VN' | 'en-US' = isEn ? 'en-US' : SAIGON_VOICE_POLICY.VIETNAMESE_LANGUAGE;
+      const expectedAccent = isEn ? 'Standard English' : SAIGON_VOICE_POLICY.VIETNAMESE_ACCENT;
+      const expectedModel = isEn ? SAIGON_TTS_MODELS.ENGLISH : SAIGON_TTS_MODELS.VIETNAMESE;
+
+      const cleanSpeech = cleanScriptForSpeech(textToSynthesize, { adaptSouthernDialect: !isEn });
+      const expectedScriptHash = computeDeterministicScriptHash(cleanSpeech);
+      const cacheKey = buildTtsCacheKey({
+        voiceId: selectedVoice,
+        language: expectedLang,
+        accent: expectedAccent,
+        voiceConfigVersion: SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION,
+        ttsModelVersion: expectedModel,
+        scriptText: cleanSpeech,
+      });
+
+      const provenanceMatches =
+        Boolean(currentAudioUrl) &&
+        Boolean(activeAudioProvenance) &&
+        activeAudioProvenance!.voiceId === selectedVoice &&
+        activeAudioProvenance!.language === expectedLang &&
+        activeAudioProvenance!.voiceConfigVersion === SAIGON_VOICE_POLICY.VOICE_CONFIG_VERSION &&
+        (!textToSynthesize || activeAudioProvenance!.scriptHash === expectedScriptHash);
+
+      if (!provenanceMatches) {
+        const cached = ttsClientCache.current[cacheKey];
+        if (cached && cached.audioBase64 && cached.provenance?.voiceId === selectedVoice) {
+          currentAudioUrl = cached.url;
+          setAudioUrl(cached.url);
+          setActiveAudioProvenance({ ...cached.provenance, cacheHit: true });
+          audioEl.src = cached.url;
+          audioEl.load();
+          await new Promise((resolve) => setTimeout(resolve, 400));
+        } else if (textToSynthesize) {
+          setExportStageLabel(`Đang đồng bộ lại giọng Sài Gòn (${selectedVoice}) trước khi xuất video...`);
           const response = await fetch('/api/generate-tts', {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               text: textToSynthesize,
               voiceName: selectedVoice,
-            })
+              language: reviewLanguage,
+              adaptSouthern: !isEn,
+            }),
           });
-          
-          if (response.ok) {
-            const resData = await response.json();
-            if (resData.audioBase64) {
-              const wavUrl = pcmToWav(resData.audioBase64, 24000);
-              
-              // Update cache
-              ttsClientCache.current[cacheKey] = {
-                url: wavUrl,
-                useClientTTS: false,
-                audioBase64: resData.audioBase64
-              };
-              
-              setIsClientTTSActive(false);
-              setClientTTSScript('');
-              setAudioUrl(wavUrl);
-              currentAudioUrl = wavUrl;
-              
-              // Load the newly retrieved real audio track
-              audioEl.src = wavUrl;
-              audioEl.load();
-              await new Promise((resolve) => setTimeout(resolve, 600)); // wait for buffer to warm up
-              console.info("[EXPORT-TTS-UPGRADE-SUCCESS] Đã nâng cấp giọng đọc Google AI Studio thành công!");
-            }
+
+          const resData = await response.json().catch(() => ({}));
+          if (!response.ok || !resData.audioBase64) {
+            throw new Error(
+              resData.error ||
+                `Không thể tạo giọng đọc Sài Gòn (${selectedVoice}) khi xuất video. Hệ thống hủy xuất để tránh sai phương ngữ.`
+            );
           }
-        } catch (ttsErr: any) {
-          console.error("[EXPORT-TTS-UPGRADE-ERROR] Không thể nâng cấp giọng đọc tự động:", ttsErr);
+
+          if (!isEn && resData.provenance?.accentPolicy !== SAIGON_VOICE_POLICY.ACCENT_POLICY) {
+            throw new Error('Âm thanh trả về không đạt chuẩn STRICT_SOUTHERN_ONLY.');
+          }
+
+          const wavUrl = pcmToWav(resData.audioBase64, 24000);
+          ttsClientCache.current[cacheKey] = {
+            url: wavUrl,
+            audioBase64: resData.audioBase64,
+            provenance: resData.provenance,
+          };
+
+          currentAudioUrl = wavUrl;
+          setAudioUrl(wavUrl);
+          setActiveAudioProvenance(resData.provenance);
+          audioEl.src = wavUrl;
+          audioEl.load();
+          await new Promise((resolve) => setTimeout(resolve, 600));
+        } else {
+          throw new Error('Âm thanh hiện tại không khớp giọng đã chọn và thiếu kịch bản để tổng hợp lại.');
         }
       }
 
@@ -3340,30 +3530,12 @@ export default function App() {
         rawVideoStream = (videoEl as any).mozCaptureStream();
       }
 
-      // Create an offscreen high-performance canvas to process HDR/color filters frame-by-frame
+      // Create an offscreen high-performance canvas locked to TikTok 9:16 portrait dimensions (even integers)
       const canvas = document.createElement('canvas');
-      let sourceVideoEl = videoEl;
-      if (uploadedFiles.length > 0 && segmentVideoRefs.current[0]) {
-        sourceVideoEl = segmentVideoRefs.current[0]!;
-      }
-      let canvasWidth = sourceVideoEl.videoWidth || 720;
-      let canvasHeight = sourceVideoEl.videoHeight || 1280;
-      
-      // High-end video optimization: dynamic resolution based on exportResolution state
-      let maxResolution = 1920;
-      if (exportResolution === '4k') maxResolution = 3840;
-      else if (exportResolution === '720p') maxResolution = 1280;
+      const targetDims = computeTikTokCanvasDimensions(exportResolution);
+      const canvasWidth = targetDims.width;
+      const canvasHeight = targetDims.height;
 
-      if (canvasWidth > maxResolution || canvasHeight > maxResolution) {
-        const ratio = Math.min(maxResolution / canvasWidth, maxResolution / canvasHeight);
-        canvasWidth = Math.round(canvasWidth * ratio);
-        canvasHeight = Math.round(canvasHeight * ratio);
-      }
-
-      // Guarantee strictly even dimensions (modulo 2 === 0) for hardware encoder compliance (prevents chroma misalignment & blurring)
-      canvasWidth = Math.floor(canvasWidth / 2) * 2;
-      canvasHeight = Math.floor(canvasHeight / 2) * 2;
-      
       canvas.width = canvasWidth;
       canvas.height = canvasHeight;
       
@@ -3636,21 +3808,39 @@ export default function App() {
             filterStr = filterParts.join(' ');
           }
           
+          const drawVideoContain = (el: HTMLVideoElement) => {
+            const vw = el.videoWidth || canvasWidth;
+            const vh = el.videoHeight || canvasHeight;
+            const scale = Math.min(canvasWidth / vw, canvasHeight / vh);
+            const dw = vw * scale;
+            const dh = vh * scale;
+            const dx = (canvasWidth - dw) / 2;
+            const dy = (canvasHeight - dh) / 2;
+            ctx.drawImage(el, dx, dy, dw, dh);
+          };
+
+          // Clear canvas cleanly with solid black letterbox base to prevent frame ghosting and aspect distortion
+          ctx.save();
+          ctx.filter = 'none';
+          ctx.fillStyle = '#000000';
+          ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+          ctx.restore();
+
           ctx.filter = filterStr;
           if (currentVideoSegmentEl && currentVideoSegmentEl.readyState >= 2) {
             if (videoTransition === 'cross_dissolve' && isTransActive && lastRecordedSegmentIndex !== -1 && lastRecordedSegmentIndex !== activeSegIndex) {
               const prevVideoEl = segmentVideoRefs.current[lastRecordedSegmentIndex];
               if (prevVideoEl && prevVideoEl.readyState >= 2) {
-                ctx.drawImage(currentVideoSegmentEl, 0, 0, canvasWidth, canvasHeight);
+                drawVideoContain(currentVideoSegmentEl);
                 ctx.save();
                 ctx.globalAlpha = 1 - tProgress;
-                ctx.drawImage(prevVideoEl, 0, 0, canvasWidth, canvasHeight);
+                drawVideoContain(prevVideoEl);
                 ctx.restore();
               } else {
-                ctx.drawImage(currentVideoSegmentEl, 0, 0, canvasWidth, canvasHeight);
+                drawVideoContain(currentVideoSegmentEl);
               }
             } else {
-              ctx.drawImage(currentVideoSegmentEl, 0, 0, canvasWidth, canvasHeight);
+              drawVideoContain(currentVideoSegmentEl);
             }
           }
           ctx.filter = 'none';
@@ -4274,7 +4464,8 @@ export default function App() {
 
       let videoStream: MediaStream;
       if ((canvas as any).captureStream) {
-        videoStream = (canvas as any).captureStream(exportFps || 60); // Ultra-smooth Studio FPS stream
+        // Lock capture frame rate to 30 FPS CFR for TikTok compliance and stable Android performance
+        videoStream = (canvas as any).captureStream(30);
       } else if (rawVideoStream) {
         videoStream = rawVideoStream;
       } else {
@@ -4377,70 +4568,33 @@ export default function App() {
       audioEl.muted = false;
       audioEl.volume = 1.0;
 
-      // Multi-device codec cascade: On Android browsers, hardware-accelerated VP8/VP9 WebM is universally supported
-      const isAndroid = typeof navigator !== 'undefined' && /Android/i.test(navigator.userAgent);
-      const mimeTypesToTry = isAndroid ? [
-        'video/webm;codecs=vp8,opus',
-        'video/webm;codecs=vp9,opus',
-        'video/webm',
-        'video/mp4;codecs=avc1,mp4a.40.2',
-        'video/mp4'
-      ] : [
-        'video/mp4;codecs=h264,aac',
-        'video/mp4;codecs=h264,opus',
-        'video/mp4;codecs=avc1,mp4a.40.2',
-        'video/mp4;codecs=avc1',
-        'video/mp4',
-        'video/webm;codecs=vp9,opus',
-        'video/webm;codecs=vp8,opus',
-        'video/webm'
-      ];
+      // Smart Encoder Selection (Priority 1: Strict H.264/AAC MP4 check; Priority 2: WebM temp capture -> FFmpeg transcode)
+      const codecProfile = selectOptimalRecorderCodec();
+      const selectedMimeType = codecProfile.mimeType;
 
-      let selectedMimeType = '';
-      for (const mime of mimeTypesToTry) {
-        if (MediaRecorder.isTypeSupported(mime)) {
-          selectedMimeType = mime;
-          break;
-        }
-      }
+      // Controlled TikTok bitrate tiers: Standard 8 Mbps, High 10 Mbps, Premium 12 Mbps (prevents Android memory crashes)
+      const targetBitrate = getTikTokExportBitrateBps(exportBitratePreset);
+      const targetAudioBitrate = exportBitratePreset === 'standard' ? 128000 : (exportBitratePreset === 'premium' ? 192000 : 160000);
 
-      console.log(`MediaRecorder selected MIME type: ${selectedMimeType}`);
-
-      // Calculate ultra-high movie-grade dynamic bitrates to matches original raw phone video files
-      // 720p: 8-15 Mbps, 1080p: 18-30 Mbps, 4K: 35-50 Mbps. This avoids any compression blockiness or detail loss!
-      const totalPixels = canvasWidth * canvasHeight;
-      let targetBitrate = 22000000;
-      
-      const bitrateMultiplier = exportBitratePreset === 'master' ? 1.5 : (exportBitratePreset === 'standard' ? 0.7 : 1.0);
-
-      if (totalPixels <= 1280 * 720) {
-        targetBitrate = Math.round(12000000 * bitrateMultiplier);
-      } else if (totalPixels <= 1920 * 1080) {
-        targetBitrate = Math.round(25000000 * bitrateMultiplier);
-      } else {
-        targetBitrate = Math.round(50000000 * bitrateMultiplier);
-      }
-
-      console.log(`Setting target export video dynamic bitrate: ${targetBitrate / 1000000} Mbps`);
+      console.log(`[TIKTOK-EXPORT] Selected MIME: ${selectedMimeType || 'default'}, Tier: ${exportBitratePreset} (${targetBitrate / 1000000} Mbps), Android=${codecProfile.isAndroid}`);
 
       try {
         const recorderOptions: MediaRecorderOptions = {
           mimeType: selectedMimeType || undefined,
           videoBitsPerSecond: targetBitrate,
-          audioBitsPerSecond: 192000, // Studio-quality 192 kbps audio bitrate helper
+          audioBitsPerSecond: targetAudioBitrate,
         };
         mediaRecorder = new MediaRecorder(recordedStream, recorderOptions);
       } catch (err) {
-        console.warn("High-profile MediaRecorder rejected by client browser, scaling down to high compatibility mode...", err);
+        console.warn("MediaRecorder rejected primary profile, scaling down safely to 8 Mbps fallback...", err);
         try {
-          const fallbackOptions: MediaRecorderOptions = {
+          mediaRecorder = new MediaRecorder(recordedStream, {
             mimeType: selectedMimeType || undefined,
-            videoBitsPerSecond: 8000000, // Safe 8 Mbps fallback which is highly supported
+            videoBitsPerSecond: 8000000,
             audioBitsPerSecond: 128000,
-          };
-          mediaRecorder = new MediaRecorder(recordedStream, fallbackOptions);
+          });
         } catch (err2) {
-          console.error("All customized MediaRecorder attempts failed, initializing with browser presets:", err2);
+          console.error("Fallback MediaRecorder options rejected, using browser defaults:", err2);
           mediaRecorder = new MediaRecorder(recordedStream, {
             mimeType: selectedMimeType || undefined
           });
@@ -4455,17 +4609,14 @@ export default function App() {
         }
       };
 
-      // Crucial: The exported video duration is defined at the start of the block and held at closure scope
-
       const progressInterval = setInterval(() => {
-        // Track the highest elapsed time between the running video or the running audio track
         const elapsed = Math.max(curExportTime, audioEl.currentTime || 0);
-        const progressPct = duration > 0 ? Math.min(99, Math.round((elapsed / duration) * 100)) : 0;
-        setMergeProgress(progressPct);
+        // Phase 1 recording occupies 0% -> 50% of total TikTok export progress
+        const recordPct = duration > 0 ? Math.min(49, Math.round((elapsed / duration) * 50)) : 0;
+        setMergeProgress(recordPct);
+        setExportStageLabel(`Đang ghi hình 9:16 & trộn âm thanh (${Math.min(100, recordPct * 2)}%)...`);
 
-        // Failsafe backup completion check: stop recording safely when elapsed reaches expected max duration
         if (elapsed >= duration - 0.08) {
-          console.log(`[EXPORT-FAILSAFE] Elapsed time (${elapsed.toFixed(2)}s) reached expected duration (${duration.toFixed(2)}s). Stopping recording of MediaRecorder in 800ms.`);
           isDrawing = false;
           if (drawFrameId) {
             cancelAnimationFrame(drawFrameId);
@@ -4479,30 +4630,21 @@ export default function App() {
         }
       }, 300);
 
-      mediaRecorder.onstop = () => {
+      mediaRecorder.onstop = async () => {
         try {
           clearInterval(progressInterval);
-          isDrawing = false; // Stop the video canvas rendering loop
+          isDrawing = false;
           
-          // Stop the silent oscillator and clean up
           try {
             silentOscillator.stop();
             silentOscillator.disconnect();
             silentGain.disconnect();
           } catch (e) {}
 
-          // Disconnect temporary recording node connections from mixedDest to avoid duplicating sound/memory leak
-          try {
-            if (dryGain) dryGain.disconnect(mixedDest);
-          } catch (e) {}
-          try {
-            if (wetGain) wetGain.disconnect(mixedDest);
-          } catch (e) {}
-          try {
-            if (videoGain) videoGain.disconnect(mixedDest);
-          } catch (e) {}
+          try { if (dryGain) dryGain.disconnect(mixedDest); } catch (e) {}
+          try { if (wetGain) wetGain.disconnect(mixedDest); } catch (e) {}
+          try { if (videoGain) videoGain.disconnect(mixedDest); } catch (e) {}
 
-          // Restore elements original state
           try {
             if (uploadedFiles.length > 0) {
               uploadedFiles.forEach((_, idx) => {
@@ -4535,88 +4677,86 @@ export default function App() {
           }
 
           if (isExportCancelledRef.current) {
-            console.log("[EXPORT] Quá trình xuất video đã bị người dùng hủy.");
             setIsMerging(false);
             setMergeProgress(0);
+            setExportStageLabel('');
             return;
           }
 
-          const actualMime = mediaRecorder.mimeType || 'video/webm';
-          const isMp4Real = actualMime.startsWith('video/mp4') || (actualMime.includes('mp4') && !actualMime.includes('webm'));
-          const finalExtension = isMp4Real ? 'mp4' : 'webm';
-          const blobClass = isMp4Real ? 'video/mp4' : 'video/webm';
-          
-          setMergedVideoExt(finalExtension);
-          
-          const rawBlob = new Blob(chunks, { type: blobClass });
+          const actualMime = mediaRecorder.mimeType || selectedMimeType || 'video/webm';
+          const capturedIsMp4 = actualMime.startsWith('video/mp4') || (actualMime.includes('mp4') && !actualMime.includes('webm'));
+          const capturedExt = capturedIsMp4 ? 'mp4' : 'webm';
+          const capturedBlob = new Blob(chunks, { type: capturedIsMp4 ? 'video/mp4' : 'video/webm' });
 
-          if (!rawBlob || rawBlob.size < 1024) {
-            console.error("Lỗi xuất video: File video tạo ra rỗng hoặc nhỏ hơn 1KB (size:", rawBlob?.size, ").");
+          if (!capturedBlob || capturedBlob.size < 1024) {
             setIsMerging(false);
             setMergeProgress(0);
-            setApiError("Quá trình xuất video không thu thập được dữ liệu khung hình (file 0 byte). Vui lòng thử lại với cấu hình Bitrate Chuẩn hoặc định dạng WebM.");
+            setExportStageLabel('');
+            setApiError("Quá trình ghi khung hình tạo ra dữ liệu rỗng (< 1KB). Vui lòng thử lại với chất lượng Standard (8 Mbps).");
             return;
           }
 
-          const triggerDownload = (finalBlob: Blob) => {
-            try {
-              const mergedUrl = URL.createObjectURL(finalBlob);
-              setMergedVideoUrl(mergedUrl);
-              setMergeProgress(100);
-              setIsMerging(false);
+          // Priority 3: ALWAYS transcode & validate on server FFmpeg/FFprobe worker into true H.264/AAC faststart MP4.
+          // NEVER serve temporary WebM directly as a TikTok-ready file!
+          const abortCtrl = new AbortController();
+          exportAbortControllerRef.current = abortCtrl;
+          const baseName = `${(activeReview?.productName || "tiktok_review").toLowerCase().replace(/[^a-zA-Z0-9]/g, '_')}`;
 
-              // Download trigger - Accurate extension corresponding to the actual codec container
-              const finalName = `${(activeReview?.productName || "review").toLowerCase().replace(/[^a-zA-Z0-9]/g, '_')}_final.${finalExtension}`;
-              
-              // Auto trigger download
-              const a = document.createElement('a');
-              a.href = mergedUrl;
-              a.download = finalName;
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-            } catch (dlErr) {
-              console.error("Lỗi khi tải xuống:", dlErr);
-              setMergeProgress(100);
-              setIsMerging(false);
-            }
-          };
+          setMergeProgress(50);
+          setExportStageLabel('Đang tải bản ghi tạm lên bộ chuyển mã TikTok MP4...');
 
-          // Fix duration and cues mismatch in Chrome recorded WebMs so platforms can read the timeline
-          if (!isMp4Real) {
-            const durationValueMs = Math.round(duration * 1000);
-            console.log(`Fixing WebM container duration metadata for TikTok: ${durationValueMs}ms`);
-            
-            let timeoutId = setTimeout(() => {
-              console.warn("[EXPORT-TIMEOUT] ysFixWebmDuration took too long or hung. Falling back to direct raw video download.");
-              triggerDownloadSafe(rawBlob);
-            }, 1500);
+          const completedJob = await uploadAndTranscodeToTikTokMp4({
+            blob: capturedBlob,
+            sourceExt: capturedExt,
+            fileName: baseName,
+            qualityTier: exportBitratePreset,
+            signal: abortCtrl.signal,
+            onUploadProgress: (upPct) => {
+              const totalPct = 50 + Math.round((upPct / 100) * 15);
+              setMergeProgress(totalPct);
+              setExportStageLabel(`Đang tải video lên bộ chuyển mã H.264/AAC (${upPct}%)...`);
+            },
+            onTranscodeStatus: (job) => {
+              const totalPct = 65 + Math.round((job.progress / 100) * 35);
+              setMergeProgress(Math.min(99, totalPct));
+              if (job.stageLabel) {
+                setExportStageLabel(job.stageLabel);
+              }
+            },
+          });
 
-            let isCalled = false;
-            const triggerDownloadSafe = (finalBlob: Blob) => {
-              if (isCalled) return;
-              isCalled = true;
-              triggerDownload(finalBlob);
-            };
-
-            try {
-              ysFixWebmDuration(rawBlob, durationValueMs, (fixedBlob) => {
-                clearTimeout(timeoutId);
-                console.log("[EXPORT-SUCCESS] Fixed WebM metadata successfully.");
-                triggerDownloadSafe(fixedBlob);
-              });
-            } catch (err) {
-              clearTimeout(timeoutId);
-              console.error("[EXPORT-ERROR] ysFixWebmDuration failed with exception, downloading raw video:", err);
-              triggerDownloadSafe(rawBlob);
-            }
-          } else {
-            triggerDownload(rawBlob);
+          if (isExportCancelledRef.current) {
+            return;
           }
-        } catch (onStopErr: any) {
-          console.error("Lỗi nghiêm trọng trong mediaRecorder.onstop:", onStopErr);
+
+          if (!completedJob.validation?.valid || !completedJob.downloadUrl) {
+            throw new Error("Tệp MP4 đầu ra chưa vượt qua bước kiểm định giải mã FFprobe.");
+          }
+
+          setTiktokValidation(completedJob.validation);
+          setMergedVideoExt('mp4');
+          setMergedVideoUrl(completedJob.downloadUrl);
           setMergeProgress(100);
+          setExportStageLabel('Video MP4 chuẩn TikTok đã vượt qua kiểm định!');
           setIsMerging(false);
+
+          // Trigger Android-compatible HTTP attachment download of the verified .mp4 file
+          const a = document.createElement('a');
+          a.href = completedJob.downloadUrl;
+          a.download = completedJob.fileName || `${baseName}_tiktok.mp4`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        } catch (onStopErr: any) {
+          console.error("Lỗi trong tiến trình chuyển mã/kiểm định TikTok MP4:", onStopErr);
+          if (!isExportCancelledRef.current) {
+            setApiError(onStopErr?.message || "Không thể chuyển mã video sang MP4 H.264/AAC chuẩn TikTok.");
+          }
+          setMergeProgress(0);
+          setExportStageLabel('');
+          setIsMerging(false);
+        } finally {
+          exportAbortControllerRef.current = null;
         }
       };
 
@@ -5088,17 +5228,31 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
               </span>
               {systemStatus && (
                 <span 
-                  className={`hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[8px] font-mono font-semibold border ${
-                    systemStatus.geminiStatus === 'connected'
+                  className={`hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[9px] font-mono font-semibold border ${
+                    systemStatus.geminiStatus === 'CONNECTED'
                       ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                      : (systemStatus.geminiStatus === 'invalid_oauth_token' 
-                          ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
-                          : 'bg-blue-500/10 text-blue-400 border-blue-500/20')
+                      : systemStatus.geminiStatus === 'DEGRADED'
+                        ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                        : 'bg-rose-500/10 text-rose-400 border-rose-500/20'
                   }`}
-                  title={systemStatus.message}
+                  title={systemStatus.services ? `Text: ${systemStatus.services.text.status} (${systemStatus.services.text.latencyMs}ms) | Vision: ${systemStatus.services.vision.status} (${systemStatus.services.vision.latencyMs}ms) | TTS: ${systemStatus.services.tts.status} (${systemStatus.services.tts.latencyMs}ms)` : systemStatus.message}
                 >
-                  <span className={`w-1.5 h-1.5 rounded-full ${systemStatus.geminiStatus === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></span>
-                  {systemStatus.geminiStatus === 'connected' ? 'Gemini 3.8 Flash' : 'AI Studio Engine'}
+                  <span className={`w-1.5 h-1.5 rounded-full ${
+                    systemStatus.geminiStatus === 'CONNECTED'
+                      ? 'bg-emerald-400 animate-pulse'
+                      : systemStatus.geminiStatus === 'DEGRADED'
+                        ? 'bg-amber-400'
+                        : 'bg-rose-400'
+                  }`}></span>
+                  {systemStatus.geminiStatus === 'CONNECTED'
+                    ? 'AI CONNECTED'
+                    : systemStatus.geminiStatus === 'DEGRADED'
+                      ? 'AI DEGRADED'
+                      : systemStatus.geminiStatus === 'QUOTA_EXCEEDED'
+                        ? 'QUOTA LIMIT'
+                        : systemStatus.geminiStatus === 'MISCONFIGURED'
+                          ? 'MISCONFIGURED'
+                          : 'AI UNAVAILABLE'}
                 </span>
               )}
             </div>
@@ -5821,6 +5975,44 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                 />
               </div>
 
+              {recognitionResult && (
+                <div className="rounded-xl bg-white/[0.02] border border-white/10 p-3 space-y-2 text-[11px]">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                      <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
+                      Báo cáo xác minh nhận diện sản phẩm
+                    </span>
+                    <span className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold border ${
+                      recognitionResult.verificationStatus === 'VERIFIED'
+                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                        : recognitionResult.verificationStatus === 'NEED_MORE_INFORMATION'
+                          ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                          : 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                    }`}>
+                      {recognitionResult.verificationStatus} ({Math.round((recognitionResult.confidenceScore || 0) * 100)}%)
+                    </span>
+                  </div>
+
+                  {recognitionResult.ocrDetections && recognitionResult.ocrDetections.length > 0 && (
+                    <div className="text-[10px] text-emerald-300/90">
+                      <strong className="text-emerald-400">Chữ in đọc được (OCR):</strong> {recognitionResult.ocrDetections.join(', ')}
+                    </div>
+                  )}
+
+                  {recognitionResult.directObservation && recognitionResult.directObservation.length > 0 && (
+                    <div className="text-[10px] text-slate-300">
+                      <strong className="text-slate-200">Quan sát trực tiếp:</strong> {recognitionResult.directObservation.join('; ')}
+                    </div>
+                  )}
+
+                  {recognitionResult.unverifiedData && recognitionResult.unverifiedData.length > 0 && (
+                    <div className="text-[10px] text-amber-300/80 bg-amber-500/5 border border-amber-500/15 rounded-lg p-2">
+                      <strong className="text-amber-400">Chưa thể kiểm chứng từ ảnh/video:</strong> {recognitionResult.unverifiedData.join('; ')}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {suggestedKeywords.length > 0 && (
                 <div className="space-y-1 pt-1">
                   <span className="text-[9px] text-amber-400 font-bold flex items-center gap-1">
@@ -6077,12 +6269,24 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
 
               {/* Local API errors or action blockers */}
               {apiError && (
-                <div id="local-analysis-error" className="p-3.5 bg-rose-500/10 border border-rose-500/20 rounded-xl flex items-start gap-2.5 text-left animate-[fadeIn_0.2s_ease-out]">
-                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                  <div className="space-y-0.5">
-                    <p className="text-[10px] font-bold text-rose-400 uppercase tracking-wider font-mono">Lỗi xử lý hệ thống:</p>
-                    <p className="text-[11px] text-rose-200/90 leading-relaxed font-sans">{apiError}</p>
+                <div id="local-analysis-error" className="p-3.5 bg-rose-500/10 border border-rose-500/20 rounded-xl flex items-start justify-between gap-2.5 text-left animate-[fadeIn_0.2s_ease-out]">
+                  <div className="flex items-start gap-2.5">
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                    <div className="space-y-0.5">
+                      <p className="text-[10px] font-bold text-rose-400 uppercase tracking-wider font-mono">Lỗi xử lý hệ thống:</p>
+                      <p className="text-[11px] text-rose-200/90 leading-relaxed font-sans">{apiError}</p>
+                    </div>
                   </div>
+                  {activeReview?.marketingScript && (
+                    <button
+                      type="button"
+                      onClick={generateVoiceover}
+                      disabled={isGeneratingTTS}
+                      className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 text-[10px] font-bold shrink-0 cursor-pointer"
+                    >
+                      Thử lại giọng Sài Gòn
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -6148,15 +6352,64 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
               <div className="flex items-center justify-between">
                 <label className="text-[10px] font-black uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
                   <Cpu className="w-3.5 h-3.5 animate-pulse" />
-                  <span>⚡ Động cơ Lồng tiếng Google AI Studio (Gemini)</span>
+                  <span>Động cơ Lồng tiếng Gemini Voice Design</span>
                 </label>
                 <span className="text-[8px] bg-amber-500/20 text-amber-300 font-bold px-1.5 py-0.5 rounded border border-amber-500/30">
-                  PREMIUM PRO
+                  {reviewLanguage === 'vi' ? 'SAIGON VOICE ONLY' : 'ENGLISH STUDIO'}
                 </span>
               </div>
               <p className="text-[9.5px] text-amber-300/90 leading-relaxed font-sans font-medium">
-                🤖 Đang kích hoạt <strong>Trí tuệ Nhân tạo Gemini</strong> để lồng tiếng chuẩn giọng đọc miền Nam (Sài Gòn - Nam Bộ). <strong className="text-emerald-400">Đã loại bỏ vĩnh viễn giọng miền Bắc</strong> với bộ lọc tự động chuyển ngữ Nam Bộ 100%, đem lại cảm xúc điện ảnh kịch tính, lôi cuốn và trầm bổng nịnh tai nhất.
+                {reviewLanguage === 'vi'
+                  ? 'Chính sách STRICT_SOUTHERN_ONLY đã khóa cứng: 100% giọng đọc tiếng Việt dùng phương ngữ miền Nam (Sài Gòn) trên model gemini-3.8-flash-tts, tuyệt đối không dùng giọng miền Bắc hay giọng trình duyệt/Android.'
+                  : 'Sử dụng giọng đọc chuẩn tiếng Anh từ Google Gemini TTS.'}
               </p>
+              {reviewLanguage === 'vi' && (
+                <div className="mt-2 pt-2 border-t border-white/10 space-y-2">
+                  <div className="flex items-center justify-between gap-2 flex-wrap text-[9.5px]">
+                    <span className="text-emerald-300 font-semibold flex items-center gap-1.5">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      vi-VN • Southern Vietnamese (Saigon) • Không fallback giọng Bắc
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleRunSaigonAudit}
+                      disabled={saigonAuditLoading}
+                      className="px-2 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 text-[9px] font-bold transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      {saigonAuditLoading ? 'Đang kiểm định WAV...' : 'Kiểm định âm thanh Sài Gòn'}
+                    </button>
+                  </div>
+
+                  {saigonAuditError && (
+                    <p className="text-[9.5px] text-rose-300 bg-rose-500/10 border border-rose-500/20 rounded-lg px-2 py-1">
+                      {saigonAuditError}
+                    </p>
+                  )}
+
+                  {saigonAuditResult?.audit && (
+                    <div className="p-2.5 rounded-xl bg-black/50 border border-emerald-500/25 space-y-1.5 text-[9.5px]">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-bold text-emerald-300">
+                          Audit {saigonAuditResult.audit.voiceId}: {saigonAuditResult.audit.detectedAccentCategory}
+                        </span>
+                        <span className="font-mono text-slate-400">
+                          {saigonAuditResult.audit.wavMetrics?.durationSec}s • {saigonAuditResult.audit.wavMetrics?.rmsDb} dBFS
+                        </span>
+                      </div>
+                      <p className="text-slate-300 leading-snug">{saigonAuditResult.audit.auditSummary}</p>
+                      <div className="grid grid-cols-4 gap-1 text-[8.5px] font-mono text-slate-300">
+                        <span>Ngữ điệu: {saigonAuditResult.audit.phoneticScores?.saigonIntonation}/10</span>
+                        <span>Âm sắc: {saigonAuditResult.audit.phoneticScores?.voiceTimbre}/10</span>
+                        <span>Tự nhiên: {saigonAuditResult.audit.phoneticScores?.naturalness}/10</span>
+                        <span>Rõ chữ: {saigonAuditResult.audit.phoneticScores?.clarity}/10</span>
+                      </div>
+                      <p className="text-[8.5px] text-amber-300/90 italic">
+                        {saigonAuditResult.audit.humanListeningInstruction}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Smart Gender Selector Segmented Tabs */}
@@ -6165,7 +6418,6 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                 type="button"
                 onClick={() => {
                   setVoiceGenderFilter('female');
-                  // Intelligent auto-selection: avoid mixup where activeVoice is male or wrong language
                   const activeVoice = TTS_VOICES.find(v => v.id === selectedVoice);
                   if (!activeVoice || activeVoice.gender !== 'female' || (activeVoice.language || 'vi') !== reviewLanguage) {
                     const firstFemale = TTS_VOICES.find(v => v.gender === 'female' && (v.language || 'vi') === reviewLanguage);
@@ -6181,14 +6433,13 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                 }`}
               >
                 <span className={`w-1.5 h-1.5 rounded-full ${voiceGenderFilter === 'female' ? 'bg-pink-400 shadow-[0_0_6px_rgba(244,63,94,0.8)]' : 'bg-slate-500'}`} />
-                Giọng Nữ (Female)
+                Giọng Nữ Sài Gòn
               </button>
               
               <button
                 type="button"
                 onClick={() => {
                   setVoiceGenderFilter('male');
-                  // Intelligent auto-selection: avoid mixup where activeVoice is female or wrong language
                   const activeVoice = TTS_VOICES.find(v => v.id === selectedVoice);
                   if (!activeVoice || activeVoice.gender !== 'male' || (activeVoice.language || 'vi') !== reviewLanguage) {
                     const firstMale = TTS_VOICES.find(v => v.gender === 'male' && (v.language || 'vi') === reviewLanguage);
@@ -6204,70 +6455,124 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                 }`}
               >
                 <span className={`w-1.5 h-1.5 rounded-full ${voiceGenderFilter === 'male' ? 'bg-sky-400 shadow-[0_0_6px_rgba(14,165,233,0.8)]' : 'bg-slate-500'}`} />
-                Giọng Nam (Male)
+                Giọng Nam Sài Gòn
               </button>
             </div>
 
-            {/* Filtered Voice List */}
+            {previewError && (
+              <div className="p-2 rounded-lg bg-rose-500/10 border border-rose-500/20 text-[10px] text-rose-300">
+                {previewError}
+              </div>
+            )}
+
+            {/* Filtered Voice List with Sample Audition ("Nghe thử") */}
             <div className="space-y-2">
-              {TTS_VOICES.filter((voice) => voice.gender === voiceGenderFilter && (voice.language || 'vi') === reviewLanguage).map((voice) => (
-                <button
-                  key={voice.id}
-                  onClick={() => setSelectedVoice(voice.id)}
-                  className={`w-full p-3 rounded-xl border text-left transition-all flex items-start gap-2.5 relative group cursor-pointer ${
-                    selectedVoice === voice.id
-                      ? voiceGenderFilter === 'female'
-                        ? 'border-pink-500/40 bg-pink-500/[0.04] shadow-[inner_0_0_12px_rgba(244,63,94,0.08)]'
-                        : 'border-sky-500/40 bg-sky-500/[0.04] shadow-[inner_0_0_12px_rgba(14,165,233,0.08)]'
-                      : 'border-white/5 bg-white/[0.01] hover:border-white/10 hover:bg-white/[0.03]'
-                  }`}
-                >
-                  <div className={`w-3 h-3 rounded-full mt-1 shrink-0 flex items-center justify-center border ${
-                    selectedVoice === voice.id
-                      ? voiceGenderFilter === 'female'
-                        ? 'border-pink-500 bg-pink-500 text-white shadow-[0_0_8px_rgba(244,63,94,0.7)]'
-                        : 'border-sky-500 bg-sky-500 text-white shadow-[0_0_8px_rgba(14,165,233,0.7)]'
-                      : 'border-slate-600 bg-transparent group-hover:border-slate-500'
-                  }`}>
-                    {selectedVoice === voice.id && (
-                      <div className="w-1.5 h-1.5 rounded-full bg-white" />
-                    )}
-                  </div>
-                  
-                  <div className="space-y-1 w-full pointer-events-none">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className={`text-xs font-bold transition-colors ${
-                        selectedVoice === voice.id 
-                          ? voiceGenderFilter === 'female' ? 'text-pink-300' : 'text-sky-300' 
-                          : 'text-slate-200 group-hover:text-white'
-                      }`}>
-                        {voice.name}
-                      </span>
-                      
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <span className={`text-[8px] tracking-wider font-mono border px-1.5 py-0.5 rounded transition-all ${
-                          voice.language === 'en'
-                            ? 'text-amber-400 border-amber-500/20 bg-amber-500/10'
-                            : 'text-teal-400 border-teal-500/20 bg-teal-500/10'
+              {TTS_VOICES.filter((voice) => voice.gender === voiceGenderFilter && (voice.language || 'vi') === reviewLanguage).map((voice) => {
+                const isSelected = selectedVoice === voice.id;
+                const isPreviewPlaying = previewVoiceId === voice.id;
+                const isPreviewBusy = previewLoadingId === voice.id;
+                const previewInfo = previewResults[voice.id];
+
+                return (
+                  <div
+                    key={voice.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setSelectedVoice(voice.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setSelectedVoice(voice.id);
+                      }
+                    }}
+                    className={`w-full p-3 rounded-xl border text-left transition-all flex items-start gap-2.5 relative group cursor-pointer ${
+                      isSelected
+                        ? voiceGenderFilter === 'female'
+                          ? 'border-pink-500/40 bg-pink-500/[0.04] shadow-[inner_0_0_12px_rgba(244,63,94,0.08)]'
+                          : 'border-sky-500/40 bg-sky-500/[0.04] shadow-[inner_0_0_12px_rgba(14,165,233,0.08)]'
+                        : 'border-white/5 bg-white/[0.01] hover:border-white/10 hover:bg-white/[0.03]'
+                    }`}
+                  >
+                    <div className={`w-3 h-3 rounded-full mt-1 shrink-0 flex items-center justify-center border ${
+                      isSelected
+                        ? voiceGenderFilter === 'female'
+                          ? 'border-pink-500 bg-pink-500 text-white shadow-[0_0_8px_rgba(244,63,94,0.7)]'
+                          : 'border-sky-500 bg-sky-500 text-white shadow-[0_0_8px_rgba(14,165,233,0.7)]'
+                        : 'border-slate-600 bg-transparent group-hover:border-slate-500'
+                    }`}>
+                      {isSelected && (
+                        <div className="w-1.5 h-1.5 rounded-full bg-white" />
+                      )}
+                    </div>
+                    
+                    <div className="space-y-1.5 w-full">
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <span className={`text-xs font-bold transition-colors ${
+                          isSelected 
+                            ? voiceGenderFilter === 'female' ? 'text-pink-300' : 'text-sky-300' 
+                            : 'text-slate-200 group-hover:text-white'
                         }`}>
-                          {voice.language === 'en' ? '🇬🇧 EN' : '🇻🇳 VI'}
+                          {voice.name}
                         </span>
                         
-                        <span className={`text-[8px] uppercase tracking-widest font-mono border px-1.5 py-0.5 rounded transition-all ${
-                          voice.gender === 'female' 
-                            ? 'text-pink-400 border-pink-500/20 bg-pink-500/10' 
-                            : 'text-sky-400 border-sky-500/20 bg-sky-500/10'
-                        }`}>
-                          {voice.gender === 'female' ? 'Nữ' : 'Nam'}
-                        </span>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {voice.verificationStatus === 'acoustic_audited_saigon' && (
+                            <span className="text-[8px] font-mono border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 px-1.5 py-0.5 rounded">
+                              Sài Gòn WAV OK
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handlePreviewVoice(voice);
+                            }}
+                            disabled={isPreviewBusy}
+                            className={`px-2 py-0.5 rounded-md text-[9px] font-bold border transition-all flex items-center gap-1 cursor-pointer ${
+                              isPreviewPlaying
+                                ? 'bg-amber-500 text-black border-amber-400'
+                                : 'bg-white/5 hover:bg-amber-500/20 text-amber-300 border-amber-500/30'
+                            }`}
+                          >
+                            {isPreviewBusy ? (
+                              <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+                            ) : isPreviewPlaying ? (
+                              <Pause className="w-2.5 h-2.5" />
+                            ) : (
+                              <Play className="w-2.5 h-2.5" />
+                            )}
+                            <span>{isPreviewBusy ? 'Đang tải' : isPreviewPlaying ? 'Dừng' : 'Nghe thử'}</span>
+                          </button>
+                        </div>
                       </div>
+                      <p className="text-[10px] text-slate-400 leading-snug">
+                        {voice.description}
+                      </p>
+                      {previewInfo && (
+                        <div className="flex items-center justify-between text-[8.5px] font-mono text-emerald-300/90 pt-1 border-t border-white/5">
+                          <span>Mẫu WAV: {previewInfo.durationSec}s • {previewInfo.rmsDb} dBFS</span>
+                          {previewInfo.samplePublicUrl && (
+                            <a
+                              href={previewInfo.samplePublicUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              className="text-amber-400 hover:underline"
+                            >
+                              Mở file WAV
+                            </a>
+                          )}
+                        </div>
+                      )}
                     </div>
-                    <p className="text-[10px] text-slate-400 leading-snug">
-                      {voice.description}
-                    </p>
                   </div>
-                </button>
-              ))}
+                );
+              })}
+              <audio
+                ref={previewAudioRef}
+                onEnded={() => setPreviewVoiceId(null)}
+                className="hidden"
+              />
             </div>
 
             {/* Playback speed dial with automatic intelligence */}
@@ -6912,9 +7217,15 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                 }`}>
                   {audioUrl ? (
                     <div className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <span className="text-[9px] font-mono tracking-widest text-[#f59e0b] uppercase font-bold">GIỌNG ĐỌC AI SẴN SÀNG</span>
-                        <span className="text-[9px] text-[#22c55e] font-mono font-bold animate-pulse">WAV</span>
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <span className="text-[9px] font-mono tracking-widest text-[#f59e0b] uppercase font-bold">
+                          {activeAudioProvenance
+                            ? `${activeAudioProvenance.language === 'vi-VN' ? 'SAIGON WAV' : 'ENGLISH WAV'} • ${activeAudioProvenance.voiceId}`
+                            : 'GIỌNG ĐỌC AI SẴN SÀNG'}
+                        </span>
+                        <span className="text-[9px] text-[#22c55e] font-mono font-bold">
+                          {activeAudioProvenance?.ttsModelVersion || 'WAV'}
+                        </span>
                       </div>
 
                       <div className="flex items-center gap-3">
@@ -7972,84 +8283,88 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                         </div>
                       </div>
 
-                      {/* Ultra-Pro 4K / 60FPS Creator Export Suite */}
+                      {/* TikTok Export Engine Suite (MP4 H.264 + AAC-LC + FastStart) */}
                       <div className="pt-3 border-t border-white/5 space-y-3">
-                        <div className="flex items-center justify-between">
+                        <div className="flex items-center justify-between gap-2">
                           <label className="text-[10px] uppercase tracking-[0.1em] text-amber-400 font-black flex items-center gap-1.5 leading-none">
                             <Sparkles className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
-                            TRUNG TÂM XUẤT BẢN MASTER PRO (4K / 60FPS)
+                            TIKTOK EXPORT ENGINE (MP4 H.264 / AAC-LC)
                           </label>
-                          <span className="text-[8px] font-mono font-bold bg-amber-500/10 text-amber-300 border border-amber-500/20 px-2 py-0.5 rounded-full">
-                            TOP 1 ENGINE
+                          <span className="text-[8px] font-mono font-bold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 px-2 py-0.5 rounded-full">
+                            9:16 • 30FPS CFR • FASTSTART
                           </span>
                         </div>
 
                         {/* Export Quality Controls Grid */}
-                        <div className="grid grid-cols-3 gap-2 bg-[#060608] p-2 rounded-xl border border-white/5">
-                          {/* Resolution Selector */}
-                          <div className="space-y-1">
-                            <span className="text-[7.5px] font-bold text-slate-400 uppercase tracking-wider block">Độ phân giải</span>
-                            <div className="flex rounded-lg bg-black/60 p-0.5 border border-white/5">
-                              {(['4k', '1080p', '720p'] as const).map(res => (
-                                <button
-                                  key={res}
-                                  type="button"
-                                  onClick={() => setExportResolution(res)}
-                                  className={`flex-1 py-1 text-[8px] font-mono font-bold rounded uppercase transition-all cursor-pointer ${
-                                    exportResolution === res
-                                      ? 'bg-amber-500 text-black shadow-sm'
-                                      : 'text-slate-400 hover:text-white'
-                                  }`}
-                                >
-                                  {res}
-                                </button>
-                              ))}
+                        <div className="space-y-2 bg-[#060608] p-2.5 rounded-xl border border-white/5">
+                          <div className="grid grid-cols-2 gap-2">
+                            {/* Resolution Selector (TikTok 9:16) */}
+                            <div className="space-y-1">
+                              <span className="text-[7.5px] font-bold text-slate-400 uppercase tracking-wider block">
+                                Độ phân giải (9:16)
+                              </span>
+                              <div className="flex rounded-lg bg-black/60 p-0.5 border border-white/5">
+                                {([
+                                  { id: '1080p', label: '1080×1920' },
+                                  { id: '720p', label: '720×1280' },
+                                ] as const).map(res => (
+                                  <button
+                                    key={res.id}
+                                    type="button"
+                                    onClick={() => setExportResolution(res.id)}
+                                    className={`flex-1 py-1 text-[8px] font-mono font-bold rounded transition-all cursor-pointer ${
+                                      (exportResolution === '720p' ? res.id === '720p' : res.id === '1080p')
+                                        ? 'bg-amber-500 text-black shadow-sm'
+                                        : 'text-slate-400 hover:text-white'
+                                    }`}
+                                  >
+                                    {res.label}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+
+                            {/* Frame Rate & Codec Spec */}
+                            <div className="space-y-1">
+                              <span className="text-[7.5px] font-bold text-slate-400 uppercase tracking-wider block">
+                                Chuẩn khung hình & Audio
+                              </span>
+                              <div className="flex items-center justify-center rounded-lg bg-black/60 px-2 py-1 border border-white/5 text-[8px] font-mono font-bold text-emerald-300">
+                                30 FPS CFR • yuv420p • AAC 48kHz
+                              </div>
                             </div>
                           </div>
 
-                          {/* FPS Selector */}
+                          {/* Quality / Bitrate Tiers (8 / 10 / 12 Mbps) */}
                           <div className="space-y-1">
-                            <span className="text-[7.5px] font-bold text-slate-400 uppercase tracking-wider block">Khung hình</span>
-                            <div className="flex rounded-lg bg-black/60 p-0.5 border border-white/5">
-                              {([60, 30] as const).map(fps => (
-                                <button
-                                  key={fps}
-                                  type="button"
-                                  onClick={() => setExportFps(fps)}
-                                  className={`flex-1 py-1 text-[8px] font-mono font-bold rounded transition-all cursor-pointer ${
-                                    exportFps === fps
-                                      ? 'bg-amber-500 text-black shadow-sm'
-                                      : 'text-slate-400 hover:text-white'
-                                  }`}
-                                >
-                                  {fps} FPS
-                                </button>
-                              ))}
+                            <span className="text-[7.5px] font-bold text-slate-400 uppercase tracking-wider block">
+                              Chất lượng mã hóa (Bitrate H.264)
+                            </span>
+                            <div className="grid grid-cols-3 gap-1 rounded-lg bg-black/60 p-0.5 border border-white/5">
+                              {(['standard', 'high', 'premium'] as const).map(tier => {
+                                const meta = EXPORT_QUALITY_META[tier];
+                                return (
+                                  <button
+                                    key={tier}
+                                    type="button"
+                                    onClick={() => setExportBitratePreset(tier)}
+                                    className={`py-1 px-1.5 text-[8px] font-mono font-bold rounded transition-all cursor-pointer flex flex-col items-center leading-tight ${
+                                      exportBitratePreset === tier
+                                        ? 'bg-amber-500 text-black shadow-sm'
+                                        : 'text-slate-400 hover:text-white'
+                                    }`}
+                                  >
+                                    <span>{meta.label}</span>
+                                    <span className={`text-[7px] ${exportBitratePreset === tier ? 'text-black/80' : 'text-slate-500'}`}>
+                                      {meta.mbpsLabel}
+                                    </span>
+                                  </button>
+                                );
+                              })}
                             </div>
-                          </div>
-
-                          {/* Bitrate Mode */}
-                          <div className="space-y-1">
-                            <span className="text-[7.5px] font-bold text-slate-400 uppercase tracking-wider block">Chất lượng</span>
-                            <div className="flex rounded-lg bg-black/60 p-0.5 border border-white/5">
-                              {[
-                                { id: 'master', label: 'Master' },
-                                { id: 'high', label: 'Pro HD' },
-                              ].map(b => (
-                                <button
-                                  key={b.id}
-                                  type="button"
-                                  onClick={() => setExportBitratePreset(b.id as any)}
-                                  className={`flex-1 py-1 text-[8px] font-mono font-bold rounded transition-all cursor-pointer ${
-                                    exportBitratePreset === b.id
-                                      ? 'bg-amber-500 text-black shadow-sm'
-                                      : 'text-slate-400 hover:text-white'
-                                  }`}
-                                >
-                                  {b.label}
-                                </button>
-                              ))}
-                            </div>
+                            <p className="text-[8px] text-slate-400 leading-snug">
+                              {EXPORT_QUALITY_META[exportBitratePreset].description}
+                            </p>
                           </div>
                         </div>
 
@@ -8067,12 +8382,16 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                           {isMerging ? (
                             <>
                               <RefreshCw className="w-4 h-4 animate-spin text-amber-400" />
-                              <span className="text-amber-200">Đang xuất bản {exportResolution.toUpperCase()} @ {exportFps}FPS: {mergeProgress}%</span>
+                              <span className="text-amber-200">
+                                {exportStageLabel ? `${exportStageLabel} (${mergeProgress}%)` : `Đang xuất TikTok MP4: ${mergeProgress}%`}
+                              </span>
                             </>
                           ) : (
                             <>
                               <FileVideo className="w-4 h-4 text-black animate-pulse" />
-                              <span>🎬 GHÉP & XUẤT VIDEO REVIEW {exportResolution.toUpperCase()} ({exportFps}FPS PRO)</span>
+                              <span>
+                                🎬 XUẤT VIDEO MP4 CHUẨN TIKTOK ({EXPORT_QUALITY_META[exportBitratePreset].label.toUpperCase()} • {EXPORT_QUALITY_META[exportBitratePreset].mbpsLabel})
+                              </span>
                             </>
                           )}
                         </button>
@@ -8130,13 +8449,13 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                           </button>
                         </div>
 
-                        {/* If merging is active, display a gorgeous micro progress bar */}
+                        {/* Export & Server Transcode Progress Banner */}
                         {isMerging && (
                           <div className="space-y-2 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20">
                             <div className="flex items-center justify-between text-[10px]">
                               <span className="text-amber-400 font-bold flex items-center gap-1.5">
                                 <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
-                                Đang ghép video & âm thanh: {mergeProgress}%
+                                {exportStageLabel || `Đang xử lý video chuẩn TikTok: ${mergeProgress}%`}
                               </span>
                               <button
                                 type="button"
@@ -8153,48 +8472,83 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                               ></div>
                             </div>
                             <p className="text-[8px] text-slate-400 text-center leading-normal italic">
-                              Hệ thống đang chạy đồng bộ hình ảnh và lồng tiếng trực tiếp trên trình duyệt. Vui lòng giữ tab này hoạt động!
+                              Quy trình 3 bước: Ghi đồng bộ khung hình & lồng tiếng → Tải lên FFmpeg Worker → Chuyển mã & kiểm định MP4 H.264/AAC faststart.
                             </p>
                           </div>
                         )}
 
-                        {/* If successfully merged video, show download fallbacks to prevent any iframe blockers */}
+                        {/* Verified TikTok MP4 Output & Android-Compatible Download Card */}
                         {mergedVideoUrl && !isMerging && (
                           <div className="p-3.5 rounded-2xl bg-gradient-to-r from-emerald-500/10 via-emerald-500/[0.02] to-transparent border border-emerald-500/20 space-y-3.5 text-left">
-                            <div className="flex items-center justify-between">
+                            <div className="flex items-center justify-between gap-2">
                               <div className="flex items-center gap-1.5 text-[10px] text-emerald-400 font-bold">
                                 <CheckCircle2 className="w-3.5 h-3.5" />
-                                <span>ĐÃ GHÉP HOÀN CHỈNH VIDEO REVIEW!</span>
+                                <span>
+                                  {tiktokValidation?.valid
+                                    ? 'VIDEO MP4 ĐÃ VƯỢT QUA KIỂM ĐỊNH TIKTOK!'
+                                    : 'ĐÃ XUẤT VIDEO MP4!'}
+                                </span>
                               </div>
                               <span className="text-[8px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2 py-0.5 rounded font-mono font-bold uppercase">
-                                {mergedVideoExt} HD
+                                .{mergedVideoExt} • {tiktokValidation ? `${tiktokValidation.width}×${tiktokValidation.height}` : 'H.264'}
                               </span>
                             </div>
 
-                            {/* Live video player preview of the merged MP4 file */}
+                            {tiktokValidation && (
+                              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[8px] font-mono bg-black/50 p-2 rounded-xl border border-white/5">
+                                <div>
+                                  <span className="text-slate-500 block">VIDEO CODEC</span>
+                                  <span className="text-emerald-300 font-bold uppercase">
+                                    {tiktokValidation.videoCodec || 'h264'} ({tiktokValidation.pixelFormat || 'yuv420p'})
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-slate-500 block">AUDIO CODEC</span>
+                                  <span className="text-emerald-300 font-bold uppercase">
+                                    {tiktokValidation.hasAudio
+                                      ? `${tiktokValidation.audioCodec || 'aac'} (${tiktokValidation.audioSampleRate || 48000}Hz)`
+                                      : 'SILENT (NO AUDIO)'}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-slate-500 block">FPS & FASTSTART</span>
+                                  <span className="text-emerald-300 font-bold">
+                                    {tiktokValidation.fps.toFixed(0)} FPS CFR • {tiktokValidation.fastStart ? 'MOOV FIRST' : 'CHECK'}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-slate-500 block">DUNG LƯỢNG & DECODE</span>
+                                  <span className="text-emerald-300 font-bold">
+                                    {formatBytes(tiktokValidation.fileSizeBytes)} • {tiktokValidation.decodeIntegrityPassed ? 'PASS' : 'OK'}
+                                  </span>
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Live video player preview of the verified MP4 file */}
                             <div className="space-y-1.5">
                               <span className="text-[8px] text-slate-400 font-mono font-bold uppercase tracking-widest block">
-                                TRÌNH PHÁT VIDEO ĐÃ GHÉP THUYẾT MINH
+                                TRÌNH PHÁT VIDEO MP4 ĐÃ KIỂM ĐỊNH (CHUẨN UPLOAD TIKTOK ANDROID/IOS)
                               </span>
                               <video
                                 src={mergedVideoUrl}
                                 controls
-                                className="w-full rounded-xl border border-white/10 aspect-video object-contain bg-black shadow-lg"
+                                className="w-full rounded-xl border border-white/10 aspect-[9/16] max-h-[420px] object-contain bg-black shadow-lg"
                                 playsInline
                               />
                             </div>
 
                             <p className="text-[9px] text-slate-300 leading-relaxed">
-                              Đã hoàn chỉnh ghép tiếng thuyết minh vào video gốc chất lượng siêu cao (6.5 Mbps) không nén!
+                              Tệp <strong>.mp4</strong> thực thụ được mã hóa bằng FFmpeg H.264 + AAC-LC (48kHz), cấu trúc moov atom faststart và hỗ trợ tải xuống ổn định trên trình duyệt Android Chrome / TikTok Uploader.
                             </p>
                             
                             <div className="flex flex-col gap-1.5 text-[9px]">
                               <a
                                 href={mergedVideoUrl}
-                                download={`${(activeReview?.productName || "review_ai").toLowerCase().replace(/[^a-zA-Z0-9]/g, '_')}_final.${mergedVideoExt}`}
-                                className="text-black hover:text-black font-semibold flex items-center justify-center gap-1.5 bg-amber-400 hover:bg-amber-300 py-1.5 px-3 rounded-lg shadow-lg shadow-amber-500/10 transition-all cursor-pointer"
+                                download={`${(activeReview?.productName || "review_ai").toLowerCase().replace(/[^a-zA-Z0-9]/g, '_')}_tiktok.${mergedVideoExt}`}
+                                className="text-black hover:text-black font-semibold flex items-center justify-center gap-1.5 bg-amber-400 hover:bg-amber-300 py-2 px-3 rounded-lg shadow-lg shadow-amber-500/10 transition-all cursor-pointer"
                               >
-                                <Download className="w-3.5 h-3.5 text-black" /> Tải Xuống Video (.{mergedVideoExt})
+                                <Download className="w-3.5 h-3.5 text-black" /> Tải Xuống Video Chuẩn TikTok (.{mergedVideoExt})
                               </a>
 
                               <a
@@ -8203,7 +8557,7 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                                 rel="noreferrer"
                                 className="text-amber-400 hover:text-amber-300 font-medium flex items-center justify-center gap-1.5 bg-white/5 border border-white/10 py-1.5 px-3 rounded-lg hover:bg-white/10 transition-all cursor-pointer text-center"
                               >
-                                <ExternalLink className="w-3 h-3" /> Mở nguồn video trong Tab mới để tải
+                                <ExternalLink className="w-3 h-3" /> Mở nguồn MP4 trong Tab mới (Android Download)
                               </a>
                             </div>
 
@@ -8508,33 +8862,33 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                         )}
                       </div>
 
-                      <audio 
-                        ref={audioRef}
-                        crossOrigin="anonymous"
-                        src={audioUrl}
-                        onEnded={handleAudioEnded}
-                        onTimeUpdate={(e) => {
-                          if (audioUrl) {
-                            setCurrentAudioTime(e.currentTarget.currentTime);
-                          }
-                        }}
-                        onLoadedMetadata={(e) => {
-                          setAudioDuration(e.currentTarget.duration);
-                        }}
-                        onDurationChange={(e) => {
-                          setAudioDuration(e.currentTarget.duration);
-                        }}
-                        className="hidden"
-                      />
                     </div>
                   ) : (
                     <div className="text-center py-2 text-slate-600">
-                      <p className="text-[10px] font-semibold text-slate-400">Chưa tải giọng đọc marketing</p>
+                      <p className="text-[10px] font-semibold text-slate-400">Chưa tải giọng đọc Sài Gòn</p>
                       <p className="text-[9px] text-slate-500 leading-snug mt-1">
-                        Nhấp nút &ldquo;Khởi tạo giọng đọc AI&rdquo; để ghép tiếng lồng trực tiếp.
+                        Nhấp nút &ldquo;Khởi tạo giọng đọc AI&rdquo; để tổng hợp giọng Sài Gòn mới cho {selectedVoice}.
                       </p>
                     </div>
                   )}
+                  <audio 
+                    ref={audioRef}
+                    crossOrigin="anonymous"
+                    src={audioUrl || undefined}
+                    onEnded={handleAudioEnded}
+                    onTimeUpdate={(e) => {
+                      if (audioUrl) {
+                        setCurrentAudioTime(e.currentTarget.currentTime);
+                      }
+                    }}
+                    onLoadedMetadata={(e) => {
+                      setAudioDuration(e.currentTarget.duration || 0);
+                    }}
+                    onDurationChange={(e) => {
+                      setAudioDuration(e.currentTarget.duration || 0);
+                    }}
+                    className="hidden"
+                  />
                 </div>
 
                 {/* Studio syncing adjustments */}
@@ -8697,6 +9051,16 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                   <p className="text-xs text-rose-200/80 leading-relaxed font-mono">
                     {apiError}
                   </p>
+                  {activeReview?.marketingScript && (
+                    <button
+                      type="button"
+                      onClick={generateVoiceover}
+                      disabled={isGeneratingTTS}
+                      className="mt-1 px-3 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 text-[11px] font-bold cursor-pointer disabled:opacity-50"
+                    >
+                      {isGeneratingTTS ? 'Đang tạo lại giọng Sài Gòn...' : 'Thử lại giọng Sài Gòn'}
+                    </button>
+                  )}
                 </div>
               </div>
               <button
@@ -10116,6 +10480,17 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                     </div>
                   </div>
                 </div>
+              ) : trendsError ? (
+                <div className="flex flex-col items-center justify-center py-12 text-center space-y-3 bg-rose-500/5 border border-rose-500/20 rounded-2xl p-6">
+                  <AlertTriangle className="w-10 h-10 text-rose-400" />
+                  <p className="text-sm font-semibold text-rose-300">{trendsError}</p>
+                  <button 
+                    onClick={() => scanTrendingProducts(scannedCategory)}
+                    className="px-4 py-2 rounded-xl bg-amber-500 text-black text-xs font-bold hover:bg-amber-400 active:scale-95 cursor-pointer transition-all border-0"
+                  >
+                    Thử quét lại ngay
+                  </button>
+                </div>
               ) : scannedProducts.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-16 text-center space-y-3">
                   <TrendingUp className="w-12 h-12 text-slate-600 animate-bounce" />
@@ -10128,86 +10503,92 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
                   </button>
                 </div>
               ) : (
-                /* PRODUCT TRENDS RENDER GRID */
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {scannedProducts.map((prod, idx) => (
-                    <div 
-                      key={prod.id || idx}
-                      className="bg-zinc-950 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 hover:bg-white/[0.01] transition-all relative overflow-hidden group flex flex-col justify-between"
-                    >
-                      {/* Top ribbon: index & badges */}
-                      <div>
-                        <div className="flex items-center justify-between gap-2 mb-3">
-                          <span className="text-[10px] bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-md font-semibold border border-amber-500/20">
-                            {prod.category}
-                          </span>
-                          <span className="text-xs font-bold text-amber-500 flex items-center gap-0.5 font-mono">
-                            🔥 Score: {prod.hotScore}%
-                          </span>
-                        </div>
-
-                        {/* Product Title */}
-                        <h4 className="text-sm font-bold text-white mb-2 leading-relaxed tracking-wide group-hover:text-amber-400 transition-colors">
-                          {prod.name}
-                        </h4>
-
-                        {/* Short pitch with Pas / Viral value */}
-                        <p className="text-[11px] text-slate-400 leading-relaxed mb-4">
-                          {prod.shortDesc}
-                        </p>
-
-                        {/* Dynamic analytical badges */}
-                        <div className="grid grid-cols-2 gap-1.5 text-[9px] font-mono uppercase tracking-wider mb-4 border-t border-b border-white/5 py-2">
-                          <div className="text-slate-400 flex items-center gap-1">
-                            📈 Growth: <strong className="text-green-400 font-bold">{prod.viralFactor}</strong>
-                          </div>
-                          <div className="text-slate-400 flex items-center gap-1">
-                            📦 Sales: <strong className="text-amber-400 font-bold">{prod.purchaseCount}</strong>
-                          </div>
-                        </div>
-
-                        {/* Viral hook sentence */}
-                        <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl text-[11px] leading-relaxed italic text-slate-300 relative mb-4">
-                          <span className="text-amber-400 font-bold not-italic block text-[9px] uppercase tracking-wider mb-1 font-sans">
-                            🎙️ Suggested Viral Hook:
-                          </span>
-                          &ldquo;{prod.viralHook}&rdquo;
-                        </div>
-                      </div>
-
-                      {/* Select product button */}
-                      <button
-                        onClick={() => {
-                          setProductName(prod.name);
-                          setProductDesc(prod.shortDesc);
-                          
-                          // Set Tone Preset matching backend suggests
-                          const matchedTone = prod.suggestedTone;
-                          const validTones = [
-                            'Thuyết phục & Truyền cảm',
-                            'Sôi nổi & Kích thích',
-                            'Phân tích chuyên sâu',
-                            'Hài hước & Gần gũi'
-                          ];
-                          if (validTones.includes(matchedTone)) {
-                            setTonePreset(matchedTone);
-                          } else {
-                            setTonePreset('Sôi nổi & Kích thích');
-                          }
-                          
-                          // Format custom prompt to append hashtags
-                          const tagsStr = prod.hashtags.map(h => h.startsWith('#') ? h : `#${h}`).join(' ');
-                          setCustomPrompt(`Hãy làm nổi bật sản phẩm hot trend này trong bài viết. Tập trung lột tả tính hữu dụng đặc sắc. Đi kèm hashtags tối ưu: ${tagsStr}`);
-                          
-                          setIsTrendingOpen(false);
-                          setApiError(null);
-                        }}
-                        className="w-full py-2.5 rounded-xl bg-amber-500 text-black hover:bg-amber-400 font-bold text-xs flex items-center justify-center gap-1 transition-all active:scale-95 shadow-md shadow-amber-500/10 cursor-pointer text-center border-0"
-                      >
-                        <Plus className="w-3.5 h-3.5" /> Sử dụng sản phẩm này review
-                      </button>
+                <div className="space-y-4">
+                  <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/25 flex items-start gap-2.5 text-[11px] text-amber-200/90">
+                    <Info className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                      <strong className="text-amber-300">Lưu ý minh bạch:</strong> Các gợi ý bên dưới là <strong>giả thuyết xu hướng do AI tổng hợp (AI-generated market hypothesis)</strong> nhằm gợi ý chủ đề quay video, không phải số liệu bán hàng thực tế từ sàn TMĐT.
                     </div>
-                  ))}
+                  </div>
+                  {/* PRODUCT TRENDS RENDER GRID */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {scannedProducts.map((prod, idx) => (
+                      <div 
+                        key={prod.id || idx}
+                        className="bg-zinc-950 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 hover:bg-white/[0.01] transition-all relative overflow-hidden group flex flex-col justify-between"
+                      >
+                        {/* Top ribbon: index & badges */}
+                        <div>
+                          <div className="flex items-center justify-between gap-2 mb-3">
+                            <span className="text-[10px] bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-md font-semibold border border-amber-500/20">
+                              {prod.category}
+                            </span>
+                            <span className="text-[10px] font-bold text-amber-300 bg-amber-500/15 px-2 py-0.5 rounded border border-amber-500/30 font-mono">
+                              Mức quan tâm: {prod.marketInterestLevel || 'Cao'}
+                            </span>
+                          </div>
+
+                          {/* Product Title */}
+                          <h4 className="text-sm font-bold text-white mb-2 leading-relaxed tracking-wide group-hover:text-amber-400 transition-colors">
+                            {prod.name}
+                          </h4>
+
+                          {/* Short pitch with Pas / Viral value */}
+                          <p className="text-[11px] text-slate-400 leading-relaxed mb-3">
+                            {prod.shortDesc}
+                          </p>
+
+                          {/* Transparency Metadata */}
+                          <div className="space-y-1 text-[10px] font-mono mb-4 border-t border-b border-white/5 py-2 text-slate-400">
+                            <div className="text-amber-400/90 font-semibold">
+                              ⚠️ {prod.marketHypothesisNotice || 'AI-generated market hypothesis – Chưa xác minh bằng dữ liệu thị trường'}
+                            </div>
+                            <div>Phương pháp: {prod.estimationMethod || 'Phân tích AI'} ({prod.dataPeriod || 'Gần đây'})</div>
+                          </div>
+
+                          {/* Viral hook sentence */}
+                          <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl text-[11px] leading-relaxed italic text-slate-300 relative mb-4">
+                            <span className="text-amber-400 font-bold not-italic block text-[9px] uppercase tracking-wider mb-1 font-sans">
+                              🎙️ Suggested Hook:
+                            </span>
+                            &ldquo;{prod.viralHook}&rdquo;
+                          </div>
+                        </div>
+
+                        {/* Select product button */}
+                        <button
+                          onClick={() => {
+                            setProductName(prod.name);
+                            setProductDesc(prod.shortDesc);
+                            
+                            // Set Tone Preset matching backend suggests
+                            const matchedTone = prod.suggestedTone;
+                            const validTones = [
+                              'Thuyết phục & Truyền cảm',
+                              'Sôi nổi & Kích thích',
+                              'Phân tích chuyên sâu',
+                              'Hài hước & Gần gũi'
+                            ];
+                            if (validTones.includes(matchedTone)) {
+                              setTonePreset(matchedTone);
+                            } else {
+                              setTonePreset('Sôi nổi & Kích thích');
+                            }
+                            
+                            // Format custom prompt to append hashtags
+                            const tagsStr = prod.hashtags.map(h => h.startsWith('#') ? h : `#${h}`).join(' ');
+                            setCustomPrompt(`Hãy làm nổi bật sản phẩm này trong bài viết. Tập trung mô tả trải nghiệm thực tế và công dụng rõ ràng. Đi kèm hashtags: ${tagsStr}`);
+                            
+                            setIsTrendingOpen(false);
+                            setApiError(null);
+                          }}
+                          className="w-full py-2.5 rounded-xl bg-amber-500 text-black hover:bg-amber-400 font-bold text-xs flex items-center justify-center gap-1 transition-all active:scale-95 shadow-md shadow-amber-500/10 cursor-pointer text-center border-0"
+                        >
+                          <Plus className="w-3.5 h-3.5" /> Sử dụng ý tưởng sản phẩm này
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
@@ -10215,10 +10596,10 @@ ${cons || "- Hàng hot trend nên dễ cháy hàng nhanh."}
             {/* Modal glassmorphic footer status */}
             <div className="p-4 border-t border-white/10 bg-black/60 flex items-center justify-between text-[10px] text-slate-500">
               <span className="flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                Đồng bộ hóa xu hướng từ Tiktok Shop, Shopee và Reels
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+                Gợi ý ý tưởng nội dung được tạo bởi Gemini AI
               </span>
-              <span>Cập nhật 1 phút trước</span>
+              <span>Chưa xác minh doanh số thực tế</span>
             </div>
 
           </div>
